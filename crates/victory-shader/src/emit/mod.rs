@@ -85,9 +85,11 @@ mod lane_mask_tests;
 mod lower;
 #[cfg(test)]
 mod mtbuf_tests;
+mod rect;
 #[cfg(test)]
 mod root_uav_tests;
 mod sampler;
+pub use rect::rect_list_gs;
 mod shader;
 mod threading;
 #[cfg(windows)]
