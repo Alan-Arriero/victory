@@ -3665,6 +3665,17 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Whether a phi, or an instruction other than an interpolation's second
+    /// half (`v_interp_p2*`), reads `v`.
+    fn read_past_interpolation(&self, v: Value) -> bool {
+        self.x.p.blocks.iter().any(|b| {
+            b.phis.iter().any(|p| p.args.contains(&v))
+                || b.insts.iter().any(|i| {
+                    !i.name().starts_with("v_interp_p2") && i.reads.iter().any(|r| r.1 == v)
+                })
+        })
+    }
+
     /// Whether an instruction or phi reads `v` other than as a resource
     /// operand of a memory instruction (which takes the descriptor whole).
     fn read_as_data(&self, v: Value) -> bool {
@@ -6171,7 +6182,15 @@ impl<'a> Lower<'a> {
                     Fields::Valu(v) => v.dst.ok_or("an interpolation")?,
                     _ => unreachable!(),
                 };
-                if let Operand::Vector { reg, .. } = dst {
+                // The second half (`v_interp_p2*`) evaluates the whole
+                // attribute; it reads this register only as its accumulator.
+                // Any other reader, or a join, would take the zero as data.
+                if let Operand::Vector { reg, .. } = dst
+                    && let Some(w) = inst.write(Reg::V(reg))
+                {
+                    if self.read_past_interpolation(w) {
+                        return Err("the first half of an interpolation");
+                    }
                     let z = self.s.m.i32(0);
                     self.write(inst, Reg::V(reg), z, None);
                 }
