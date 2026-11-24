@@ -9,6 +9,7 @@ mod run;
 mod shader;
 mod translate;
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -21,6 +22,10 @@ use clap::{Parser, Subcommand, ValueEnum};
     about = "Run an Xbox Series title natively on Windows"
 )]
 struct Cli {
+    /// Write structured diagnostics to a new file outside every VIctory checkout.
+    #[arg(long, global = true, value_name = "FILE")]
+    diagnostic_jsonl: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -78,12 +83,12 @@ enum Command {
         /// Also create a host D3D12 pipeline for each emitted shader.
         #[arg(long)]
         pipelines: bool,
-        /// Print one line per program and outcome.
+        /// Include runtime hashes and duplicate DXIL containers in the per-program listing.
         #[arg(long)]
         list: bool,
-        /// Worker threads (default: every logical core).
+        /// Positive worker thread count (default: every logical core).
         #[arg(long)]
-        jobs: Option<usize>,
+        jobs: Option<NonZeroUsize>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -129,7 +134,20 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
-    match cli.command {
+    if let Some(path) = cli.diagnostic_jsonl
+        && victory_core::diagnostics::start(&path).is_err()
+    {
+        eprintln!(
+            "VIctory: cannot create diagnostic output (expected a new file outside the source tree)"
+        );
+    }
+    let result = dispatch(cli.command);
+    victory_core::diagnostics::finish(result.is_ok());
+    result
+}
+
+fn dispatch(command: Command) -> Result<()> {
+    match command {
         Command::Inspect {
             file,
             imports,
@@ -152,7 +170,13 @@ fn main() -> Result<()> {
             pipelines,
             list,
             jobs,
-        } => translate::run(paths, validate, pipelines, list, jobs),
+        } => translate::run(
+            paths,
+            validate,
+            pipelines,
+            list,
+            jobs.map(NonZeroUsize::get),
+        ),
         Command::Run {
             exe,
             unimplemented,
@@ -178,16 +202,27 @@ fn show_config() -> Result<()> {
             .as_ref()
             .map_or("(none)".into(), |p| p.display().to_string())
     );
-    println!("game_dir    : {}", status(&cfg.game_dir));
-    println!("cache_dir   : {}", cfg.cache_dir.display());
+    // Where each value came from, so it is clear which setting to change.
+    let o = cfg.origins;
+    println!("game_dir    : {}  [{}]", status(&cfg.game_dir), o.game_dir);
+    println!(
+        "cache_dir   : {}  [{}]",
+        cfg.cache_dir.display(),
+        o.cache_dir
+    );
+    println!("data_dir    : {}  [{}]", cfg.data_dir.display(), o.data_dir);
     for t in &cfg.test_titles {
-        println!("test_title  : {}", status(&Some(t.clone())));
+        println!(
+            "test_title  : {}  [{}]",
+            status(&Some(t.clone())),
+            o.test_titles
+        );
     }
     for p in cfg
         .game_dir
         .iter()
         .chain(&cfg.test_titles)
-        .chain([&cfg.cache_dir])
+        .chain([&cfg.cache_dir, &cfg.data_dir])
     {
         if let Err(e) = victory_core::ensure_outside_repo(p) {
             println!("POLICY VIOLATION: {e}");
@@ -198,14 +233,38 @@ fn show_config() -> Result<()> {
 
 /// Paths given on the command line, or the configured game + test titles.
 pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
-    if !paths.is_empty() {
-        return Ok(paths);
+    let resolved = if !paths.is_empty() {
+        paths
+    } else {
+        let cfg = victory_core::Config::load()?;
+        let all: Vec<PathBuf> = cfg.game_dir.into_iter().chain(cfg.test_titles).collect();
+        anyhow::ensure!(
+            !all.is_empty(),
+            "no paths given and none configured (see victory.example.toml)"
+        );
+        all
+    };
+    for p in &resolved {
+        victory_core::ensure_outside_repo(p)?;
     }
-    let cfg = victory_core::Config::load()?;
-    let all: Vec<PathBuf> = cfg.game_dir.into_iter().chain(cfg.test_titles).collect();
-    anyhow::ensure!(
-        !all.is_empty(),
-        "no paths given and none configured (see victory.example.toml)"
-    );
-    Ok(all)
+    Ok(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_paths_enforces_outside_repo() {
+        let inside = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let err = default_paths(vec![inside]).unwrap_err();
+        assert!(err.to_string().contains("inside"));
+    }
+
+    #[test]
+    fn default_paths_accepts_outside_path() {
+        let outside = std::env::temp_dir();
+        let res = default_paths(vec![outside.clone()]).unwrap();
+        assert_eq!(res, vec![outside]);
+    }
 }

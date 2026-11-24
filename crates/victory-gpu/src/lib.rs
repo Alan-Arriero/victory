@@ -38,6 +38,8 @@ pub mod pipeline;
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod rectangles;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -49,10 +51,11 @@ mod shadow;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
+mod timeline;
 #[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::{HdrDisplayInfo, display_hdr_info, on_failure};
 #[cfg(windows)]
 pub use watch::{title_memory_remapped, writing as kernel_will_write};

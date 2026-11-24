@@ -142,9 +142,11 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
         f64::from(aw) / f64::from(width),
         f64::from(ah) / f64::from(height),
     );
+    // A very small work area can scale a positive requested dimension below
+    // one pixel, which truncates to zero. A window still needs a pixel there.
     (
-        (f64::from(width) * scale) as i32,
-        (f64::from(height) * scale) as i32,
+        ((f64::from(width) * scale) as i32).max(1),
+        ((f64::from(height) * scale) as i32).max(1),
     )
 }
 
@@ -172,6 +174,15 @@ extern "system" fn window_proc(
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
         end_title("window closed", Box::new(|| {}));
+        return 0;
+    }
+    // Alt or F10 puts a window into menu mode: the system runs a modal menu
+    // loop on the thread that owns the window, which is the title's. The
+    // title then stops (no frames, no input) until a key ends the loop, and
+    // nothing shows it, since the window has no menu bar; Grand Theft Auto
+    // VI aborts itself about half a minute later. A console has no window
+    // menu. The mouse still opens it from the title bar.
+    if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
     }
     // SAFETY: the procedure `hook` stored, called the way the system would.
@@ -336,6 +347,16 @@ mod tests {
             fit_into(&area, wm::CW_USEDEFAULT, 0),
             (wm::CW_USEDEFAULT, 0)
         );
+
+        // A tiny work area must not round a positive size down to zero.
+        let tiny = RECT {
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 100,
+        };
+        assert_eq!(fit_into(&tiny, 1000, 100), (1, 1));
+        assert_eq!(fit_into(&area, 0, -5), (0, -5));
     }
 
     #[test]
@@ -365,5 +386,65 @@ mod tests {
             assert!(!wm::GetPropW(hwnd, TITLE_PROC).is_null());
             wm::DestroyWindow(hwnd);
         }
+    }
+
+    thread_local! {
+        /// The system commands `recording` received, low four bits cleared.
+        static COMMANDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Stands in for a title's procedure: notes system commands and acts
+    /// on none of them (no menu loop, no minimising).
+    extern "system" fn recording(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if message == wm::WM_SYSCOMMAND {
+            COMMANDS.with(|c| c.borrow_mut().push(wparam & 0xFFF0));
+            return 0;
+        }
+        // SAFETY: the system's default procedure, called as the system would.
+        unsafe { wm::DefWindowProcW(hwnd, message, wparam, lparam) }
+    }
+
+    #[test]
+    fn the_keyboard_menu_never_reaches_the_title() {
+        let null = std::ptr::null_mut();
+        let hwnd = CreateWindowExW(
+            0,
+            w!("STATIC"),
+            w!("menu"),
+            0,
+            0,
+            0,
+            10,
+            10,
+            null,
+            null,
+            null,
+            std::ptr::null(),
+        );
+        assert!(!hwnd.is_null());
+        // SAFETY: our window, owned by this thread, so each message is
+        // handled before SendMessageW returns. `recording` stands in for the
+        // title's procedure and the original is put back before the window
+        // is destroyed.
+        unsafe {
+            let title = wm::GetPropW(hwnd, TITLE_PROC);
+            wm::SetPropW(hwnd, TITLE_PROC, recording as *const () as *mut c_void);
+            let command = |c: u32, key: u8| {
+                wm::SendMessageW(hwnd, wm::WM_SYSCOMMAND, c as usize, LPARAM::from(key))
+            };
+            command(wm::SC_KEYMENU, 0); // Alt or F10
+            command(wm::SC_KEYMENU, b' '); // Alt+Space
+            command(wm::SC_KEYMENU | 1, 0); // the low bits are the system's
+            command(wm::SC_MINIMIZE, 0);
+            wm::SetPropW(hwnd, TITLE_PROC, title);
+            wm::DestroyWindow(hwnd);
+        }
+        let seen = COMMANDS.with(|c| c.borrow().clone());
+        assert_eq!(seen, [wm::SC_MINIMIZE as usize]);
     }
 }

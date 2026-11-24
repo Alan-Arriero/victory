@@ -15,7 +15,7 @@ use victory_shader::{
 };
 use victory_shader::{io, resource};
 
-use crate::shader::{MAX_FILE, Source, sources};
+use crate::shader::{MAX_FILE, Source, scan_entries, sources};
 
 #[derive(Default)]
 struct Tally {
@@ -71,7 +71,7 @@ struct Tally {
     ms_pipelines: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
-    /// With `--list`: one line per program and outcome.
+    /// With `--list`: per-program result rows, including runtime hashes.
     list: bool,
     lines: Vec<String>,
 }
@@ -183,11 +183,9 @@ pub fn run(
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
+    let mut walk_errors = 0;
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
+        for entry in scan_entries(root, &mut walk_errors) {
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
@@ -298,6 +296,10 @@ pub fn run(
     for (reason, (n, example)) in failed {
         println!("  {n:>7}  {reason}  (e.g. {example})");
     }
+    anyhow::ensure!(
+        walk_errors == 0,
+        "scan incomplete (traversal errors: {walk_errors})"
+    );
     Ok(())
 }
 
@@ -308,9 +310,18 @@ fn translate(
     t: &mut Tally,
     checks: &mut Checks,
 ) {
-    let example = || format!("{}{}", path.display(), source.label());
+    let location = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
-        return t.fail("corrupt record".into(), example);
+        return t.fail("corrupt record".into(), location);
+    };
+    let list = t.list;
+    let hash = list.then(|| blake3::hash(&bytes).to_hex().to_string());
+    let example = || {
+        let location = location();
+        match &hash {
+            Some(hash) => format!("{location} hash={}", &hash[..16]),
+            None => location,
+        }
     };
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
@@ -319,7 +330,7 @@ fn translate(
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(dxil)) {
+    if !lock(seen).insert(blake3::hash(dxil)) && !list {
         t.duplicates += 1;
         return;
     }

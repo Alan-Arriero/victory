@@ -57,11 +57,39 @@ pub const INTERFACES: &[Interface] = &[
 
 type This = *const Object;
 
-/// 2: disabled. We present in SDR, so the title must render SDR.
-// shortcut: HDR output is not done (see the presentation items in
-// `TODO.md`); report enabled, with the host display's luminance, once the
-// swap chain can present HDR.
-extern "system" fn try_enable_hdr(_: This, preference: u32, _info: *mut c_void) -> u32 {
+/// `XDisplayHdrModeInfo` (nits).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct HdrModeInfo {
+    min_tone_map_luminance: f32,
+    max_tone_map_luminance: f32,
+    max_full_frame_tone_map_luminance: f32,
+}
+
+/// `XDisplayTryEnableHdrMode`: enables HDR (`1`) and fills the host display's
+/// luminance bounds when Windows HDR is active; otherwise returns disabled (`2`).
+extern "system" fn try_enable_hdr(_: This, preference: u32, info: *mut c_void) -> u32 {
+    #[cfg(windows)]
+    if let Some(hdr) = victory_gpu::display_hdr_info() {
+        if !info.is_null() {
+            // SAFETY: caller passed a writable `XDisplayHdrModeInfo` pointer.
+            unsafe {
+                info.cast::<HdrModeInfo>().write_unaligned(HdrModeInfo {
+                    min_tone_map_luminance: hdr.min_luminance,
+                    max_tone_map_luminance: hdr.max_luminance,
+                    max_full_frame_tone_map_luminance: hdr.max_full_frame_luminance,
+                });
+            }
+        }
+        tracing::info!(
+            preference,
+            min = hdr.min_luminance,
+            max = hdr.max_luminance,
+            max_ff = hdr.max_full_frame_luminance,
+            "HDR mode: enabled"
+        );
+        return 1;
+    }
     tracing::info!(preference, "HDR mode: disabled (SDR presentation)");
     2
 }
@@ -94,7 +122,7 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
     context.Reason.SimpleReasonString = reason.as_mut_ptr();
     // SAFETY: a valid context; the string is copied by the call.
     let request = unsafe { PowerCreateRequest(&context) };
-    if request as isize == -1 {
+    if request.is_null() || request as isize == -1 {
         return last_error();
     }
     // SAFETY: the request we just created.
@@ -111,7 +139,7 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
 extern "system" fn close_deferral(_: This, handle: *mut c_void) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Power::{PowerClearRequest, PowerRequestDisplayRequired};
-    if !handle.is_null() {
+    if !handle.is_null() && handle as isize != -1 {
         // SAFETY: a request from `acquire_deferral`.
         unsafe {
             PowerClearRequest(handle, PowerRequestDisplayRequired);
@@ -176,12 +204,22 @@ mod tests {
     use crate::modules::xgameruntime::{S_OK, method};
 
     #[test]
-    fn sdr_and_display_deferrals() {
+    fn hdr_and_display_deferrals() {
         type Hdr = extern "system" fn(This, u32, *mut c_void) -> u32;
-        assert_eq!(
-            method::<Hdr>(&HDR_OBJECT, 0x20)(&HDR_OBJECT, 0, std::ptr::null_mut()),
-            2
-        );
+        let mut info = HdrModeInfo::default();
+        let res = method::<Hdr>(&HDR_OBJECT, 0x20)(&HDR_OBJECT, 0, (&raw mut info).cast());
+        if let Some(hdr) = victory_gpu::display_hdr_info() {
+            assert_eq!(res, 1);
+            assert_eq!(info.min_tone_map_luminance, hdr.min_luminance);
+            assert_eq!(info.max_tone_map_luminance, hdr.max_luminance);
+            assert_eq!(
+                info.max_full_frame_tone_map_luminance,
+                hdr.max_full_frame_luminance
+            );
+            assert!(info.max_tone_map_luminance > 0.0);
+        } else {
+            assert_eq!(res, 2);
+        }
         type Acquire = extern "system" fn(This, *mut *mut c_void) -> HRESULT;
         type Close = extern "system" fn(This, *mut c_void);
         let mut handle = std::ptr::null_mut();
@@ -191,5 +229,21 @@ mod tests {
         );
         assert!(!handle.is_null());
         method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
+    }
+
+    #[test]
+    fn acquire_deferral_rejects_null_out() {
+        type Acquire = extern "system" fn(This, *mut *mut c_void) -> HRESULT;
+        assert_eq!(
+            method::<Acquire>(&SHELL_OBJECT, 0x20)(&SHELL_OBJECT, std::ptr::null_mut()),
+            super::super::xasync::E_INVALIDARG
+        );
+    }
+
+    #[test]
+    fn close_deferral_handles_null_and_invalid() {
+        type Close = extern "system" fn(This, *mut c_void);
+        method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, std::ptr::null_mut());
+        method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, (-1isize) as *mut c_void);
     }
 }
