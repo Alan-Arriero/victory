@@ -431,9 +431,9 @@ mod tests {
             ),
             S_OK
         );
-        assert_eq!(
-            xasync::XAsyncGetStatus(&mut block, true),
-            FAILED_TO_GET_TOKEN
-        );
+        // Offline, the token call completes with an empty token rather than
+        // FAILED_TO_GET_TOKEN (the title only initialises its auth object on
+        // success; see token_async).
+        assert_eq!(xasync::XAsyncGetStatus(&mut block, true), S_OK);
     }
 }
