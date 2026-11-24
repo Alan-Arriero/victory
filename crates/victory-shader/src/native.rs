@@ -192,6 +192,20 @@ impl NativeProgram {
         }
         code
     }
+
+    /// Whether this program reads spilled root arguments through the
+    /// spill-table pointer in `s[0:1]`.
+    pub fn uses_spill_table(&self) -> bool {
+        self.stage == HwStage::Cs
+            && self
+                .layout
+                .iter()
+                .any(|r| self.stage.user_sgpr(r.user_data) >= 16)
+            && self
+                .layout
+                .iter()
+                .all(|r| self.stage.user_sgpr(r.user_data) >= 2)
+    }
 }
 
 /// What a semantic is, as the stage data names it.

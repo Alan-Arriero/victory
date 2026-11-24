@@ -1371,16 +1371,17 @@ impl<'a> Lower<'a> {
     }
 
     fn load_input(&mut self, id: usize, col: u8) -> Val {
-        if self.s.inputs[id].half {
-            // shortcut: 16-bit vertex inputs (the fetch routine's) are not
-            // unpacked; pixel inputs are (`interp`).
-            return Val::Missing("a 16-bit input");
-        }
-        self.load_any_input(id, col)
+        let x = self.load_input_bits(id, col);
+        Val::I32(if self.s.inputs[id].half {
+            // The fetch ABI gives each channel its own VGPR.
+            self.input_half(id, x)
+        } else {
+            x
+        })
     }
 
-    /// An input element's channel as declared (16-bit ones as 32-bit floats).
-    fn load_any_input(&mut self, id: usize, col: u8) -> Val {
+    /// An input channel as declared on the host, where 16-bit types are widened.
+    fn load_input_bits(&mut self, id: usize, col: u8) -> V {
         let e = &mut self.s.inputs[id];
         e.usage |= 1 << col;
         let (int, bit) = (e.comp != 9, e.comp == 1);
@@ -1414,12 +1415,22 @@ impl<'a> Lower<'a> {
             &args,
         );
         if bit {
-            let z = self.s.m.cast(entry, Cast::ZExt, v, self.s.t.i32);
-            Val::I32(z)
+            self.s.m.cast(entry, Cast::ZExt, v, self.s.t.i32)
         } else if int {
-            Val::I32(v)
+            v
         } else {
-            Val::I32(self.s.m.cast(entry, Cast::Bitcast, v, self.s.t.i32))
+            self.s.m.cast(entry, Cast::Bitcast, v, self.s.t.i32)
+        }
+    }
+
+    /// Recover the console's 16-bit payload from a widened host channel.
+    fn input_half(&mut self, id: usize, x: V) -> V {
+        if self.s.inputs[id].comp == 9 {
+            let f = self.as_float(x);
+            self.f16_nearest(f)
+        } else {
+            let mask = self.s.m.i32(0xFFFF);
+            self.s.m.bin(self.cur, Bin::And, x, mask)
         }
     }
 
@@ -6562,19 +6573,16 @@ impl<'a> Lower<'a> {
             return Err("an interpolation");
         };
         // A channel of an input element, interpolated as `mode` says.
-        let channel = |l: &mut Self, row: u8, ch: u8| -> Result<V, Why> {
-            let (id, col) = l
-                .find_input(row, ch)
-                .ok_or("an input the signature lacks")?;
+        let channel = |l: &mut Self, id: usize, col: u8| -> Result<V, Why> {
             let e = &mut l.s.inputs[id];
             if e.interp != mode && e.usage != 0 {
                 return Err("one input interpolated two ways");
             }
-            e.interp = mode;
-            match l.load_any_input(id, col) {
-                Val::I32(x) => Ok(x),
-                _ => Err("an input"),
+            if mode != 1 && e.comp != 9 {
+                return Err("interpolation of an integer input");
             }
+            e.interp = mode;
+            Ok(l.load_input_bits(id, col))
         };
         let packing = match &self.x.native.io {
             StageIo::Ps { inputs, .. } => inputs
@@ -6586,34 +6594,44 @@ impl<'a> Lower<'a> {
         let f16 = inst.name().ends_with("_f16");
         let x = match packing {
             None if f16 || attribute.high => return Err("a 16-bit read of a 32-bit input"),
-            None => channel(self, attribute.row, attribute.channel)?,
+            None => {
+                let (id, col) = self
+                    .find_input(attribute.row, attribute.channel)
+                    .ok_or("an input the signature lacks")?;
+                channel(self, id, col)?
+            }
             Some((pack2, b)) => {
-                // 16-bit values: one in the low half of each dword, or two
-                // per dword (`packed_half`); the host's are 32-bit floats.
-                let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
+                if !self
+                    .s
+                    .inputs
+                    .iter()
+                    .any(|e| e.row == Some(u32::from(attribute.row)))
+                {
+                    return Err("an input the signature lacks");
+                }
+                let half = |l: &mut Self, h: u8| -> Result<V, Why> {
                     let src = if pack2 {
                         packed_half(&l.s.inputs, attribute.row, b, h)
                     } else {
                         h.is_multiple_of(2).then_some((attribute.row, h / 2))
                     };
-                    let Some((row, ch)) = src else {
-                        return Ok(None);
+                    let Some((id, col)) = src.and_then(|(row, ch)| l.find_input(row, ch)) else {
+                        // An unwritten half has no host input channel. Give it
+                        // the same zero as an unwritten register.
+                        return Ok(l.s.m.i32(0));
                     };
-                    let x = channel(l, row, ch)?;
-                    let f = l.as_float(x);
-                    Ok(Some(l.f16_nearest(f)))
+                    let x = channel(l, id, col)?;
+                    Ok(l.input_half(id, x))
                 };
                 let h = 2 * attribute.channel;
                 let c = self.cur;
                 if f16 {
-                    let lo = half(self, h + u8::from(attribute.high))?
-                        .ok_or("a packed input half no element holds")?;
+                    let lo = half(self, h + u8::from(attribute.high))?;
                     self.low_half(inst, reg, lo)
                 } else if mode == 1 {
                     // The whole dword of a flat input: both halves.
-                    let z = self.s.m.i32(0);
-                    let lo = half(self, h)?.unwrap_or(z);
-                    let hi = half(self, h + 1)?.unwrap_or(z);
+                    let lo = half(self, h)?;
+                    let hi = half(self, h + 1)?;
                     let k16 = self.s.m.i32(16);
                     let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
                     self.s.m.bin(c, Bin::Or, lo, hi)
@@ -8051,22 +8069,36 @@ impl<'a> Lower<'a> {
         };
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
+            let comp = elements(self, primitive)[id].comp;
             if let Some(high) = half {
-                // An f16 half, declared a 32-bit float on the host.
                 let c = self.cur;
                 if high {
                     let k16 = self.s.m.i32(16);
                     x = self.s.m.bin(c, Bin::LShr, x, k16);
                 }
-                let f32t = self.s.t.f32;
-                let f = self
-                    .s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
-                x = self.as_int(f);
+                // The host links these channels at 32 bits.
+                match comp {
+                    4 if !e.compressed => {
+                        let k16 = self.s.m.i32(16);
+                        let low = self.s.m.bin(c, Bin::Shl, x, k16);
+                        x = self.s.m.bin(c, Bin::AShr, low, k16);
+                    }
+                    5 if !e.compressed => {
+                        let mask = self.s.m.i32(0xFFFF);
+                        x = self.s.m.bin(c, Bin::And, x, mask);
+                    }
+                    _ => {
+                        let f32t = self.s.t.f32;
+                        let f = self
+                            .s
+                            .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
+                        x = self.as_int(f);
+                    }
+                }
             }
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
-            let (suffix, x) = match el.comp {
+            let (suffix, x) = match comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
                     let f = match self.floats.get(&value) {
