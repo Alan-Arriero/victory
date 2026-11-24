@@ -59,6 +59,10 @@ pub(crate) struct Heap {
     host: std::sync::OnceLock<Option<host::HostHeap>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
+    /// Last `watch::writes` asking number scanned for direct CPU copies into
+    /// this heap's memory (`0` before the first sync).
+    #[cfg(windows)]
+    sync_watch: std::sync::Mutex<u64>,
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -105,6 +109,49 @@ impl Heap {
         let at = handle.checked_sub(self.start)?;
         let index = at / step;
         (index < u64::from(self.desc.count)).then_some(index as u32)
+    }
+
+    /// Detects and mirrors descriptor slots the title wrote directly in heap
+    /// memory (bypassing `Create*View` and `CopyDescriptors*`).
+    ///
+    /// Uses kernel write-watch pages when the heap lives in write-watched title
+    /// memory so clean heaps scan zero slots; falls back to scanning the
+    /// host-mirrored slot range when the heap memory is not write-watched.
+    #[cfg(windows)]
+    pub(crate) fn sync_direct_copies(&self, for_draw: bool) -> usize {
+        let Some(Some(host)) = self.host.get() else {
+            return 0;
+        };
+        let Some(step) = increment(self.desc.kind).map(u64::from) else {
+            return 0;
+        };
+        let mirrored_count = self.desc.count.min(host.count());
+        if mirrored_count == 0 {
+            return 0;
+        }
+        let start = self.start as usize;
+        let end = start.saturating_add(mirrored_count as usize * step as usize);
+        let mut last_watch = self.sync_watch.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((now, pages)) = crate::watch::writes(start, end, false) {
+            let prev = *last_watch;
+            let mut mirrored = 0;
+            for (page, written_at) in pages {
+                if written_at <= prev {
+                    continue;
+                }
+                let page_start = page * crate::watch::PAGE;
+                let page_end = page_start + crate::watch::PAGE;
+                let lo = page_start.max(start) - start;
+                let hi = page_end.min(end) - start;
+                let first_slot = (lo / step as usize) as u32;
+                let end_slot = hi.div_ceil(step as usize).min(mirrored_count as usize) as u32;
+                mirrored += host.sync_slots(self.start, step, first_slot, end_slot, for_draw);
+            }
+            *last_watch = now;
+            return mirrored;
+        }
+        drop(last_watch);
+        host.sync_slots(self.start, step, 0, mirrored_count, for_draw)
     }
 }
 
@@ -182,6 +229,26 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
         host.release(first, n);
+    }
+}
+
+/// Mirrors any descriptor slots the title copied directly in memory across all
+/// live, already-initialized shader-visible heaps (called before submission).
+#[cfg(windows)]
+pub(crate) fn sync_all_heaps() {
+    let pinned: Vec<object::Held> = {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        heaps
+            .iter()
+            .filter_map(|&(_, _, at)| {
+                // SAFETY: while `SHADER_HEAPS` is held, no registered `Heap`
+                // has finished `Drop`, so its `Object` refcount is still live.
+                unsafe { object::Held::try_new(at as This) }
+            })
+            .collect()
+    };
+    for held in pinned {
+        heap(held.get()).sync_direct_copies(true);
     }
 }
 
@@ -676,6 +743,8 @@ pub(crate) extern "system" fn create_heap(
         host: std::sync::OnceLock::new(),
         #[cfg(windows)]
         pending: Default::default(),
+        #[cfg(windows)]
+        sync_watch: std::sync::Mutex::new(0),
     });
     #[cfg(windows)]
     if visible {
