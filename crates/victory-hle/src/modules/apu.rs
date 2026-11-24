@@ -509,7 +509,13 @@ fn process_convert(
             samples
         };
     }
-    let room = output_length as usize / (4 * channels);
+    let deinterleaved_output = options & DEINTERLEAVED_OUTPUT != 0 && channels == 2;
+    let mut room = output_length as usize / (4 * channels);
+    if deinterleaved_output {
+        // The right channel starts at the midpoint; more frames than that
+        // would write the left channel over it.
+        room = room.min(max_frames as usize);
+    }
     let mut converted = vec![0f32; room * channels];
     let frames = resampler.convert(
         &pcm,
@@ -519,7 +525,7 @@ fn process_convert(
         // FLUSH is a command option; `options` are the connection's.
         { command.id.options } & FLUSH != 0,
     );
-    if options & DEINTERLEAVED_OUTPUT != 0 && channels == 2 {
+    if deinterleaved_output {
         // The converter's midpoint is `maxFrameCountPerOutput`, even when
         // fewer frames were written (the docs spell this out).
         let midpoint = max_frames as usize;
@@ -720,13 +726,17 @@ mod tests {
     }
 
     fn connect(process: u32, frames: u32) -> (*mut Connection, *mut u8) {
+        connect_with(process, frames, 0)
+    }
+
+    fn connect_with(process: u32, frames: u32, options: u32) -> (*mut Connection, *mut u8) {
         let input = ConnectInput {
             process,
             streams: 1,
             commands_per_stream: 2,
             memory: 0x10_0000,
             frames_per_output: frames,
-            options: 0,
+            options,
         };
         let mut output = ConnectOutput {
             memory: std::ptr::null_mut(),
@@ -805,6 +815,50 @@ mod tests {
             connect_as(&input(9, 256), &mut output, &mut handle),
             E_NOTIMPL
         );
+    }
+
+    #[test]
+    fn deinterleaved_output_stops_at_the_channel_midpoint() {
+        // A 256-frame midpoint, half pitch, and room for 1024 frames: the
+        // left channel must not run on over the right one.
+        let (handle, base) = connect_with(CONVERT_PCM, 256, DEINTERLEAVED_OUTPUT);
+        activate(handle, 2, 0.5);
+        let samples: Vec<f32> = (0..256)
+            .flat_map(|i| [i as f32, 1000.0 + i as f32])
+            .collect();
+        let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        // SAFETY: inside the connection memory.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), base, bytes.len()) };
+        let command = Process {
+            id: id(PROCESS, 0),
+            pitch_ramp: 0.0,
+            target_pitch: 0.5,
+            first_frame: 0,
+            frame_count: 256,
+            input_length: bytes.len() as u32,
+            input: base,
+            output_length: 1024 * 2 * 4,
+            output: base.wrapping_add(0x1000),
+        };
+        assert_eq!(
+            XApuEnqueueCommand(handle, (&raw const command).cast(), std::ptr::null_mut()),
+            S_OK
+        );
+        let mut result = std::mem::MaybeUninit::<ApuResult>::zeroed();
+        assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), S_OK);
+        assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), S_OK);
+        // SAFETY: written above.
+        let result = unsafe { result.assume_init() };
+        let (error, frames) = (result.error, result.frames);
+        assert_eq!((error, frames), (S_OK, 256));
+        // SAFETY: the converter wrote both 256-float halves there.
+        let pcm =
+            unsafe { std::slice::from_raw_parts(base.wrapping_add(0x1000).cast::<f32>(), 512) };
+        assert_eq!(pcm[..4], [0.0, 0.5, 1.0, 1.5]);
+        assert_eq!(pcm[255], 127.5);
+        assert_eq!(pcm[256..260], [1000.0, 1000.5, 1001.0, 1001.5]);
+        assert_eq!(pcm[511], 1127.5);
+        assert_eq!(XApuDisconnect(handle), S_OK);
     }
 
     #[test]
