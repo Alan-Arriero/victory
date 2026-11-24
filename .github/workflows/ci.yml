@@ -56,6 +56,18 @@ jobs:
       - name: Tests
         run: cargo test --workspace --locked -- --test-threads=1
 
+  msrv:
+    name: msrv
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      # Keep this version in sync with workspace.package.rust-version.
+      - name: Install minimum Rust toolchain
+        run: rustup toolchain install 1.88.0
+      - name: Check workspace on the declared minimum
+        run: cargo +1.88.0 check --workspace --locked
+
   # The portable crates build and test on Linux too; this catches
   # Windows-only code reaching them.
   linux:
