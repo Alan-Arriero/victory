@@ -463,9 +463,16 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
     );
 }
 
-/// The title released it; lists that still hold its copy keep it alive.
+/// The title released it; lists that still hold its copy keep it alive,
+/// and any active epoch keeps it until that work completes.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let shadow = {
+        let mut map = buffers();
+        map.remove(&(start, resource)).and_then(|e| e.shadow)
+    };
+    if let Some(shadow) = shadow {
+        crate::host::retire(shadow);
+    }
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
@@ -707,5 +714,57 @@ mod tests {
             cached[2],
             baseline[2].as_secs_f64() / cached[2].as_secs_f64(),
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unregister_drops_shadow_immediately_when_idle() {
+        let _retire = crate::host::isolated_retire_scope();
+        if host().is_none() {
+            return;
+        }
+        let data = vec![0u8; 4096];
+        let start = data.as_ptr() as u64;
+        let resource = 0xdead_beef_0001_usize;
+        register(resource, start, data.len() as u64);
+        let weak = {
+            let shadow = find(start, 64).expect("shadow");
+            Arc::downgrade(&shadow)
+        };
+        assert_eq!(weak.strong_count(), 1);
+        unregister(resource, start);
+        assert_eq!(weak.strong_count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unregister_retires_shadow_until_active_epoch_finishes() {
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        list.mark_work();
+
+        let data = vec![0u8; 4096];
+        let start = data.as_ptr() as u64;
+        let resource = 0xdead_beef_0002_usize;
+        register(resource, start, data.len() as u64);
+        let weak = {
+            let shadow = find(start, 64).expect("shadow");
+            Arc::downgrade(&shadow)
+        };
+        assert_eq!(weak.strong_count(), 1);
+
+        unregister(resource, start);
+        assert_eq!(
+            weak.strong_count(),
+            1,
+            "unregistered shadow must wait for active epochs"
+        );
+
+        list.close();
+        list.reset();
+        assert_eq!(weak.strong_count(), 0);
     }
 }

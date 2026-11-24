@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{
-    DXGI_STATUS_OCCLUDED, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    DXGI_STATUS_OCCLUDED, HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -61,6 +61,8 @@ pub(crate) struct Host {
     free_lists: Mutex<Vec<HostList>>,
     #[cfg(test)]
     reused_lists: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    d3d12_errors: std::sync::atomic::AtomicU64,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -69,57 +71,185 @@ unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
 
-/// Time spent in submissions since the last frame-rate line, in
-/// microseconds: preparing them on the CPU (title memory copies, texture
-/// detiling), then waiting for the GPU.
-/// Host objects the title let go of while a submission may still use them
-/// (a texture its descriptors name, a descriptor slot's old resource), by
-/// the submission count they wait for. The title's descriptor writes and
-/// releases reach the host at once, from its own threads, while the host
-/// runs a submission for most of a second in the world: freeing there was
-/// a GPU page fault on the freed texture (DXGI_ERROR_DEVICE_HUNG,
-/// 2026-11-24, RX 7600).
-static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
-/// Submissions started and finished (waited for).
-static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Warn once when a pinned epoch holds back this many retired host objects
+/// (for example, an unreset command list or a submission stalled behind an
+/// unsignalled fence).
+const RETIRED_WARN_THRESHOLD: usize = 4096;
 
-/// A retired object, dropped on whatever thread finishes the submission.
+/// Host objects the title let go of while an open list or a queued/running
+/// submission may still use them (a texture its descriptors name, a descriptor
+/// slot's old resource, a buffer shadow, or texture staging), by the highest
+/// epoch that existed when they were retired. The title's descriptor writes and
+/// releases reach the host at once, from its own threads, while lists are
+/// recorded or submissions run for most of a second in the world: freeing there
+/// was a GPU page fault on the freed texture (DXGI_ERROR_DEVICE_HUNG,
+/// 2026-11-24, RX 7600).
+///
+/// Any stuck pinned epoch (such as a list that recorded GPU work and is never
+/// reset, or a submission waiting behind a fence that never signals) pins all
+/// later retirements until it is released; a one-time warning is logged once
+/// the queue reaches [`RETIRED_WARN_THRESHOLD`].
+///
+/// Lock invariant: `RETIRE_STATE` is a strict leaf lock — never lock anything
+/// else while holding it, and ALWAYS drop retired objects AFTER releasing it.
+struct RetireState {
+    next_epoch: u64,
+    active_epochs: std::collections::BTreeMap<u64, usize>,
+    retired: std::collections::VecDeque<(u64, Retired)>,
+    warned: bool,
+}
+
+impl RetireState {
+    const fn new() -> Self {
+        Self {
+            next_epoch: 1,
+            active_epochs: std::collections::BTreeMap::new(),
+            retired: std::collections::VecDeque::new(),
+            warned: false,
+        }
+    }
+}
+
+static RETIRE_STATE: Mutex<RetireState> = Mutex::new(RetireState::new());
+
+#[cfg(test)]
+thread_local! {
+    static RETIRE_SCOPE: std::cell::RefCell<Option<std::sync::Arc<Mutex<RetireState>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct RetireTestScope {
+    prev: Option<std::sync::Arc<Mutex<RetireState>>>,
+}
+
+#[cfg(test)]
+impl Drop for RetireTestScope {
+    fn drop(&mut self) {
+        RETIRE_SCOPE.with(|cell| *cell.borrow_mut() = self.prev.take());
+    }
+}
+
+#[cfg(test)]
+fn current_retire_scope() -> Option<std::sync::Arc<Mutex<RetireState>>> {
+    RETIRE_SCOPE.with(|cell| cell.borrow().clone())
+}
+
+#[cfg(test)]
+fn enter_retire_scope(scope: Option<std::sync::Arc<Mutex<RetireState>>>) -> RetireTestScope {
+    let prev = RETIRE_SCOPE.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), scope));
+    RetireTestScope { prev }
+}
+
+/// Isolates retirement epochs and queued drops on the current test thread (and
+/// any `HostList` created or acquired on it) from concurrent GPU tests.
+#[cfg(test)]
+pub(crate) fn isolated_retire_scope() -> RetireTestScope {
+    let fresh = std::sync::Arc::new(Mutex::new(RetireState::new()));
+    let prev = RETIRE_SCOPE.with(|cell| cell.borrow_mut().replace(fresh));
+    RetireTestScope { prev }
+}
+
+/// A retired object, dropped on whatever thread finishes the blocking epoch.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
 // reference-counted wrappers holding them, dropped once.
 unsafe impl Send for Retired {}
 
-/// Drops `object` once every submission running now has finished: at once
-/// if none is.
-pub(crate) fn retire<T: 'static>(object: T) {
-    let started = STARTED.load(Ordering::Acquire);
-    if started <= FINISHED.load(Ordering::Acquire) {
-        drop(object);
-        return;
-    }
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((started, Retired(Box::new(object))));
+/// Acquires a monotonically increasing epoch (never 0) that keeps retired
+/// objects alive until [`release_epoch_in`] is called with it.
+fn acquire_epoch_in(retire_state: &Mutex<RetireState>) -> u64 {
+    let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
+    let e = state.next_epoch;
+    state.next_epoch += 1;
+    *state.active_epochs.entry(e).or_default() += 1;
+    e
 }
 
-/// Drops what waited for submissions up to `finished`.
-fn bury(finished: u64) {
-    let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-        if retired.is_empty() {
-            return;
+/// Releases an epoch acquired with [`acquire_epoch_in`] and drops any retired
+/// objects whose blocking epochs have all completed, after releasing the lock.
+fn release_epoch_in(retire_state: &Mutex<RetireState>, epoch: u64) {
+    if epoch == 0 {
+        return;
+    }
+    let done: Vec<Retired> = {
+        let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
+        if let std::collections::btree_map::Entry::Occupied(mut entry) =
+            state.active_epochs.entry(epoch)
+        {
+            if *entry.get() <= 1 {
+                entry.remove();
+            } else {
+                *entry.get_mut() -= 1;
+            }
         }
-        let (done, keep) = std::mem::take(&mut *retired)
-            .into_iter()
-            .partition(|(at, _)| *at <= finished);
-        *retired = keep;
+        let min_active = state.active_epochs.keys().next().copied();
+        let mut done = Vec::new();
+        while let Some(&(wait_for, _)) = state.retired.front() {
+            if min_active.is_none_or(|min| min > wait_for) {
+                if let Some((_, item)) = state.retired.pop_front() {
+                    done.push(item);
+                }
+            } else {
+                break;
+            }
+        }
         done
     };
     drop(done);
 }
 
+fn retire_in<T: 'static>(retire_state: &Mutex<RetireState>, object: T) {
+    let warn = {
+        let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.active_epochs.is_empty() {
+            drop(state);
+            drop(object);
+            return;
+        }
+        let wait_for = state.next_epoch.saturating_sub(1);
+        state
+            .retired
+            .push_back((wait_for, Retired(Box::new(object))));
+        if !state.warned && state.retired.len() >= RETIRED_WARN_THRESHOLD {
+            state.warned = true;
+            Some((
+                state.retired.len(),
+                state.active_epochs.keys().next().copied().unwrap_or(0),
+                state.active_epochs.len(),
+                wait_for,
+            ))
+        } else {
+            None
+        }
+    };
+    if let Some((pending, oldest_epoch, active_epochs, latest_epoch)) = warn {
+        tracing::warn!(
+            pending,
+            oldest_epoch,
+            active_epochs,
+            latest_epoch,
+            "retired host resource queue grew past threshold; an unreset command list or stalled wait may be pinning epochs"
+        );
+    }
+}
+
+/// Drops `object` once every epoch active now has finished: at once if none is.
+/// Note: a stuck pinned epoch (such as an unreset list with recorded work or a
+/// submission behind an unsignalled fence) holds back all later retirements
+/// until released.
+pub(crate) fn retire<T: 'static>(object: T) {
+    #[cfg(test)]
+    if let Some(scope) = current_retire_scope() {
+        retire_in(&scope, object);
+        return;
+    }
+    retire_in(&RETIRE_STATE, object);
+}
+
+/// Time spent in submissions since the last frame-rate line, in
+/// microseconds: preparing them on the CPU (title memory copies, texture
+/// detiling), then waiting for the GPU.
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -323,6 +453,8 @@ fn create() -> windows::core::Result<Host> {
             free_lists: Mutex::default(),
             #[cfg(test)]
             reused_lists: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            d3d12_errors: std::sync::atomic::AtomicU64::new(0),
         })
     }
 }
@@ -460,6 +592,18 @@ pub(crate) struct HostList {
     /// expanded vertices, rewritten draw arguments and per-draw atomic
     /// counters, reused across draws and across resets.
     rect_scratch: Mutex<RectScratch>,
+    /// Active retirement epoch pinned while this list has recorded work or is
+    /// queued/executing (0 when idle).
+    epoch: std::sync::atomic::AtomicU64,
+    /// Queued or executing submissions currently pinning this list.
+    in_flight: std::sync::atomic::AtomicUsize,
+    /// Serializes `in_flight` transitions with `epoch` updates so a concurrent
+    /// `end_submit` never clears an epoch pinned by a new `begin_submit`.
+    epoch_lock: Mutex<()>,
+    /// Test-only isolated retirement state captured when the list is created or
+    /// acquired so parallel GPU tests do not pin each other's drops.
+    #[cfg(test)]
+    retire_scope: Option<std::sync::Arc<Mutex<RetireState>>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -473,6 +617,7 @@ pub(crate) struct HostList {
 impl Drop for HostList {
     fn drop(&mut self) {
         self.release_kept();
+        self.release_epoch();
     }
 }
 
@@ -733,9 +878,15 @@ impl Host {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .pop();
-        if let Some(list) = pooled {
-            #[cfg(test)]
+        #[cfg(test)]
+        if let Some(mut list) = pooled {
             self.reused_lists.fetch_add(1, Ordering::Relaxed);
+            list.reset();
+            list.retire_scope = current_retire_scope();
+            return Ok(list);
+        }
+        #[cfg(not(test))]
+        if let Some(list) = pooled {
             list.reset();
             return Ok(list);
         }
@@ -745,6 +896,11 @@ impl Host {
     #[cfg(test)]
     pub(crate) fn reused_lists(&self) -> u64 {
         self.reused_lists.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn d3d12_errors(&self) -> u64 {
+        self.d3d12_errors.load(Ordering::Relaxed)
     }
 
     /// Returns a finished, unreferenced host list to the pool up to
@@ -794,6 +950,11 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 rect_scratch: Mutex::default(),
+                epoch: std::sync::atomic::AtomicU64::new(0),
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                epoch_lock: Mutex::default(),
+                #[cfg(test)]
+                retire_scope: current_retire_scope(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -807,7 +968,16 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        #[cfg(test)]
+        let exec_scope = runs
+            .iter()
+            .find_map(|l| l.retire_scope.clone())
+            .or_else(current_retire_scope);
+        #[cfg(test)]
+        let exec_state: &Mutex<RetireState> = exec_scope.as_deref().unwrap_or(&RETIRE_STATE);
+        #[cfg(not(test))]
+        let exec_state: &Mutex<RetireState> = &RETIRE_STATE;
+        let exec_epoch = acquire_epoch_in(exec_state);
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -815,13 +985,17 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
-        for list in runs {
-            list.run_deferred(&mut batch);
-            firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
-                lists.push(Some(prelude));
+        {
+            #[cfg(test)]
+            let _scope = enter_retire_scope(exec_scope.clone());
+            for list in runs {
+                list.run_deferred(&mut batch);
+                firsts.push(lists.len());
+                if let Some(prelude) = list.prelude() {
+                    lists.push(Some(prelude));
+                }
+                lists.push(list.list.cast().ok());
             }
-            lists.push(list.list.cast().ok());
         }
         batch.flush();
         let prepared = std::time::Instant::now();
@@ -844,15 +1018,32 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                match self.queue.Signal(&self.fence, *submitted) {
+                    Ok(()) => match self.fence.SetEventOnCompletion(*submitted, self.event) {
+                        Ok(()) => {
+                            let waited = WaitForSingleObject(self.event, INFINITE);
+                            if waited != WAIT_OBJECT_0 {
+                                tracing::warn!(
+                                    wait = waited.0,
+                                    "host fence event wait failed; polling fence"
+                                );
+                                self.poll_fence(*submitted);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "host fence event registration failed; polling fence"
+                            );
+                            self.poll_fence(*submitted);
+                        }
+                    },
+                    Err(e) => fail(format_args!(
+                        "host GPU fence signal failed after a submission of {} lists ({e}){}{}",
+                        runs.len(),
+                        self.removal_data(runs),
+                        last_notes(runs)
+                    )),
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -876,8 +1067,6 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
-        FINISHED.store(this_submission, Ordering::Release);
-        bury(this_submission);
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -948,7 +1137,33 @@ impl Host {
         }
         self.log_messages();
         drop(submitted);
+        release_epoch_in(exec_state, exec_epoch);
         woken.run();
+    }
+
+    /// Fallback completion wait when registering or waiting on `self.event`
+    /// fails after `self.queue.Signal(&self.fence, target)` succeeded, so
+    /// copy-back, writes, and epoch retirement never run while the GPU may
+    /// still be executing.
+    fn poll_fence(&self, target: u64) {
+        let mut spins = 0u32;
+        loop {
+            // SAFETY: plain fence and device queries on our live host objects.
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            if completed >= target || completed == u64::MAX {
+                return;
+            }
+            // SAFETY: plain device-removed query.
+            if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                return;
+            }
+            if spins < 64 {
+                spins += 1;
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -1088,8 +1303,12 @@ impl Host {
                     let text = String::from_utf8_lossy(text);
                     let text = text.trim_end_matches('\0');
                     tracing::warn!(id = m.ID.0, severity = m.Severity.0, "D3D12: {text}");
-                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && first_error.is_none() {
-                        first_error = Some(text.to_owned());
+                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
+                        #[cfg(test)]
+                        self.d3d12_errors.fetch_add(1, Ordering::Relaxed);
+                        if first_error.is_none() {
+                            first_error = Some(text.to_owned());
+                        }
                     }
                 }
             }
@@ -1313,6 +1532,84 @@ impl HostList {
         }
     }
 
+    fn retire_state(&self) -> &Mutex<RetireState> {
+        #[cfg(test)]
+        if let Some(scope) = self.retire_scope.as_deref() {
+            return scope;
+        }
+        &RETIRE_STATE
+    }
+
+    fn ensure_epoch(&self, _guard: &std::sync::MutexGuard<'_, ()>) {
+        if self.epoch.load(Ordering::Acquire) == 0 {
+            let e = acquire_epoch_in(self.retire_state());
+            self.epoch.store(e, Ordering::Release);
+        }
+    }
+
+    /// Pins a retirement epoch for this list once it records GPU work, so
+    /// retired host resources remain alive until the list executes or resets.
+    pub(crate) fn mark_work(&self) {
+        if self.epoch.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let guard = self.epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.ensure_epoch(&guard);
+    }
+
+    /// Pins an epoch and increments the in-flight submission count for this
+    /// list before queuing it on a command queue timeline.
+    pub(crate) fn begin_submit(&self) {
+        let guard = self.epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        self.ensure_epoch(&guard);
+    }
+
+    /// Releases a queued submission pin and, if it was the last in-flight
+    /// submission for this list, releases the list's retirement epoch.
+    pub(crate) fn end_submit(&self) {
+        let released = {
+            let _guard = self.epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
+            if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+                self.epoch.swap(0, Ordering::AcqRel)
+            } else {
+                0
+            }
+        };
+        if released != 0 {
+            release_epoch_in(self.retire_state(), released);
+        }
+    }
+
+    /// Releases a queued submission pin for a cancelled (unexecuted) submission
+    /// without clearing the list's recording epoch: if the title still owns
+    /// this closed list, its epoch stays pinned until it executes, resets, or
+    /// drops; if the cancelled submission held the last reference, dropping
+    /// the `HostList` immediately releases the epoch.
+    pub(crate) fn cancel_submit(&self) {
+        let _guard = self.epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_epoch(&self) -> bool {
+        self.epoch.load(Ordering::Acquire) != 0
+    }
+
+    fn release_epoch(&self) {
+        let released = {
+            let _guard = self.epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
+            if self.in_flight.load(Ordering::Acquire) == 0 {
+                self.epoch.swap(0, Ordering::AcqRel)
+            } else {
+                0
+            }
+        };
+        if released != 0 {
+            release_epoch_in(self.retire_state(), released);
+        }
+    }
+
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
@@ -1349,6 +1646,7 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        self.release_epoch();
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -1362,6 +1660,7 @@ impl HostList {
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
+        self.mark_work();
         let wanted = legal_state(texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
@@ -1469,6 +1768,7 @@ impl HostList {
 
     /// Notes a pipeline the list binds.
     pub(crate) fn used_pipeline(&self, name: &str) {
+        self.mark_work();
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if !pipelines.contains(name) {
             pipelines.insert(name.to_owned());
@@ -1481,6 +1781,7 @@ impl HostList {
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
+        self.mark_work();
         let mut deferred = self.deferred();
         deferred
             .copies
@@ -1500,6 +1801,7 @@ impl HostList {
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
+        self.mark_work();
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
@@ -1515,6 +1817,7 @@ impl HostList {
         src: *const u8,
         len: usize,
     ) {
+        self.mark_work();
         let mut d = self.deferred();
         // Every draw or dispatch that binds the slot asks; until a title
         // copy intervenes another fill would copy the same bytes again.
@@ -1533,6 +1836,7 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        self.mark_work();
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
@@ -1550,6 +1854,7 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        self.mark_work();
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));
@@ -1557,6 +1862,7 @@ impl HostList {
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
+        self.mark_work();
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
@@ -1573,6 +1879,7 @@ impl HostList {
         row_bytes: usize,
         total: usize,
     ) {
+        self.mark_work();
         self.deferred().readbacks.push(Readback {
             dst: dst as usize,
             src: src as usize,
@@ -1590,6 +1897,7 @@ impl HostList {
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let (buffer, data) = host.upload_buffer(size)?;
+        self.mark_work();
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().uploads.push(buffer.clone());
         Some((buffer, data))
@@ -1599,6 +1907,7 @@ impl HostList {
     /// reset.
     pub(crate) fn readback(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *const u8)> {
         let (buffer, data) = host.readback_buffer(size)?;
+        self.mark_work();
         name(&buffer, || format!("list readback {size:#x}"));
         self.deferred().uploads.push(buffer.clone());
         Some((buffer, data))
@@ -1608,16 +1917,17 @@ impl HostList {
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
         let host = host()?;
-        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            self.mark_work();
             self.deferred().uploads.push(buffer);
             return Some((gpu, data));
         }
+        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
             (s.current, s.used) = (s.current + 1, 0);
         }
@@ -1632,6 +1942,8 @@ impl HostList {
         let (_, data, gpu) = s.chunks[s.current];
         let at = s.used;
         s.used += len;
+        drop(s);
+        self.mark_work();
         Some((gpu + at, (data + at as usize) as *mut u8))
     }
 
@@ -1645,6 +1957,7 @@ impl HostList {
                 Some((b, d as usize))
             })
             .as_ref()?;
+        self.mark_work();
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
@@ -1667,7 +1980,10 @@ impl HostList {
             name(&buffer, || format!("rect scratch {capacity:#x}"));
             rect.vertices = Some(buffer);
         }
-        rect.vertices.clone()
+        let buffer = rect.vertices.clone()?;
+        drop(rect);
+        self.mark_work();
+        Some(buffer)
     }
 
     /// A GPU-writable buffer of at least `bytes` for rewritten indirect
@@ -1678,12 +1994,16 @@ impl HostList {
         if let Some((buf, len)) = &rect.args
             && *len >= want
         {
-            return Some(buf.clone());
+            let buf = buf.clone();
+            drop(rect);
+            self.mark_work();
+            return Some(buf);
         }
         let buffer = host()?.default_buffer(want)?;
         name(&buffer, || format!("rect args {want:#x}"));
         let old = rect.args.replace((buffer.clone(), want));
         drop(rect);
+        self.mark_work();
         if let Some((old, _)) = old {
             self.keep(&old);
         }
@@ -1711,6 +2031,7 @@ impl HostList {
         let slot = rect.counter_used;
         rect.counter_used += 1;
         drop(rect);
+        self.mark_work();
         if slot == 0 {
             let bytes = RECT_COUNTER_CHUNK as usize * 4;
             // SAFETY: the list's own mapped chunk, zeroed before it runs.
@@ -1724,8 +2045,31 @@ impl HostList {
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
+            self.mark_work();
             self.deferred().kept.push(object);
         }
+    }
+
+    /// Keeps `object` alive until the list is reset without pinning a
+    /// retirement epoch (used when mirroring fixed-function target bindings
+    /// onto a newly split trailing list before any GPU work is recorded).
+    pub(crate) fn keep_unmarked(&self, object: &impl Interface) {
+        if let Ok(object) = object.cast::<windows::core::IUnknown>() {
+            self.deferred().kept.push(object);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kept_contains(&self, object: &impl Interface) -> bool {
+        object.cast::<windows::core::IUnknown>().is_ok_and(|u| {
+            let raw = u.as_raw();
+            self.deferred().kept.iter().any(|k| k.as_raw() == raw)
+        })
+    }
+
+    #[cfg(test)]
+    fn defer_unmarked(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().copies.push(Step::Run(Box::new(work)));
     }
 
     /// Whether this is the first time since the reset that the list asks
@@ -1737,6 +2081,7 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
+        self.mark_work();
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.refreshed.clear();
@@ -1745,12 +2090,14 @@ impl HostList {
 
     /// As [`HostList::defer`], for work that writes only host memory.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
+        self.mark_work();
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
+        self.mark_work();
         self.deferred().copies.push(Step::Texture(staging));
     }
 
@@ -3056,6 +3403,24 @@ fn pick_hardware_adapter(
 }
 
 #[cfg(test)]
+pub(crate) struct DropCounter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(test)]
+impl DropCounter {
+    pub(crate) fn new() -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (Self(count.clone()), count)
+    }
+}
+
+#[cfg(test)]
+impl Drop for DropCounter {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3196,6 +3561,104 @@ mod tests {
         host.rtv(None, Some(&null_target()));
         // SAFETY: a plain query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn retire_drops_immediately_when_no_epoch_is_active() {
+        let _retire = isolated_retire_scope();
+        let (counter, drops) = DropCounter::new();
+        retire(counter);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn idle_list_does_not_block_retirement() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let idle = host.new_list().expect("host list");
+        let (counter, drops) = DropCounter::new();
+        retire(counter);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        drop(idle);
+    }
+
+    #[test]
+    fn open_marked_list_pins_retired_objects_across_other_executions() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let open = host.new_list().expect("open list");
+        open.mark_work();
+
+        let (c1, d1) = DropCounter::new();
+        retire(c1);
+        assert_eq!(d1.load(Ordering::SeqCst), 0);
+
+        // Submitting and executing a DIFFERENT list must not drop objects
+        // retired while `open` is still active.
+        let other = host.new_list().expect("other list");
+        other.mark_work();
+        other.close();
+        host.execute(&[&other]);
+        other.reset();
+        drop(other);
+        assert_eq!(
+            d1.load(Ordering::SeqCst),
+            0,
+            "executing another list must not release an open list's epoch"
+        );
+
+        // Closing and resetting the open list releases its epoch.
+        open.close();
+        open.reset();
+        assert_eq!(d1.load(Ordering::SeqCst), 1);
+
+        // Marking work again and dropping the list also releases its epoch.
+        open.mark_work();
+        let (c2, d2) = DropCounter::new();
+        retire(c2);
+        assert_eq!(d2.load(Ordering::SeqCst), 0);
+        drop(open);
+        assert_eq!(d2.load(Ordering::SeqCst), 1);
+
+        // A closed list pinned via begin_submit stays active across execution
+        // until end_submit.
+        let submitted = host.new_list().expect("submitted list");
+        submitted.mark_work();
+        submitted.begin_submit();
+        let (c3, d3) = DropCounter::new();
+        retire(c3);
+        submitted.close();
+        host.execute(&[&submitted]);
+        assert_eq!(d3.load(Ordering::SeqCst), 0);
+        submitted.end_submit();
+        assert_eq!(d3.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn active_execution_epoch_pins_objects_retired_during_execute() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drops_during = drops.clone();
+        // Use an unmarked deferred step without `begin_submit()` so `list`
+        // itself pins no epoch; only `Host::execute`'s `exec_epoch` keeps the
+        // object alive until execution finishes.
+        list.defer_unmarked(move || {
+            let counter = DropCounter(drops_during.clone());
+            retire(counter);
+            assert_eq!(drops_during.load(Ordering::SeqCst), 0);
+        });
+        assert!(!list.has_epoch());
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }
 

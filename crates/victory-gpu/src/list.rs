@@ -510,6 +510,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
+            list.mark_work();
             // SAFETY: the same layout; borrowed resource pointers, never
             // released through this slice.
             let host = unsafe {
@@ -593,6 +594,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             ensure_state(&list, dst, COPY_DEST);
             ensure_state(&list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
+            list.mark_work();
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -712,6 +714,7 @@ extern "system" fn copy_texture_region(
             };
             crate::texture::upload(&list, src.resource, from_tex);
             ensure_state(&list, src.resource, COPY_SOURCE);
+            list.mark_work();
             let mut to_location = dst;
             to_location.resource = buffer.as_raw().cast_const().cast();
             to_location.footprint.offset = 0;
@@ -798,6 +801,7 @@ extern "system" fn copy_texture_region(
         }
         ensure_state(&list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
+        list.mark_work();
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         #[cfg(feature = "diagnostics")]
@@ -880,6 +884,7 @@ extern "system" fn resolve(
         ensure_state(&list, dst, RESOLVE_DEST);
         ensure_state(&list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
+        list.mark_work();
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         let extent = |d: D3D12_RESOURCE_DESC, subresource: u32| {
@@ -1115,6 +1120,7 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
+        list.mark_work();
         let rtv = host.rtv(Some(texture), record.desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
@@ -1163,6 +1169,7 @@ extern "system" fn clear_dsv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const DEPTH_WRITE: u32 = 0x10;
+        list.mark_work();
         ensure_state(&list, record.resource, DEPTH_WRITE);
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
@@ -1757,6 +1764,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        list.mark_work();
         // SAFETY: the same layout; no resource named.
         let barrier =
             unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
@@ -2848,5 +2856,62 @@ mod tests {
         for object in [list, allocator, queue, ready] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn idle_list_state_does_not_pin_retirement_while_recorded_commands_do() {
+        let _retire = crate::host::isolated_retire_scope();
+        use std::sync::atomic::Ordering;
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        // Fixed-function state alone leaves the list idle.
+        let vp = windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT::default();
+        let rect = windows::Win32::Foundation::RECT::default();
+        let blend = [1.0f32; 4];
+        state::topology(list, 4);
+        state::viewports(list, 1, &vp);
+        state::scissors(list, 1, &rect);
+        state::blend_factor(list, &blend);
+        state::stencil_ref(list, 0);
+        set_pipeline(list, null);
+        let (c_idle, d_idle) = crate::host::DropCounter::new();
+        crate::host::retire(c_idle);
+        assert_eq!(
+            d_idle.load(Ordering::SeqCst),
+            1,
+            "state-only list must not pin retired objects"
+        );
+
+        // Recording a GPU barrier marks the list active until reset/drop.
+        barrier_groups(list, 1, null.cast());
+        let (c_busy, d_busy) = crate::host::DropCounter::new();
+        crate::host::retire(c_busy);
+        assert_eq!(
+            d_busy.load(Ordering::SeqCst),
+            0,
+            "recorded barrier must pin retired objects"
+        );
+        assert_eq!(close(list), S_OK);
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert_eq!(d_busy.load(Ordering::SeqCst), 1);
+
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
     }
 }
