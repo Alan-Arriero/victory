@@ -6,13 +6,14 @@
 //! reads it through a table and finds the slot changed.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::{Host, HostList, host};
+use crate::shadow::Shadow;
 
 /// An aligned upload copy backing a buffer SRV whose offset inside its shadow
 /// buffer is not a multiple of its element stride. Kept persistently mapped so
@@ -25,6 +26,18 @@ struct UnalignedCopy {
     dst: usize,
     src: usize,
     len: usize,
+}
+
+/// Submission-time refresh state for a slot: either an aligned copy upload or
+/// an aliased view whose exact backing shadow may differ from `buffer_range`.
+#[derive(Clone)]
+enum SlotRefresh {
+    Unaligned(UnalignedCopy),
+    Shadow {
+        shadow: Arc<Shadow>,
+        address: u64,
+        len: u64,
+    },
 }
 
 pub(crate) struct HostHeap {
@@ -45,9 +58,9 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
-    /// Slots backed by an [`UnalignedCopy`] that must be refreshed from title
-    /// memory when a command list referencing the slot is submitted.
-    unaligned: Mutex<HashMap<u32, UnalignedCopy>>,
+    /// Slots requiring submission-time title-memory refresh (`UnalignedCopy`
+    /// uploads or aliased structured SRV shadows).
+    refreshes: Mutex<HashMap<u32, SlotRefresh>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -231,7 +244,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            unaligned: Mutex::new(HashMap::new()),
+            refreshes: Mutex::new(HashMap::new()),
             next: Mutex::new((0, vec![false; extra as usize])),
         };
         // A slot never written is undefined: shaders reading one (a slot
@@ -405,6 +418,31 @@ impl HostHeap {
         self.keep(index, kept.unwrap_or(Kept::Empty));
     }
 
+    /// Makes slot `index` (a dynamic one) a structured buffer alias with
+    /// element width `stride` without mutating the canonical title heap slot.
+    pub(crate) fn make_structured_at(&self, index: u32, view: &View, stride: u32) -> bool {
+        let Some((address, len, desc)) = buffer_srv_parts(view) else {
+            return false;
+        };
+        let Some(alias) = structured_alias(desc, stride) else {
+            return false;
+        };
+        let Some(kept) = buffer_srv_inner(address, len, alias, self.cpu(index), true) else {
+            return false;
+        };
+        self.keep(index, kept);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gpu(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+        // SAFETY: a live shader-visible descriptor heap.
+        let base = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart() };
+        D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: base.ptr + u64::from(index) * u64::from(self.step),
+        }
+    }
+
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
@@ -417,10 +455,25 @@ impl HostHeap {
 
     /// Slot `index` now views `kept` (or nothing of the host's).
     fn keep(&self, index: u32, kept: Kept) {
-        let (resource, unaligned) = match kept {
+        let (resource, refresh) = match kept {
             Kept::Empty => (None, None),
             Kept::Resource(r) => (Some(r), None),
-            Kept::Unaligned(copy) => (Some(copy.resource.clone()), Some(copy)),
+            Kept::Unaligned(copy) => (
+                Some(copy.resource.clone()),
+                Some(SlotRefresh::Unaligned(copy)),
+            ),
+            Kept::AliasedShadow {
+                shadow,
+                address,
+                len,
+            } => (
+                Some(shadow.buffer.clone()),
+                Some(SlotRefresh::Shadow {
+                    shadow,
+                    address,
+                    len,
+                }),
+            ),
         };
         let mut slots = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = slots.get_mut(index as usize) {
@@ -431,10 +484,10 @@ impl HostHeap {
             }
         }
         drop(slots);
-        let mut map = self.unaligned.lock().unwrap_or_else(|e| e.into_inner());
-        match unaligned {
-            Some(copy) => {
-                map.insert(index, copy);
+        let mut map = self.refreshes.lock().unwrap_or_else(|e| e.into_inner());
+        match refresh {
+            Some(entry) => {
+                map.insert(index, entry);
             }
             None if !map.is_empty() => {
                 map.remove(&index);
@@ -443,23 +496,36 @@ impl HostHeap {
         }
     }
 
-    /// If slot `index` is backed by an unaligned upload copy, schedules a
-    /// submission-time refresh from title memory on `list`.
-    pub(crate) fn refresh_slot(&self, index: u32, list: &HostList) {
-        let copy = {
-            let map = self.unaligned.lock().unwrap_or_else(|e| e.into_inner());
+    /// If slot `index` has a registered refresh entry (`UnalignedCopy` upload
+    /// or aliased shadow range), schedules a submission-time refresh on `list`
+    /// and returns `true`.
+    pub(crate) fn refresh_slot(&self, index: u32, list: &HostList) -> bool {
+        let refresh = {
+            let map = self.refreshes.lock().unwrap_or_else(|e| e.into_inner());
             if map.is_empty() {
-                return;
+                return false;
             }
             map.get(&index).cloned()
         };
-        if let Some(copy) = copy {
-            list.defer_fill_upload(
-                copy.resource,
-                copy.dst as *mut u8,
-                copy.src as *const u8,
-                copy.len,
-            );
+        match refresh {
+            Some(SlotRefresh::Unaligned(copy)) => {
+                list.defer_fill_upload(
+                    copy.resource,
+                    copy.dst as *mut u8,
+                    copy.src as *const u8,
+                    copy.len,
+                );
+                true
+            }
+            Some(SlotRefresh::Shadow {
+                shadow,
+                address,
+                len,
+            }) => {
+                shadow.refresh(list, address, len);
+                true
+            }
+            None => false,
         }
     }
 
@@ -668,13 +734,83 @@ enum Kept {
     Empty,
     Resource(ID3D12Resource),
     Unaligned(UnalignedCopy),
+    AliasedShadow {
+        shadow: Arc<Shadow>,
+        address: u64,
+        len: u64,
+    },
+}
+
+fn buffer_srv_parts(view: &View) -> Option<(u64, u64, D3D12_SHADER_RESOURCE_VIEW_DESC)> {
+    const BUFFER: u32 = 1;
+    match view {
+        View::Shader(resource, Some(desc)) => {
+            let (data, len) = crate::resource::buffer_bytes(*resource as crate::object::This)?;
+            Some((data as u64, len, srv_desc(desc)))
+        }
+        View::Placed(false, resource, desc) if resource[0] == BUFFER => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+            Some((address, len, srv_desc(desc[..10].try_into().ok()?)))
+        }
+        _ => None,
+    }
+}
+
+/// Re-expresses the exact byte start and length of a raw buffer SRV as
+/// structured elements of width `stride`, rejecting typed or already-structured
+/// views and fractional bounds.
+fn structured_alias(
+    mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
+    stride: u32,
+) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER
+        || !(4..=2048).contains(&stride)
+        || !stride.is_multiple_of(4)
+    {
+        return None;
+    }
+    let old_bytes = element_size(&desc);
+    // SAFETY: `ViewDimension == D3D12_SRV_DIMENSION_BUFFER` verified above.
+    let old = unsafe { desc.Anonymous.Buffer };
+    if old.StructureByteStride != 0
+        || old.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 == 0
+        || old_bytes == 0
+        || old.NumElements == 0
+    {
+        return None;
+    }
+    let width = u64::from(stride);
+    let start = old.FirstElement.checked_mul(old_bytes)?;
+    let size = u64::from(old.NumElements).checked_mul(old_bytes)?;
+    if start % width != 0 || size % width != 0 {
+        return None;
+    }
+    desc.Format = DXGI_FORMAT_UNKNOWN;
+    desc.Anonymous.Buffer = D3D12_BUFFER_SRV {
+        FirstElement: start / width,
+        NumElements: u32::try_from(size / width).ok()?,
+        StructureByteStride: stride,
+        Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+    };
+    Some(desc)
 }
 
 fn buffer_srv(
     address: u64,
     len: u64,
+    desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> Option<Kept> {
+    buffer_srv_inner(address, len, desc, at, false)
+}
+
+fn buffer_srv_inner(
+    address: u64,
+    len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    track_shadow: bool,
 ) -> Option<Kept> {
     let shadow = crate::shadow::find(address, len)?;
     let element = element_size(&desc);
@@ -697,6 +833,11 @@ fn buffer_srv(
         once!("a buffer view of no elements is left null");
         return None;
     }
+    let view_offset = buffer.FirstElement.checked_mul(element)?;
+    let bytes = u64::from(buffer.NumElements).checked_mul(element)?;
+    if track_shadow && view_offset.checked_add(bytes)? > len {
+        return None;
+    }
     if offset % element != 0 {
         // The title's placed buffer starts at an address that is not a
         // multiple of `element` inside our larger host shadow buffer (e.g. a
@@ -704,8 +845,6 @@ fn buffer_srv(
         // Copy the viewed bytes into a persistently mapped aligned upload
         // buffer starting at element 0, and track it so draws refresh it from
         // title memory at submission time.
-        let view_offset = buffer.FirstElement.checked_mul(element)?;
-        let bytes = u64::from(buffer.NumElements).checked_mul(element)?;
         const MAX_UNALIGNED_COPY: u64 = 1 << 20;
         if bytes == 0 || bytes > MAX_UNALIGNED_COPY {
             once!(
@@ -742,7 +881,15 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
-    Some(Kept::Resource(shadow.buffer.clone()))
+    if track_shadow {
+        Some(Kept::AliasedShadow {
+            shadow,
+            address: address.checked_add(view_offset)?,
+            len: bytes,
+        })
+    } else {
+        Some(Kept::Resource(shadow.buffer.clone()))
+    }
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -1397,5 +1544,461 @@ mod tests {
             assert_eq!(got, &updated);
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+}
+
+#[cfg(test)]
+mod structured_alias_tests {
+    use super::*;
+    use crate::descriptor::{create_placed_srv, view};
+
+    fn raw_srv_desc(first_dword: u64, dwords: u32) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+        D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: first_dword,
+                    NumElements: dwords,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        }
+    }
+
+    fn placed_raw_srv_handle(
+        slot: &mut [u64; 16],
+        address: u64,
+        len: u64,
+        first_dword: u32,
+        dwords: u32,
+    ) -> u64 {
+        let mut resource = [0u32; 14];
+        resource[0] = 1; // BUFFER
+        resource[4] = len as u32;
+        resource[5] = (len >> 32) as u32;
+        let srv = raw_srv_desc(u64::from(first_dword), dwords);
+        // SAFETY: `D3D12_SHADER_RESOURCE_VIEW_DESC` is 40 bytes (`[u32; 10]`).
+        let srv_words: [u32; 10] = unsafe {
+            std::ptr::from_ref(&srv)
+                .cast::<[u32; 10]>()
+                .read_unaligned()
+        };
+        let mut desc = [0u32; 16];
+        desc[..10].copy_from_slice(&srv_words);
+        desc[10] = address as u32;
+        desc[11] = (address >> 32) as u32;
+        let handle = slot.as_mut_ptr() as u64;
+        create_placed_srv(std::ptr::null(), &resource, &desc, handle);
+        handle
+    }
+
+    struct ShadowGuard {
+        resource: usize,
+        address: u64,
+    }
+
+    impl Drop for ShadowGuard {
+        fn drop(&mut self) {
+            crate::shadow::unregister(self.resource, self.address);
+        }
+    }
+
+    #[test]
+    fn structured_alias_preserves_exact_byte_bounds() {
+        let alias = structured_alias(raw_srv_desc(16, 32), 64).expect("64-byte aligned raw SRV");
+        assert_eq!(alias.Format, DXGI_FORMAT_UNKNOWN);
+        assert_eq!(alias.ViewDimension, D3D12_SRV_DIMENSION_BUFFER);
+        // SAFETY: `ViewDimension == D3D12_SRV_DIMENSION_BUFFER`.
+        let buf = unsafe { alias.Anonymous.Buffer };
+        assert_eq!(buf.FirstElement, 1);
+        assert_eq!(buf.NumElements, 2);
+        assert_eq!(buf.StructureByteStride, 64);
+        assert_eq!(buf.Flags, D3D12_BUFFER_SRV_FLAG_NONE);
+    }
+
+    #[test]
+    fn structured_alias_rejects_fractional_typed_structured_and_non_buffer_views() {
+        // Fractional byte offset (4 bytes % 64 != 0).
+        assert!(structured_alias(raw_srv_desc(1, 32), 64).is_none());
+        // Fractional byte length (124 bytes % 64 != 0).
+        assert!(structured_alias(raw_srv_desc(16, 31), 64).is_none());
+        // Zero elements.
+        assert!(structured_alias(raw_srv_desc(0, 0), 64).is_none());
+        // Already-structured SRV must not be reinterpreted.
+        let mut structured = raw_srv_desc(0, 2);
+        structured.Format = DXGI_FORMAT_UNKNOWN;
+        structured.Anonymous.Buffer.StructureByteStride = 64;
+        structured.Anonymous.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+        assert!(structured_alias(structured, 64).is_none());
+        // Typed non-raw buffer SRV must not be reinterpreted.
+        let typed = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: 0,
+                    NumElements: 8,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                },
+            },
+        };
+        assert!(structured_alias(typed, 64).is_none());
+        // Non-buffer (texture) SRV must not be aliased.
+        let tex = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            ..Default::default()
+        };
+        assert!(structured_alias(tex, 64).is_none());
+        // Invalid strides.
+        assert!(structured_alias(raw_srv_desc(0, 16), 0).is_none());
+        assert!(structured_alias(raw_srv_desc(0, 16), 6).is_none());
+        assert!(structured_alias(raw_srv_desc(0, 16), 4096).is_none());
+    }
+
+    #[test]
+    fn make_structured_at_rejects_range_past_placed_buffer() {
+        let Some(_) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let backing = vec![0u8; 1024];
+        let base = backing.as_ptr() as u64;
+        let _guard = ShadowGuard {
+            resource: base as usize,
+            address: base,
+        };
+        crate::shadow::register(base as usize, base, backing.len() as u64);
+
+        // Placed length is 128 bytes, but view reads FirstElement=16 (64B) + 128B = 192B > 128B.
+        let mut slot = [0u64; 16];
+        let handle = placed_raw_srv_handle(&mut slot, base + 64, 128, 16, 32);
+        let v = view(handle).expect("placed raw SRV");
+        let dyn_idx = heap.dynamic(1).expect("dynamic slot");
+        assert!(!heap.make_structured_at(dyn_idx, &v, 64));
+    }
+
+    #[test]
+    fn structured_alias_reads_exact_records_with_sentinel_and_mutation_checks() {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+        use windows::core::{Interface, s};
+
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        const SOURCE: &str = r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=1)), DescriptorTable(SRV(t1, numDescriptors=1)), UAV(u0)"
+struct Record { uint w[16]; };
+StructuredBuffer<Record> aliased : register(t0);
+ByteAddressBuffer canonical_raw : register(t1);
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint count = 0;
+    uint stride = 0;
+    aliased.GetDimensions(count, stride);
+    dst.Store(0, count);
+    dst.Store(4, stride);
+    for (uint r = 0; r < 2; ++r) {
+        Record rec = aliased[r];
+        for (uint i = 0; i < 16; ++i) {
+            dst.Store(8 + (r * 16 + i) * 4, rec.w[i]);
+        }
+    }
+    dst.Store(136, canonical_raw.Load(0));
+}
+"#;
+        let mut blob: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
+        // SAFETY: source string and entry names are static and valid.
+        unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("structured_alias_readback"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut blob,
+                Some(&mut errors),
+            )
+            .unwrap_or_else(|e| {
+                let msg = errors
+                    .as_ref()
+                    .map(|b| {
+                        let p = b.GetBufferPointer().cast::<u8>();
+                        String::from_utf8_lossy(std::slice::from_raw_parts(p, b.GetBufferSize()))
+                            .into_owned()
+                    })
+                    .unwrap_or_default();
+                panic!("D3DCompile failed: {e}: {msg}");
+            });
+        }
+        let blob = blob.unwrap();
+        // SAFETY: `blob` owns compiled DXBC bytes.
+        let code = unsafe {
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+        };
+        // SAFETY: `code` contains embedded root signature and compute shader.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root = host.device.CreateRootSignature(0, code).unwrap();
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.as_ptr().cast(),
+                    BytecodeLength: code.len(),
+                },
+                ..Default::default()
+            };
+            let pso = host.device.CreateComputePipelineState(&desc).unwrap();
+            (root, pso)
+        };
+
+        let make_buffer = |kind: D3D12_HEAP_TYPE, flags, state| -> ID3D12Resource {
+            let mut b: Option<ID3D12Resource> = None;
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 512,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: flags,
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: kind,
+                ..Default::default()
+            };
+            // SAFETY: valid buffer creation parameters.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        state,
+                        None,
+                        &mut b,
+                    )
+                    .unwrap();
+            }
+            b.unwrap()
+        };
+
+        let out = make_buffer(
+            D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+        );
+        let readback = make_buffer(
+            D3D12_HEAP_TYPE_READBACK,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+
+        let mut backing = vec![0xCCu8; 4096];
+        let base = backing.as_ptr() as u64;
+        let _guard = ShadowGuard {
+            resource: base as usize,
+            address: base,
+        };
+        crate::shadow::register(base as usize, base, backing.len() as u64);
+
+        let write_word = |buf: &mut [u8], byte_off: usize, val: u32| {
+            buf[byte_off..byte_off + 4].copy_from_slice(&val.to_le_bytes());
+        };
+        let fill_sentinels = |buf: &mut [u8], start: usize, len: usize, pat: u8| {
+            buf[start..start + len].fill(pat);
+        };
+
+        // Case 1: 64-byte aligned start inside shadow (`shadow.offset == 64`).
+        // Case 2: 16-byte aligned (raw-valid) but unaligned for stride 64 (`shadow.offset == 528`).
+        for (tag, placed_off) in [(0x1000_0000u32, 64usize), (0x2000_0000u32, 528usize)] {
+            // 64B prefix sentinel + 128B (2 records) + 64B suffix sentinel = 256B.
+            let prefix_off = placed_off;
+            let rec_off = placed_off + 64;
+            let suffix_off = placed_off + 192;
+            fill_sentinels(&mut backing, prefix_off, 64, 0xA5);
+            for i in 0..32u32 {
+                write_word(&mut backing, rec_off + i as usize * 4, tag | i);
+            }
+            fill_sentinels(&mut backing, suffix_off, 64, 0x5A);
+
+            let mut slot = [0u64; 16];
+            let handle = placed_raw_srv_handle(&mut slot, base + placed_off as u64, 192, 16, 32);
+            let heap = HostHeap::new(false, 4).expect("host heap");
+            let v = heap
+                .mirror(0, handle, true)
+                .expect("canonical slot 0 raw mirror");
+            let dyn_idx = heap.dynamic(1).expect("dynamic alias slot");
+            assert!(
+                heap.make_structured_at(dyn_idx, &v, 64),
+                "make_structured_at failed for offset {placed_off}"
+            );
+
+            // Mutate dword 17 after creating the alias to prove submission-time
+            // refresh updates the backing resource (shadow or UnalignedCopy).
+            let mutated_word = tag | 0x00FF_0011;
+            write_word(&mut backing, rec_off + 17 * 4, mutated_word);
+
+            let list = host.new_list().expect("host list");
+            assert!(heap.refresh_slot(dyn_idx, &list));
+            if placed_off % 64 != 0 {
+                // `dyn_idx` reads an `UnalignedCopy` upload buffer rather than `shadow`,
+                // so refresh `canonical_raw`'s first record word independently to check
+                // canonical slot 0's raw readback too.
+                crate::shadow::find(base + rec_off as u64, 4)
+                    .expect("registered shadow")
+                    .refresh(&list, base + rec_off as u64, 4);
+            }
+            // SAFETY: open list with live compute root signature, PSO, and heaps.
+            unsafe {
+                let l = &list.list;
+                l.SetComputeRootSignature(&root);
+                l.SetPipelineState(&pso);
+                l.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                l.SetComputeRootDescriptorTable(0, heap.gpu(dyn_idx));
+                l.SetComputeRootDescriptorTable(1, heap.gpu(0));
+                l.SetComputeRootUnorderedAccessView(2, out.GetGPUVirtualAddress());
+                l.Dispatch(1, 1, 1);
+                l.ResourceBarrier(&[crate::host::transition(
+                    &out,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                l.CopyBufferRegion(&readback, 0, &out, 0, 140);
+                l.ResourceBarrier(&[crate::host::transition(
+                    &out,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+            list.close();
+            host.execute(&[&list]);
+
+            // Validate descriptor binding cleanly through a standalone queue when
+            // the D3D12 InfoQueue is active (`VICTORY_D3D12_DEBUG=1`) so we inspect
+            // messages before `host.execute` clears them.
+            if let Ok(iq) = host.device.cast::<ID3D12InfoQueue>() {
+                // SAFETY: standalone queue/allocator/list/fence on `host.device`.
+                unsafe {
+                    let queue: ID3D12CommandQueue = host
+                        .device
+                        .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                            ..Default::default()
+                        })
+                        .unwrap();
+                    let alloc: ID3D12CommandAllocator = host
+                        .device
+                        .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                        .unwrap();
+                    let cl: ID3D12GraphicsCommandList = host
+                        .device
+                        .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+                        .unwrap();
+                    cl.SetComputeRootSignature(&root);
+                    cl.SetPipelineState(&pso);
+                    cl.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                    cl.SetComputeRootDescriptorTable(0, heap.gpu(dyn_idx));
+                    cl.SetComputeRootDescriptorTable(1, heap.gpu(0));
+                    cl.SetComputeRootUnorderedAccessView(2, out.GetGPUVirtualAddress());
+                    cl.Dispatch(1, 1, 1);
+                    cl.Close().unwrap();
+
+                    let before = iq.GetNumStoredMessages();
+                    queue.ExecuteCommandLists(&[Some(cl.into())]);
+                    let fence: ID3D12Fence =
+                        host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+                    let event = CreateEventW(None, false, false, None).unwrap();
+                    queue.Signal(&fence, 1).unwrap();
+                    fence.SetEventOnCompletion(1, event).unwrap();
+                    WaitForSingleObject(event, INFINITE);
+                    let _ = CloseHandle(event);
+
+                    let after = iq.GetNumStoredMessages();
+                    for idx in before.min(after)..after {
+                        let mut size = 0usize;
+                        if iq.GetMessage(idx, None, &mut size).is_err() || size == 0 {
+                            continue;
+                        }
+                        let mut raw = vec![0u64; size.div_ceil(8)];
+                        let msg = raw.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                        if iq.GetMessage(idx, Some(msg), &mut size).is_ok() {
+                            let m = &*msg;
+                            let desc =
+                                std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
+                            let text = String::from_utf8_lossy(desc);
+                            assert_ne!(m.ID.0, 1387, "unexpected ID 1387: {text}");
+                            assert!(
+                                m.Severity.0 > D3D12_MESSAGE_SEVERITY_ERROR.0,
+                                "unexpected D3D12 error {}: {text}",
+                                m.ID.0
+                            );
+                        }
+                    }
+                }
+            }
+
+            let mut mapped = std::ptr::null_mut();
+            let mut dwords = [0u32; 35];
+            // SAFETY: execution completed and readback holds 140 bytes (35 dwords).
+            unsafe {
+                let range = D3D12_RANGE { Begin: 0, End: 140 };
+                readback.Map(0, Some(&range), Some(&mut mapped)).unwrap();
+                std::ptr::copy_nonoverlapping(mapped.cast::<u32>(), dwords.as_mut_ptr(), 35);
+                readback.Unmap(0, None);
+            }
+            assert_eq!(dwords[0], 2, "GetDimensions count for offset {placed_off}");
+            assert_eq!(
+                dwords[1], 64,
+                "GetDimensions stride for offset {placed_off}"
+            );
+            for i in 0..32u32 {
+                let expected = if i == 17 { mutated_word } else { tag | i };
+                assert_eq!(
+                    dwords[2 + i as usize],
+                    expected,
+                    "record dword {i} mismatch for offset {placed_off}"
+                );
+            }
+            assert_eq!(
+                dwords[34], tag,
+                "canonical slot 0 must stay a valid raw SRV for offset {placed_off}"
+            );
+            assert!(
+                backing[prefix_off..prefix_off + 64]
+                    .iter()
+                    .all(|&b| b == 0xA5)
+            );
+            assert!(
+                backing[suffix_off..suffix_off + 64]
+                    .iter()
+                    .all(|&b| b == 0x5A)
+            );
+        }
+
+        // SAFETY: plain device health query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 }
