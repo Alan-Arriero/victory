@@ -30,8 +30,6 @@ mod copystat;
 pub mod stats {
     pub use super::copystat::{C, add};
 }
-#[cfg(all(windows, feature = "diagnostics"))]
-mod producers;
 
 pub mod descriptor;
 pub mod device;
