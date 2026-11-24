@@ -872,6 +872,27 @@ impl<'a> Lanes<'a> {
         }
     }
 
+    /// Follow scalar dword copies back to their original SSA value.
+    fn copied_word(&self, mut value: Value) -> Value {
+        while let Some(&(block, index)) = self.defs.get(&value) {
+            let inst = &self.p.blocks[block].insts[index];
+            if inst.name() != "s_mov_b32" {
+                break;
+            }
+            let Fields::Sop { src, .. } = &inst.fields else {
+                break;
+            };
+            let [Operand::Scalar { code, dwords: 1 }] = src.as_slice() else {
+                break;
+            };
+            let Some(source) = inst.read(Reg::S(*code)) else {
+                break;
+            };
+            value = source;
+        }
+        value
+    }
+
     /// The mask a value pair holds, and whether it derives from EXEC or a
     /// VALU result.
     fn mask(&mut self, k: Key) -> (Bool, bool) {
@@ -1195,7 +1216,15 @@ impl<'a> Lanes<'a> {
                     && let Some(k) = self.key(|r| inst.read(r), code)
                     && let Some(&(_, dst)) = inst.writes.first()
                 {
-                    let (mask, derived) = self.mask(k);
+                    let source = if self.p.wave64 {
+                        (self.copied_word(k.0), self.copied_word(k.1))
+                    } else {
+                        k
+                    };
+                    let (mask, derived) = match self.masks.get(&source) {
+                        Some(&mask) => (mask, true),
+                        None => self.mask(k),
+                    };
                     if derived {
                         self.select_masks.insert(dst, mask);
                     }
@@ -1450,6 +1479,30 @@ mod tests {
             s.bools.node(when),
             Some((Atom::Lane(_), Bool::TRUE, Bool::FALSE))
         ));
+    }
+
+    #[test]
+    fn copied_mask_words_keep_their_original_lane_order() {
+        for (low, high, restored) in [(103, 102, true), (102, 103, false), (103, 103, false)] {
+            let p = build(
+                &[
+                    0x7D84_0080,        // v_cmp_eq_u32 vcc, 0, v0
+                    0xBEE7_036A,        // s_mov_b32 s103, vcc_lo
+                    0xBEE6_036B,        // s_mov_b32 s102, vcc_hi
+                    0xBE82_0300 | low,  // s_mov_b32 s2, saved word
+                    0xBE83_0300 | high, // s_mov_b32 s3, saved word
+                    0xD501_0001,
+                    258 | (259 << 9) | (2 << 18), // v_cndmask_b32 v1, v2, v3, s[2:3]
+                    S_ENDPGM,
+                ],
+                true,
+            );
+            let s = structure(&p).unwrap();
+            let original = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+            let select = p.blocks[0].insts[5].write(Reg::V(1)).unwrap();
+            let mask = *s.masks.get(&original).expect("comparison mask");
+            assert_eq!(s.select_masks.get(&select) == Some(&mask), restored);
+        }
     }
 
     #[test]
