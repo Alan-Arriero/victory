@@ -164,6 +164,29 @@ pub extern "system" fn XDspActivate(
         channels,
         "audio DSP stream activated"
     );
+    let convolver = if kind == CONVOLUTION {
+        // `ir_floats` is one channel's length; a stereo IR holds one per channel.
+        let stereo_ir = options & STEREO_IR != 0;
+        let len = desc.ir_floats as usize * if stereo_ir { channels as usize } else { 1 };
+        // SAFETY: `valid` checked the pointer; the title's IR holds `ir_floats`
+        // floats per IR channel and stays alive in title memory for the
+        // stream's lifetime (the console copies it here).
+        let ir = unsafe { std::slice::from_raw_parts(desc.ir, len) };
+        match Convolver::new(
+            ir,
+            desc.ir_floats as usize,
+            frames as usize,
+            channels as usize,
+            stereo_ir,
+        ) {
+            Some(convolver) => Some(convolver),
+            None => return E_INVALIDARG,
+        }
+    } else {
+        None
+    };
+    // Reserve the stream only once it can be made, so a refused activation
+    // does not hold a slot.
     {
         // SAFETY: a connection from `XDspConnectWithMaximumStreamLimit`.
         let dsp = unsafe { &*dsp };
@@ -173,23 +196,6 @@ pub extern "system" fn XDspActivate(
         }
         *active += 1;
     }
-    let convolver = if kind == CONVOLUTION {
-        // SAFETY: `valid` checked the pointer and length; the IR stays alive in
-        // title memory for the stream's lifetime (the console copies it here).
-        let ir = unsafe { std::slice::from_raw_parts(desc.ir, desc.ir_floats as usize) };
-        match Convolver::new(
-            ir,
-            desc.ir_floats as usize,
-            frames as usize,
-            channels as usize,
-            options & STEREO_IR != 0,
-        ) {
-            Some(convolver) => Some(convolver),
-            None => return E_INVALIDARG,
-        }
-    } else {
-        None
-    };
     let new = Box::new(Stream {
         dsp,
         frames: desc.frames,
@@ -358,6 +364,65 @@ mod tests {
             XDspActivate(dsp, &transform, &mut status, &mut stream),
             S_OK
         );
+        assert_eq!(XDspDeactivate(stream), S_OK);
+        assert_eq!(XDspDisconnect(dsp), S_OK);
+    }
+
+    #[test]
+    fn a_stereo_ir_activates_and_frees_its_slot() {
+        const BLOCK: usize = 0x200;
+        let mut base = vec![0u8; 0x10_0000];
+        let mut dsp = std::ptr::null_mut();
+        assert_eq!(
+            XDspConnectWithMaximumStreamLimit(
+                base.as_mut_ptr().cast(),
+                0x10_0000,
+                24,
+                1,
+                2,
+                &mut dsp
+            ),
+            S_OK
+        );
+        // One unity impulse per channel; `ir_floats` is one channel's length.
+        let mut time = vec![0f32; BLOCK];
+        time[0] = 1.0;
+        let left = crate::modules::dsp_convolve::encode_ir(&time, BLOCK);
+        let mut ir = left.clone();
+        ir.extend_from_slice(&left);
+        let desc = StreamDesc {
+            kind: CONVOLUTION,
+            options: STEREO_IR,
+            frames: BLOCK as u32,
+            channels: 2,
+            ir_floats: left.len() as u32,
+            ir: ir.as_ptr(),
+        };
+        let (mut status, mut stream) = (std::ptr::null(), std::ptr::null_mut());
+        assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
+        let input = vec![0.75f32; BLOCK * 2];
+        let mut output = vec![0f32; BLOCK * 2];
+        let command = Command {
+            gains: [1.0, 1.0],
+            input: input.as_ptr(),
+            output: output.as_mut_ptr(),
+            reserved: 0,
+        };
+        let mut ticket = 0;
+        assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
+        for channel in 0..2 {
+            let energy: f32 = output
+                .iter()
+                .skip(channel)
+                .step_by(2)
+                .map(|s| s * s)
+                .sum::<f32>()
+                / BLOCK as f32;
+            assert!(energy > 0.5, "channel {channel} wet, energy {energy}");
+        }
+        assert_eq!(XDspDeactivate(stream), S_OK);
+        // The only slot is free again.
+        assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
         assert_eq!(XDspDeactivate(stream), S_OK);
         assert_eq!(XDspDisconnect(dsp), S_OK);
     }
