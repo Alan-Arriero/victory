@@ -1256,7 +1256,6 @@ impl State {
                         if !aliased {
                             host.make_at(index, &view);
                         }
-                        let _ = host.refresh_slot(index, list);
                     }
                     None => {
                         host.make_null(index);
@@ -1274,12 +1273,20 @@ impl State {
                 self.table_failed = true;
                 continue;
             }
-            for u in &entries {
-                let handle = table + u64::from(u.table_offset_dwords) * 4;
-                if let Some(view) = crate::descriptor::view(handle)
-                    && !matches!(view, View::Constant(..))
-                {
-                    self.depth_sampled |= readable(list, u, &view, read_only_depth);
+            for k in start_slot..=max_slot {
+                let index = first + (k - start_slot);
+                if !host.refresh_slot(index, list) {
+                    let at = table + u64::from(k) * step_bytes;
+                    if let Some(view) = crate::descriptor::view(at)
+                        && !matches!(view, View::Constant(..))
+                    {
+                        for u in entries
+                            .iter()
+                            .filter(|u| u.table_offset_dwords / step_dwords == k)
+                        {
+                            self.depth_sampled |= readable(list, u, &view, read_only_depth);
+                        }
+                    }
                 }
             }
             self.fresh_tables.insert(
@@ -1952,6 +1959,34 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     unsafe { list.list.OMSetStencilRef(reference) };
 }
 
+/// Fully initialized `[u32; 10]` encoding of a 2D `D3D12_SHADER_RESOURCE_VIEW_DESC`,
+/// avoiding uninitialized struct padding or union tail bytes when `create_srv`
+/// reads the descriptor as `[u32; 10]`.
+#[cfg(test)]
+fn tex2d_srv_words(format: DXGI_FORMAT, mip_levels: u32) -> [u32; 10] {
+    const {
+        assert!(size_of::<D3D12_SHADER_RESOURCE_VIEW_DESC>() == size_of::<[u32; 10]>());
+        assert!(std::mem::offset_of!(D3D12_SHADER_RESOURCE_VIEW_DESC, Format) == 0);
+        assert!(std::mem::offset_of!(D3D12_SHADER_RESOURCE_VIEW_DESC, ViewDimension) == 4);
+        assert!(
+            std::mem::offset_of!(D3D12_SHADER_RESOURCE_VIEW_DESC, Shader4ComponentMapping) == 8
+        );
+        assert!(std::mem::offset_of!(D3D12_SHADER_RESOURCE_VIEW_DESC, Anonymous) == 16);
+    }
+    [
+        format.0 as u32,
+        D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32,
+        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        0,          // padding before 8-byte-aligned union
+        0,          // Texture2D.MostDetailedMip
+        mip_levels, // Texture2D.MipLevels
+        0,          // Texture2D.PlaneSlice
+        0,          // Texture2D.ResourceMinLODClamp (0.0f)
+        0,          // unused union tail
+        0,          // unused union tail
+    ]
+}
+
 #[cfg(test)]
 mod depth_tests {
     use super::*;
@@ -2024,19 +2059,9 @@ mod depth_tests {
             ),
             crate::object::S_OK
         );
-        // SAFETY: every field of `D3D12_SHADER_RESOURCE_VIEW_DESC` is an
-        // integer, float, or enum newtype; zeroing initializes padding and
-        // unused union tail bytes before `create_srv` reads it as `[u32; 10]`.
-        let mut srv_desc: D3D12_SHADER_RESOURCE_VIEW_DESC = unsafe { std::mem::zeroed() };
-        srv_desc.Format = DXGI_FORMAT_R32_FLOAT;
-        srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv_desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
-            MipLevels: 1,
-            ..Default::default()
-        };
+        let srv_desc = tex2d_srv_words(DXGI_FORMAT_R32_FLOAT, 1);
         let srv = crate::descriptor::heap(views).start;
-        crate::descriptor::create_srv(null, depth, (&raw const srv_desc).cast(), srv);
+        crate::descriptor::create_srv(null, depth, &srv_desc, srv);
         let used = UsedResource {
             kind: ResourceType::Srv,
             root: RootType::Table,
@@ -2608,7 +2633,7 @@ mod table_tests {
         state.set_heaps(&[views.0, samplers.0]);
         state.set_table(false, 0, table);
         let used = used_table(ResourceType::Srv, 0, 500, 8);
-        let made = state.tables(&list, &[used], false);
+        let made = state.tables(&list, &[used], false, &[]);
         assert!(!state.table_failed);
         assert_eq!(state.dynamic.len(), 1);
         let (dyn_heap, first, n) = state.dynamic[0];
@@ -2648,17 +2673,7 @@ mod table_tests {
             D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
             D3D12_RESOURCE_STATE_DEPTH_WRITE,
         );
-        // SAFETY: every field of `D3D12_SHADER_RESOURCE_VIEW_DESC` is an
-        // integer, float, or enum newtype; zeroing initializes padding and
-        // unused union tail bytes before `create_srv` reads it as `[u32; 10]`.
-        let mut srv_desc: D3D12_SHADER_RESOURCE_VIEW_DESC = unsafe { std::mem::zeroed() };
-        srv_desc.Format = DXGI_FORMAT_R32_FLOAT;
-        srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv_desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
-            MipLevels: 1,
-            ..Default::default()
-        };
+        let srv_desc = tex2d_srv_words(DXGI_FORMAT_R32_FLOAT, 1);
         let dsv_desc = [
             DXGI_FORMAT_D32_FLOAT.0 as u32,
             D3D12_DSV_DIMENSION_TEXTURE2D.0 as u32,
@@ -2681,24 +2696,9 @@ mod table_tests {
         let table1 = view_heap.start + 100 * 32;
         let table2 = view_heap.start + 300 * 32;
         let table_other = other_heap.start;
-        crate::descriptor::create_srv(
-            std::ptr::null(),
-            depth.0,
-            (&raw const srv_desc).cast(),
-            table1 + 10 * 32,
-        );
-        crate::descriptor::create_srv(
-            std::ptr::null(),
-            depth.0,
-            (&raw const srv_desc).cast(),
-            table2 + 25 * 32,
-        );
-        crate::descriptor::create_srv(
-            std::ptr::null(),
-            depth.0,
-            (&raw const srv_desc).cast(),
-            table_other + 10 * 32,
-        );
+        crate::descriptor::create_srv(std::ptr::null(), depth.0, &srv_desc, table1 + 10 * 32);
+        crate::descriptor::create_srv(std::ptr::null(), depth.0, &srv_desc, table2 + 25 * 32);
+        crate::descriptor::create_srv(std::ptr::null(), depth.0, &srv_desc, table_other + 10 * 32);
 
         let list1 = host.new_list().expect("list1");
         let mut state = State::default();
@@ -2707,7 +2707,7 @@ mod table_tests {
         state.set_table(false, 0, table1);
 
         let used1 = used_table(ResourceType::Srv, 0, 10, 8);
-        let made1 = state.tables(&list1, &[used1], false);
+        let made1 = state.tables(&list1, &[used1], false, &[]);
         assert!(!state.table_failed);
         assert_eq!(state.dynamic.len(), 1);
         assert_eq!(state.fresh_tables.len(), 1);
@@ -2722,7 +2722,7 @@ mod table_tests {
         state.depth_sampled = false;
         state.set_table(false, 0, table2);
         let used2 = used_table(ResourceType::Srv, 0, 25, 8);
-        let made2 = state.tables(&list2, &[used2], false);
+        let made2 = state.tables(&list2, &[used2], false, &[]);
         assert!(!state.table_failed);
         assert_eq!(state.dynamic.len(), 1, "must reuse dynamic allocation");
         assert_eq!(
@@ -2745,7 +2745,7 @@ mod table_tests {
         // Identical descriptor content in a different heap must NOT share slots across heaps.
         state.set_heaps(&[views_other.0]);
         state.set_table(false, 0, table_other);
-        let made_other = state.tables(&list2, &[used1], false);
+        let made_other = state.tables(&list2, &[used1], false, &[]);
         assert!(!state.table_failed);
         assert_eq!(state.dynamic.len(), 2);
         assert_eq!(state.fresh_tables.len(), 2);
@@ -2852,7 +2852,7 @@ mod table_tests {
             used_table(ResourceType::Sampler, 1, 4, 4),
             used_table(ResourceType::Sampler, 1, 5, 4),
         ];
-        let made = state.tables(&list, &used, false);
+        let made = state.tables(&list, &used, false, &[]);
         assert!(!state.table_failed);
         assert_eq!(state.dynamic.len(), 1);
         let (_, first, n) = state.dynamic[0];
@@ -2916,7 +2916,7 @@ mod table_tests {
             state.set_heaps(&[samplers.0]);
             state.set_table(false, 0, table);
             let used = used_table(ResourceType::Sampler, 0, cap, 4);
-            let made = state.tables(&list, &[used], false);
+            let made = state.tables(&list, &[used], false, &[]);
             assert!(!state.table_failed);
             assert_eq!(state.dynamic.len(), 1);
             let (_, first, n) = state.dynamic[0];
@@ -2936,7 +2936,7 @@ mod table_tests {
             state.set_heaps(&[samplers.0]);
             state.set_table(false, 0, table);
             let used = used_table(ResourceType::Sampler, 0, cap + 1, 4);
-            let made = state.tables(&list, &[used], false);
+            let made = state.tables(&list, &[used], false, &[]);
             assert!(state.table_failed);
             assert!(made.is_empty());
             assert!(state.dynamic.is_empty());
@@ -2976,16 +2976,7 @@ mod table_tests {
         let dsv = dsv_slot.as_mut_ptr() as u64;
         crate::descriptor::create_dsv(std::ptr::null(), depth.0, &dsv_desc, dsv);
 
-        // SAFETY: zero-initialize padding and unused union tail bytes before
-        // `create_srv` reads the description as `[u32; 10]`.
-        let mut depth_srv_desc: D3D12_SHADER_RESOURCE_VIEW_DESC = unsafe { std::mem::zeroed() };
-        depth_srv_desc.Format = DXGI_FORMAT_R32_FLOAT;
-        depth_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        depth_srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        depth_srv_desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
-            MipLevels: 1,
-            ..Default::default()
-        };
+        let depth_srv_desc = tex2d_srv_words(DXGI_FORMAT_R32_FLOAT, 1);
 
         let views = create_title_heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 64);
         let view_heap = crate::descriptor::heap(views.0);
@@ -2998,12 +2989,7 @@ mod table_tests {
             std::ptr::null(),
             table0,
         );
-        crate::descriptor::create_srv(
-            std::ptr::null(),
-            depth.0,
-            (&raw const depth_srv_desc).cast(),
-            table1,
-        );
+        crate::descriptor::create_srv(std::ptr::null(), depth.0, &depth_srv_desc, table1);
 
         let list = host.new_list().expect("multi-used list");
         crate::list::ensure_state(&list, uav_tex.0, D3D12_RESOURCE_STATE_COMMON.0 as u32);
@@ -3021,7 +3007,7 @@ mod table_tests {
             used_table(ResourceType::Cbv, 1, 0, 8),
             used_table(ResourceType::Srv, 1, 0, 8),
         ];
-        let made = state.tables(&list, &used, false);
+        let made = state.tables(&list, &used, false, &[]);
         assert!(!state.table_failed);
         assert_eq!(made.len(), 2);
         assert!(
@@ -3061,7 +3047,7 @@ mod table_tests {
         state.set_table(false, 0, table);
         let used = [used_table(ResourceType::Srv, 0, 0, 8)];
 
-        let made1 = state.tables(&list, &used, false);
+        let made1 = state.tables(&list, &used, false, &[]);
         assert!(!state.table_failed);
         assert_eq!(state.dynamic.len(), 1);
         let first1 = state.dynamic[0].1;
@@ -3071,7 +3057,7 @@ mod table_tests {
         // `descriptor::forget` bumped the view's generation so the cached range
         // must not be reused.
         drop(tex);
-        let made2 = state.tables(&list, &used, false);
+        let made2 = state.tables(&list, &used, false, &[]);
         assert!(!state.table_failed);
         assert_eq!(
             state.dynamic.len(),
@@ -3112,7 +3098,7 @@ mod table_tests {
             used_table(ResourceType::Sampler, 0, 0, 0),
             used_table(ResourceType::Sampler, 0, 1, cap * 4),
         ];
-        let made = state.tables(&list, &used, false);
+        let made = state.tables(&list, &used, false, &[]);
         assert!(state.table_failed);
         assert!(made.is_empty());
         assert!(state.fresh_tables.is_empty());
@@ -3147,7 +3133,7 @@ mod table_tests {
         state.set_table(false, 0, table1);
         let used = [used_table(ResourceType::Cbv, 0, 0, 0)];
 
-        let made1 = state.tables(&list, &used, false);
+        let made1 = state.tables(&list, &used, false, &[]);
         assert!(!state.table_failed);
         assert_eq!(state.dynamic.len(), 1);
         let first1 = state.dynamic[0].1;
@@ -3156,7 +3142,7 @@ mod table_tests {
         // Without an intervening deferred copy, identical table content at
         // `table2` reuses `first1`.
         state.set_table(false, 0, table2);
-        let made2 = state.tables(&list, &used, false);
+        let made2 = state.tables(&list, &used, false, &[]);
         assert!(!state.table_failed);
         assert_eq!(state.dynamic.len(), 1);
         assert_eq!(made2, vec![(0, first1 * 32)]);
@@ -3165,7 +3151,7 @@ mod table_tests {
         // must partition the cache so the next draw allocates a fresh CBV
         // snapshot (`Fill -> Copy -> Fill`).
         list.defer_copy(cb_dst.as_mut_ptr(), cb_src.as_ptr(), cb_src.len());
-        let made3 = state.tables(&list, &used, false);
+        let made3 = state.tables(&list, &used, false, &[]);
         assert!(!state.table_failed);
         assert_eq!(state.dynamic.len(), 2);
         let first2 = state.dynamic[1].1;
@@ -3174,7 +3160,7 @@ mod table_tests {
 
         // Subsequent draws with no further copies reuse `first2`.
         state.set_table(false, 0, table1);
-        let made4 = state.tables(&list, &used, false);
+        let made4 = state.tables(&list, &used, false, &[]);
         assert!(!state.table_failed);
         assert_eq!(state.dynamic.len(), 2);
         assert_eq!(made4, vec![(0, first2 * 32)]);
