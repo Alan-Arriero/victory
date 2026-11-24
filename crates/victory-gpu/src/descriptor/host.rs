@@ -5,13 +5,27 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
-use crate::host::{Host, host};
+use crate::host::{Host, HostList, host};
+
+/// An aligned upload copy backing a buffer SRV whose offset inside its shadow
+/// buffer is not a multiple of its element stride. Kept persistently mapped so
+/// each draw or dispatch using the slot can schedule a submission-time refresh
+/// (safe to overwrite in place because the host queue waits for each submission
+/// to finish before the next one runs).
+#[derive(Clone)]
+struct UnalignedCopy {
+    resource: ID3D12Resource,
+    dst: usize,
+    src: usize,
+    len: usize,
+}
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -31,6 +45,9 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    /// Slots backed by an [`UnalignedCopy`] that must be refreshed from title
+    /// memory when a command list referencing the slot is submitted.
+    unaligned: Mutex<HashMap<u32, UnalignedCopy>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -214,6 +231,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
+            unaligned: Mutex::new(HashMap::new()),
             next: Mutex::new((0, vec![false; extra as usize])),
         };
         // A slot never written is undefined: shaders reading one (a slot
@@ -384,7 +402,7 @@ impl HostHeap {
                 null_for(view, self.cpu(index));
             }
         }
-        self.keep(index, kept.flatten());
+        self.keep(index, kept.unwrap_or(Kept::Empty));
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -394,25 +412,61 @@ impl HostHeap {
         } else {
             null_view(self.cpu(index));
         }
-        self.keep(index, None);
+        self.keep(index, Kept::Empty);
     }
 
-    /// Slot `index` now views `resource` (or nothing of the host's).
-    fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
-        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = kept.get_mut(index as usize) {
+    /// Slot `index` now views `kept` (or nothing of the host's).
+    fn keep(&self, index: u32, kept: Kept) {
+        let (resource, unaligned) = match kept {
+            Kept::Empty => (None, None),
+            Kept::Resource(r) => (Some(r), None),
+            Kept::Unaligned(copy) => (Some(copy.resource.clone()), Some(copy)),
+        };
+        let mut slots = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = slots.get_mut(index as usize) {
             // A running submission may still read the old resource through
             // this slot.
             if let Some(old) = std::mem::replace(slot, resource) {
                 crate::host::retire(old);
             }
         }
+        drop(slots);
+        let mut map = self.unaligned.lock().unwrap_or_else(|e| e.into_inner());
+        match unaligned {
+            Some(copy) => {
+                map.insert(index, copy);
+            }
+            None if !map.is_empty() => {
+                map.remove(&index);
+            }
+            None => {}
+        }
+    }
+
+    /// If slot `index` is backed by an unaligned upload copy, schedules a
+    /// submission-time refresh from title memory on `list`.
+    pub(crate) fn refresh_slot(&self, index: u32, list: &HostList) {
+        let copy = {
+            let map = self.unaligned.lock().unwrap_or_else(|e| e.into_inner());
+            if map.is_empty() {
+                return;
+            }
+            map.get(&index).cloned()
+        };
+        if let Some(copy) = copy {
+            list.defer_fill_upload(
+                copy.resource,
+                copy.dst as *mut u8,
+                copy.src as *const u8,
+                copy.len,
+            );
+        }
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
-        self.keep(index, None);
+        self.keep(index, Kept::Empty);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
@@ -476,7 +530,7 @@ impl HostHeap {
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
-            self.keep(index, kept.flatten());
+            self.keep(index, kept.unwrap_or(Kept::Empty));
         }
         Some(view)
     }
@@ -610,7 +664,11 @@ fn raw_start_fits(first: u64) -> bool {
 }
 
 /// The host resource a slot made by [`make`] views, if any.
-type Kept = Option<ID3D12Resource>;
+enum Kept {
+    Empty,
+    Resource(ID3D12Resource),
+    Unaligned(UnalignedCopy),
+}
 
 fn buffer_srv(
     address: u64,
@@ -643,8 +701,9 @@ fn buffer_srv(
         // The title's placed buffer starts at an address that is not a
         // multiple of `element` inside our larger host shadow buffer (e.g. a
         // non-power-of-two structured element stride inside a ring buffer).
-        // Copy the viewed bytes into an aligned upload buffer starting at
-        // element 0 so D3D12 accepts the structured or typed SRV.
+        // Copy the viewed bytes into a persistently mapped aligned upload
+        // buffer starting at element 0, and track it so draws refresh it from
+        // title memory at submission time.
         let view_offset = buffer.FirstElement.checked_mul(element)?;
         let bytes = u64::from(buffer.NumElements).checked_mul(element)?;
         const MAX_UNALIGNED_COPY: u64 = 1 << 20;
@@ -659,15 +718,18 @@ fn buffer_srv(
         let start = address.checked_add(view_offset)?;
         let (upload, dst) = host.upload_buffer(bytes)?;
         crate::host::copy_mapped(dst, start as *const u8, bytes as usize, false);
-        // SAFETY: `upload` was mapped by `upload_buffer` and will not be written again.
-        unsafe { upload.Unmap(0, None) };
         buffer.FirstElement = 0;
         // SAFETY: a live upload buffer and a slot of our heap.
         unsafe {
             host.device
                 .CreateShaderResourceView(&upload, Some(&desc), at)
         };
-        return Some(Some(upload));
+        return Some(Kept::Unaligned(UnalignedCopy {
+            resource: upload,
+            dst: dst as usize,
+            src: start as usize,
+            len: bytes as usize,
+        }));
     }
     buffer.FirstElement += offset / element;
     if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 && !raw_start_fits(buffer.FirstElement) {
@@ -680,7 +742,7 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
-    Some(Some(shadow.buffer.clone()))
+    Some(Kept::Resource(shadow.buffer.clone()))
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -744,7 +806,7 @@ fn buffer_uav(
             at,
         )
     };
-    Some(Some(shadow.buffer.clone()))
+    Some(Kept::Resource(shadow.buffer.clone()))
 }
 
 /// Whether the host lets views of a typed resource name another format of
@@ -863,7 +925,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
-            Some(Some(shadow.buffer.clone()))
+            Some(Kept::Resource(shadow.buffer.clone()))
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
@@ -880,7 +942,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         at,
                     )
                 };
-                Some(Some(texture.clone()))
+                Some(Kept::Resource(texture.clone()))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
@@ -912,7 +974,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     at,
                 )
             };
-            Some(Some(texture.clone()))
+            Some(Kept::Resource(texture.clone()))
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
@@ -923,13 +985,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            Some(None)
+            Some(Kept::Empty)
         }
         View::ConsoleSampler(words) => {
             let desc = crate::sampler::console(words);
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            Some(None)
+            Some(Kept::Empty)
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
@@ -1282,16 +1344,17 @@ mod tests {
 
     /// A structured buffer SRV whose offset inside its shadow buffer is not a
     /// multiple of its element stride is copied into an aligned upload buffer
-    /// instead of being dropped.
+    /// and refreshed from title memory when a command list referencing the slot
+    /// is submitted.
     #[test]
-    fn unaligned_structured_buffer_srv_copies_into_aligned_upload_buffer() {
+    fn unaligned_structured_buffer_srv_refreshes_on_submission() {
         let Some(host) = host() else {
             return; // no host GPU
         };
         let Some(heap) = HostHeap::new(false, 4) else {
             return;
         };
-        let backing: Vec<u8> = (0..4096usize).map(|i| (i % 251) as u8).collect();
+        let mut backing: Vec<u8> = (0..4096usize).map(|i| (i % 251) as u8).collect();
         let base = backing.as_ptr() as u64;
         crate::shadow::register(base as usize, base, backing.len() as u64);
         // Offset 32 is not a multiple of stride 24 (32 % 24 == 8).
@@ -1308,14 +1371,30 @@ mod tests {
                 },
             },
         };
-        let kept = buffer_srv(base + 32, 24, desc, heap.cpu(0));
+        let kept = buffer_srv(base + 32, 24, desc, heap.cpu(0))
+            .expect("unaligned structured SRV should succeed");
+        let (upload, dst) = match &kept {
+            Kept::Unaligned(copy) => (copy.resource.clone(), copy.dst as *const u8),
+            _ => panic!("expected an unaligned upload copy"),
+        };
+        heap.keep(0, kept);
+
+        // Mutate the title slice *after* creating the view (as a ring buffer does).
+        let updated: [u8; 24] = std::array::from_fn(|i| 0xA0u8.wrapping_add(i as u8));
+        backing[32..56].copy_from_slice(&updated);
+
+        let list = host.new_list().expect("host command list");
+        heap.refresh_slot(0, &list);
+        list.close();
+        host.execute(&[&list]);
         crate::shadow::unregister(base as usize, base);
-        let upload = kept
-            .expect("unaligned structured SRV should succeed")
-            .expect("aligned upload buffer should be kept");
-        // SAFETY: live D3D12 resource and device queries.
+
+        // SAFETY: `upload` is persistently mapped for its lifetime (`24` bytes)
+        // and `host.execute` has completed.
         unsafe {
             assert_eq!(upload.GetDesc().Width, 24);
+            let got = std::slice::from_raw_parts(dst, 24);
+            assert_eq!(got, &updated);
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
     }
