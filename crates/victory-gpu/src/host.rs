@@ -71,6 +71,11 @@ unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
 
+/// Warn once when a pinned epoch holds back this many retired host objects
+/// (for example, an unreset command list or a submission stalled behind an
+/// unsignalled fence).
+const RETIRED_WARN_THRESHOLD: usize = 4096;
+
 /// Host objects the title let go of while an open list or a queued/running
 /// submission may still use them (a texture its descriptors name, a descriptor
 /// slot's old resource, a buffer shadow, or texture staging), by the highest
@@ -80,12 +85,18 @@ unsafe impl Sync for Host {}
 /// was a GPU page fault on the freed texture (DXGI_ERROR_DEVICE_HUNG,
 /// 2026-11-24, RX 7600).
 ///
+/// Any stuck pinned epoch (such as a list that recorded GPU work and is never
+/// reset, or a submission waiting behind a fence that never signals) pins all
+/// later retirements until it is released; a one-time warning is logged once
+/// the queue reaches [`RETIRED_WARN_THRESHOLD`].
+///
 /// Lock invariant: `RETIRE_STATE` is a strict leaf lock — never lock anything
 /// else while holding it, and ALWAYS drop retired objects AFTER releasing it.
 struct RetireState {
     next_epoch: u64,
     active_epochs: std::collections::BTreeMap<u64, usize>,
     retired: std::collections::VecDeque<(u64, Retired)>,
+    warned: bool,
 }
 
 impl RetireState {
@@ -94,6 +105,7 @@ impl RetireState {
             next_epoch: 1,
             active_epochs: std::collections::BTreeMap::new(),
             retired: std::collections::VecDeque::new(),
+            warned: false,
         }
     }
 }
@@ -188,19 +200,44 @@ fn release_epoch_in(retire_state: &Mutex<RetireState>, epoch: u64) {
 }
 
 fn retire_in<T: 'static>(retire_state: &Mutex<RetireState>, object: T) {
-    let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
-    if state.active_epochs.is_empty() {
-        drop(state);
-        drop(object);
-        return;
+    let warn = {
+        let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.active_epochs.is_empty() {
+            drop(state);
+            drop(object);
+            return;
+        }
+        let wait_for = state.next_epoch.saturating_sub(1);
+        state
+            .retired
+            .push_back((wait_for, Retired(Box::new(object))));
+        if !state.warned && state.retired.len() >= RETIRED_WARN_THRESHOLD {
+            state.warned = true;
+            Some((
+                state.retired.len(),
+                state.active_epochs.keys().next().copied().unwrap_or(0),
+                state.active_epochs.len(),
+                wait_for,
+            ))
+        } else {
+            None
+        }
+    };
+    if let Some((pending, oldest_epoch, active_epochs, latest_epoch)) = warn {
+        tracing::warn!(
+            pending,
+            oldest_epoch,
+            active_epochs,
+            latest_epoch,
+            "retired host resource queue grew past threshold; an unreset command list or stalled wait may be pinning epochs"
+        );
     }
-    let wait_for = state.next_epoch.saturating_sub(1);
-    state
-        .retired
-        .push_back((wait_for, Retired(Box::new(object))));
 }
 
 /// Drops `object` once every epoch active now has finished: at once if none is.
+/// Note: a stuck pinned epoch (such as an unreset list with recorded work or a
+/// submission behind an unsignalled fence) holds back all later retirements
+/// until released.
 pub(crate) fn retire<T: 'static>(object: T) {
     #[cfg(test)]
     if let Some(scope) = current_retire_scope() {
