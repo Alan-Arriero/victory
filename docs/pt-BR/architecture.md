@@ -41,7 +41,7 @@ só como aquecimento.
 | `victory-shader` | containers de shader do Xbox → shaders do host |
 | `victory-formats` | layouts de textura da GPU (tamanhos, tiling, detiling), codecs de áudio; planejado: BCPack |
 | `victory-pipeline` | trait de conversor, cache endereçado por conteúdo |
-| `victory-game` | formatos, identidades de build e hooks específicos de Grand Theft Auto VI |
+| `victory-game` | formatos, identidades de build e hooks específicos do título |
 | `apps/victory` | interface de linha de comando |
 | `xtask` | verificação da política de assets, git hooks |
 | `tests/fixtures/hle-probe` | um "jogo" substituto (código nosso) para testes do loader |

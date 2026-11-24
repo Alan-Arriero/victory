@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-VIctory runs an Xbox Series X|S title (Grand Theft Auto VI) natively on Windows. The console
+VIctory runs an Xbox Series X|S title natively on Windows. The console
 executable is x86-64 PE32+ built for Zen 2, so its machine code runs **unchanged inside our
 process**; VIctory supplies the platform underneath (system APIs, D3D12.X → host D3D12, console
 GPU shaders → DXIL) and converts the title's data. See `README.md` for current status and
@@ -65,7 +65,7 @@ Crate flow: game assets → `victory-pipeline` + `victory-game` (using `victory-
 `victory-shader`) → `cache_dir`; game executable → `victory-loader` → native title code →
 imports into `victory-hle` → D3D12.X into `victory-gpu` → host D3D12, with shaders translated by
 `victory-shader` at pipeline creation. Everything except `victory-game` is platform-level and
-testable with any Xbox Series title; GTA VI–specific code (formats, build identities, hooks)
+testable with any Xbox Series title; title-specific code (formats, build identities, hooks)
 belongs only in `victory-game`.
 
 **Loader** (`victory-loader`): patches a copy of the image to look like a DLL (no entry point,
