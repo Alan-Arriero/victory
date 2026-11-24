@@ -1059,6 +1059,9 @@ fn hand_out_resource(
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
+    } else if host_writes(&desc) {
+        let at = std::ptr::from_ref::<Resource>(&resource) as usize;
+        targets().insert(resource.data() as u64, at);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -1091,6 +1094,13 @@ impl Drop for Resource {
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        if self.desc.dimension != BUFFER && host_writes(&self.desc) {
+            let mut targets = targets();
+            let at = self.data() as u64;
+            if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
+                targets.remove(&at);
+            }
+        }
         if self.desc.dimension == BUFFER {
             crate::shadow::unregister(
                 std::ptr::from_ref::<Resource>(self) as usize,
@@ -1290,7 +1300,89 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
+    placed_views().insert(out as usize);
     resource(out).host().is_some().then_some(out)
+}
+
+/// The resources [`texture_at`] made (never released, as they are).
+#[cfg(windows)]
+fn placed_views() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize>> {
+    static PLACED: std::sync::Mutex<std::collections::BTreeSet<usize>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    PLACED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether the host writes a texture described by `desc` (a render target,
+/// depth or unordered-access texture): its contents exist on the host alone,
+/// not in title memory.
+#[cfg(windows)]
+fn host_writes(desc: &ResourceDesc) -> bool {
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    desc.dimension != BUFFER && desc.flags & TARGET_DEPTH_UNORDERED != 0
+}
+
+/// The title textures the host writes ([`host_writes`]), by the address of
+/// their memory: what a view the title places in that memory in another
+/// format shows ([`alias_of`]). A texture leaves the table before it is
+/// freed.
+#[cfg(windows)]
+fn targets() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<u64, usize>> {
+    static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// For `this`, a texture made for a view the title placed in memory
+/// ([`texture_at`]): the title texture the host writes that lies in the same
+/// memory, if there is one of the same size, levels and layers with texels of
+/// the same width.
+///
+/// The console reads such memory through the view as it is: a title can
+/// pack light as R9G9B9E5 into R32_UINT textures with compute shaders, which
+/// cannot write R9G9B9E5, and sample them through R9G9B9E5 views placed at
+/// the textures' addresses. On the host these are two textures and what the
+/// shaders wrote exists in one of them only; the other was filled from title
+/// memory, which nothing writes, so everything read through such a view was
+/// black. The caller copies the written texture's texels into the view's
+/// (`texture::alias`).
+///
+/// `VICTORY_ALIAS_COPY=0` (diagnostics builds) finds none, as before.
+#[cfg(windows)]
+pub(crate) fn alias_of(this: This) -> Option<This> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        !cfg!(feature = "diagnostics")
+            || std::env::var_os("VICTORY_ALIAS_COPY").is_none_or(|v| v != "0")
+    });
+    if this.is_null() || !on {
+        return None;
+    }
+    let r = resource(this);
+    // A level count of 0 asks for a full chain: not counted here.
+    let plain = |d: &ResourceDesc| {
+        d.dimension != BUFFER
+            && d.mip_levels >= 1
+            && d.depth_or_array_size >= 1
+            && d.sample_count <= 1
+    };
+    if host_writes(&r.desc) || !plain(&r.desc) || !placed_views().contains(&(this as usize)) {
+        return None;
+    }
+    // Under the table's lock: a texture leaves it before it is freed.
+    let targets = targets();
+    let other = *targets.get(&(r.data() as u64))? as This;
+    let o = resource(other);
+    const DEPTH: u32 = 0x2;
+    let same = plain(&o.desc)
+        && o.desc.dimension == r.desc.dimension
+        && o.desc.width == r.desc.width
+        && o.desc.height == r.desc.height
+        && o.desc.mip_levels == r.desc.mip_levels
+        && o.desc.depth_or_array_size == r.desc.depth_or_array_size
+        && o.desc.flags & DEPTH == 0
+        && target_format(o.desc.format) == o.desc.format
+        && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
+    same.then_some(other)
 }
 
 pub(crate) extern "system" fn create_placed(
