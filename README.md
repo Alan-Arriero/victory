@@ -2,7 +2,7 @@
 
 *Read this in: [English](README.md) | [Bahasa Indonesia](languages/README.id.md)*
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
+Runs an Xbox Series X|S title natively on Windows, from files
 the user supplies.
 
 The title's x86-64 code runs unchanged inside our process; VIctory supplies
@@ -109,12 +109,12 @@ Run the title, replacing the example path with the full path to your game's exec
 
 ```powershell
 cargo build --release -p victory
-.\target\release\victory.exe run 'D:\Xbox Games\GTA VI\title.exe' --execute
+.\target\release\victory.exe run 'D:\Xbox Games\Title\title.exe' --execute
 ```
 
 ### Selecting the Series S profile
 
-GTA VI chooses its render configuration from the console model, not from the
+The title chooses its render configuration from the console model, not from the
 display modes VIctory advertises through DXGI. To use the lower-resolution
 profile, pass `--console series-s` when starting the title:
 
@@ -275,7 +275,7 @@ Nothing from the title's data belongs in the report: no shader dumps, no
 frames, no memory, per [docs/asset-policy.md](docs/asset-policy.md). Names of
 our own functions, error codes and timings are enough to start.
 
-[docs/debugging-notes-from-a-gta-v-port.md](docs/debugging-notes-from-a-gta-v-port.md)
+[docs/debugging-notes-from-a-port.md](docs/debugging-notes-from-a-port.md)
 collects what got another RAGE port from "the world loads" to "the game
 runs": what the title waited for, and how each wait was found.
 

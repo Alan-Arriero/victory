@@ -2,7 +2,7 @@
 
 *Read this in: [English](../README.md)*
 
-Menjalankan Grand Theft Auto VI (Xbox Series X|S) secara native di Windows, dari file yang disediakan oleh pengguna.
+Menjalankan sebuah judul Xbox Series X|S secara native di Windows, dari file yang disediakan oleh pengguna.
 
 Kode x86-64 milik game berjalan tanpa perubahan di dalam proses kita; VIctory menyediakan platform di bawahnya dan mengonversi data game — di muka jika memungkinkan, dan saat pertama dipakai jika tidak (shader). Lihat [docs/architecture.md](../docs/architecture.md).
 

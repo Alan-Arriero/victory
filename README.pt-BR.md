@@ -3,7 +3,7 @@
 > Tradução do [README.md](README.md) em inglês, feita em 2026-11-23. Em caso de
 > divergência, vale a versão em inglês.
 
-Roda Grand Theft Auto VI (Xbox Series X|S) nativamente no Windows, a partir de
+Roda um título de Xbox Series X|S nativamente no Windows, a partir de
 arquivos fornecidos pelo próprio usuário.
 
 O código x86-64 do jogo roda sem alterações dentro do nosso processo; o

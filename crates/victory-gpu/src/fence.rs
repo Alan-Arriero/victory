@@ -558,7 +558,7 @@ mod tests {
         assert_eq!(wait(f, 5, event), S_OK, "already reached");
         // SAFETY: as above.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
-        // Grand Theft Auto VI reads the value at the fence's address.
+        // The title reads the value at the fence's address.
         // SAFETY: the fence's value.
         assert_eq!(unsafe { *(address(f) as *const u64) }, 5);
         // SAFETY: ours.

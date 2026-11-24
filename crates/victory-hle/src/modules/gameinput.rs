@@ -806,7 +806,7 @@ fn token(out: *mut u64) -> HRESULT {
     S_OK
 }
 
-// shortcut: reading callbacks never run; Grand Theft Auto VI registers none
+// shortcut: reading callbacks never run; the title registers none
 // (it polls).
 extern "system" fn register_reading(
     _: This,
@@ -1011,7 +1011,7 @@ extern "system" fn device_status(this: *const Device) -> u32 {
         0
     }
 }
-// Grand Theft Auto VI sends trigger levels in slot 0x50; all four reach the
+// The title sends trigger levels in slot 0x50; all four reach the
 // host, which drops the trigger motors (see `host::Host::rumble`).
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.

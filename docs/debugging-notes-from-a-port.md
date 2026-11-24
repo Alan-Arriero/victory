@@ -1,10 +1,10 @@
-# Debugging notes from a GTA V port
+# Debugging notes from an earlier port
 
-Lessons from bringing GTA V (RAGE, D3D11 path) up natively on an Android
+Lessons from bringing an earlier title (RAGE, D3D11 path) up natively on an Android
 phone (ARM64, D3D11 over DXVK and Vulkan on an Adreno 740). That port went
 through the stage VIctory is at now: the title loads the world and then
 does not move on into the game. What got it past that is written down here
-as things to try. None of it has been checked against GTA VI.
+as things to try. None of it has been checked against the current title.
 
 Nothing from either game is in this note: no code, names from it or data.
 
@@ -152,4 +152,4 @@ unchanged. These problems from the port do not apply:
 * memory ordering on ARM (empty barriers, counters seen before data);
 * compiler differences (signed `char`, null checks after `new`, references
   assumed non-null);
-* the data formats and encryption of GTA V's PC release.
+* the data formats and encryption of that title's PC release.

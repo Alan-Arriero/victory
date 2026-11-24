@@ -16,7 +16,7 @@ use crate::policy::ensure_outside_repo;
 
 #[derive(Debug, Default, Clone)]
 pub struct Config {
-    /// The user's dump of Grand Theft Auto VI.
+    /// The user's dump of the title.
     pub game_dir: Option<PathBuf>,
     /// Root for all derived data. Always outside the repository.
     pub cache_dir: PathBuf,
@@ -368,7 +368,7 @@ fn ensure_data_outside_cache(cache_dir: &Path, data_dir: &Path, origins: &Origin
 /// delete it, and neither the cache nor the data folder may be inside it,
 /// where derived files and saves would be mixed into the dump. Each is an
 /// easy slip with one parent folder for everything, e.g.
-/// `VICTORY_CACHE_DIR=~/gta` with `VICTORY_GAME_DIR=~/gta/game`, or
+/// `VICTORY_CACHE_DIR=~/title` with `VICTORY_GAME_DIR=~/title/game`, or
 /// `[paths].cache_dir = "cache"` in a `victory.toml` kept inside the dump.
 /// Compared like [`ensure_data_outside_cache`]: lexically, without the disk.
 fn ensure_game_apart(game: &Path, cache: &Path, data: &Path, origins: &Origins) -> Result<()> {
@@ -474,7 +474,7 @@ fn check_setting(what: &str, path: &Path) -> Result<()> {
 }
 
 /// Refuses a path that names an environment variable instead of its value:
-/// `$HOME/Games/gta`, `${XDG_DATA_HOME}/victory` or
+/// `$HOME/Games/title`, `${XDG_DATA_HOME}/victory` or
 /// `%LOCALAPPDATA%\victory` (the form `victory.example.toml` uses for the
 /// defaults, so an easy one to copy). Only a shell (or `cmd` for `%...%`)
 /// expands these; TOML, an env file read by `docker run --env-file` or
@@ -536,7 +536,7 @@ fn variable_in(part: &str) -> Option<&str> {
 
 /// Refuses a path that starts or ends with whitespace (a space, or a
 /// no-break space pasted from a web page). An env file or launcher keeps
-/// what a shell would split off: `VICTORY_GAME_DIR= /games/gta` or a value
+/// what a shell would split off: `VICTORY_GAME_DIR= /games/title` or a value
 /// with a trailing space. A leading space makes the path relative, so it
 /// would be taken as a folder named ` ` under the config file's folder or
 /// the working directory (often the repository); a trailing one is reported
@@ -561,8 +561,8 @@ fn ensure_trimmed(what: &str, path: &Path) -> Result<()> {
     anyhow::bail!("{what} is {text:?}, which {place} with whitespace; remove it");
 }
 
-/// Refuses a path wrapped in a matching pair of quotes (`"/games/gta"` or
-/// `'/games/gta'`, quotes included). Only a shell removes them: an env file
+/// Refuses a path wrapped in a matching pair of quotes (`"/games/title"` or
+/// `'/games/title'`, quotes included). Only a shell removes them: an env file
 /// read by `docker run --env-file`, systemd's `EnvironmentFile=` (single
 /// quotes on older versions), an IDE run configuration or a Windows
 /// `set VICTORY_GAME_DIR="D:\games"` keeps them as part of the value. The
@@ -926,7 +926,7 @@ mod tests {
         let home = PathBuf::from(abs("home"));
         let h = Some(home.as_path());
         assert_eq!(expand_home("~".into(), h), home);
-        assert_eq!(expand_home("~/games/gta".into(), h), home.join("games/gta"));
+        assert_eq!(expand_home("~/games/title".into(), h), home.join("games/title"));
         // Only a whole leading `~` component counts.
         assert_eq!(expand_home("~user/x".into(), h), PathBuf::from("~user/x"));
         assert_eq!(expand_home("a/~/b".into(), h), PathBuf::from("a/~/b"));
@@ -937,12 +937,12 @@ mod tests {
     #[test]
     fn tilde_in_the_file_is_home_not_next_to_the_file() {
         let parsed: FileConfig =
-            toml::from_str("[paths]\ngame_dir = '~/games/gta'\ntest_titles = ['~/t']\n").unwrap();
+            toml::from_str("[paths]\ngame_dir = '~/games/title'\ntest_titles = ['~/t']\n").unwrap();
         let home = PathBuf::from(abs("home"));
         let paths = parsed
             .anchored_at(&PathBuf::from(abs("configs")), Some(&home))
             .unwrap();
-        assert_eq!(paths.game_dir.unwrap(), home.join("games/gta"));
+        assert_eq!(paths.game_dir.unwrap(), home.join("games/title"));
         assert_eq!(paths.test_titles, vec![home.join("t")]);
     }
 
@@ -951,7 +951,7 @@ mod tests {
         let sep = if cfg!(windows) { ";" } else { ":" };
         let titles = format!("~/one{sep}~/two");
         let env = |k: &str| match k {
-            "VICTORY_GAME_DIR" => Some(OsString::from("~/games/gta")),
+            "VICTORY_GAME_DIR" => Some(OsString::from("~/games/title")),
             "VICTORY_CACHE_DIR" => Some(OsString::from("~/cache")),
             "VICTORY_TEST_TITLES" => Some(OsString::from(&titles)),
             "HOME" => Some(abs("home")),
@@ -959,7 +959,7 @@ mod tests {
         };
         let cfg = Config::resolve(FilePaths::default(), None, env).unwrap();
         let home = PathBuf::from(abs("home"));
-        assert_eq!(cfg.game_dir.unwrap(), home.join("games/gta"));
+        assert_eq!(cfg.game_dir.unwrap(), home.join("games/title"));
         assert_eq!(cfg.cache_dir, home.join("cache"));
         assert_eq!(cfg.test_titles, vec![home.join("one"), home.join("two")]);
     }
@@ -995,18 +995,18 @@ mod tests {
     #[test]
     fn control_characters_in_paths_are_refused() {
         // A CRLF `.env` file leaves a `\r` on the end of every value.
-        let err = ensure_no_control("VICTORY_GAME_DIR", Path::new("/games/gta\r"))
+        let err = ensure_no_control("VICTORY_GAME_DIR", Path::new("/games/title\r"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("VICTORY_GAME_DIR"), "{err}");
-        assert!(err.contains("\"/games/gta\\r\""), "{err}");
+        assert!(err.contains("\"/games/title\\r\""), "{err}");
         assert!(err.contains("CRLF"), "{err}");
         let err = ensure_no_control("[paths].data_dir", Path::new("/a\tb"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("'\\t'"), "{err}");
         assert!(!err.contains("CRLF"), "{err}");
-        for ok in ["/games/gta", "games with spaces", "~/jeux/été", ""] {
+        for ok in ["/games/title", "games with spaces", "~/jeux/été", ""] {
             assert!(ensure_no_control("x", Path::new(ok)).is_ok(), "{ok}");
         }
 
@@ -1040,18 +1040,18 @@ mod tests {
 
     #[test]
     fn quoted_paths_are_refused() {
-        // `docker run --env-file` keeps the quotes of `VICTORY_GAME_DIR="/games/gta"`.
-        let err = ensure_unquoted("VICTORY_GAME_DIR", Path::new("\"/games/gta\""))
+        // `docker run --env-file` keeps the quotes of `VICTORY_GAME_DIR="/games/title"`.
+        let err = ensure_unquoted("VICTORY_GAME_DIR", Path::new("\"/games/title\""))
             .unwrap_err()
             .to_string();
         assert!(err.contains("VICTORY_GAME_DIR"), "{err}");
-        assert!(err.contains("\"/games/gta\""), "{err}");
+        assert!(err.contains("\"/games/title\""), "{err}");
         assert!(err.contains("quotes included"), "{err}");
-        assert!(ensure_unquoted("x", Path::new("'~/gta'")).is_err());
+        assert!(ensure_unquoted("x", Path::new("'~/title'")).is_err());
         for ok in [
-            "/games/gta",
+            "/games/title",
             "/games/Rockstar's",
-            "'/games/gta\"",
+            "'/games/title\"",
             "\"",
             "'",
             "",
@@ -1081,7 +1081,7 @@ mod tests {
         let env = |k: &str| (k == "VICTORY_CONFIG").then(|| OsString::from("'victory.toml'"));
         let err = explicit_config(env, None).unwrap_err().to_string();
         assert!(err.contains("VICTORY_CONFIG"), "{err}");
-        let parsed: FileConfig = toml::from_str("[paths]\ngame_dir = '\"/games/gta\"'\n").unwrap();
+        let parsed: FileConfig = toml::from_str("[paths]\ngame_dir = '\"/games/title\"'\n").unwrap();
         let err = parsed
             .anchored_at(Path::new("/configs"), None)
             .unwrap_err()
@@ -1091,13 +1091,13 @@ mod tests {
 
     #[test]
     fn surrounding_whitespace_in_paths_is_refused() {
-        let err = ensure_trimmed("VICTORY_GAME_DIR", Path::new(" /games/gta"))
+        let err = ensure_trimmed("VICTORY_GAME_DIR", Path::new(" /games/title"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("VICTORY_GAME_DIR"), "{err}");
-        assert!(err.contains("\" /games/gta\""), "{err}");
+        assert!(err.contains("\" /games/title\""), "{err}");
         assert!(err.contains("starts with whitespace"), "{err}");
-        let err = ensure_trimmed("x", Path::new("/games/gta "))
+        let err = ensure_trimmed("x", Path::new("/games/title "))
             .unwrap_err()
             .to_string();
         assert!(err.contains("ends with whitespace"), "{err}");
@@ -1106,9 +1106,9 @@ mod tests {
             .to_string();
         assert!(err.contains("starts and ends"), "{err}");
         // A no-break space pasted from a web page.
-        assert!(ensure_trimmed("x", Path::new("/games/gta\u{a0}")).is_err());
+        assert!(ensure_trimmed("x", Path::new("/games/title\u{a0}")).is_err());
         for ok in [
-            "/games/gta",
+            "/games/title",
             "games with spaces",
             "/Program Files/x",
             "~/é",
@@ -1161,7 +1161,7 @@ mod tests {
     #[test]
     fn unexpanded_variables_in_paths_are_refused() {
         // An env file or the config file keeps `$HOME` literally.
-        let err = ensure_no_variable("VICTORY_GAME_DIR", Path::new("$HOME/Games/gta"))
+        let err = ensure_no_variable("VICTORY_GAME_DIR", Path::new("$HOME/Games/title"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("VICTORY_GAME_DIR"), "{err}");
@@ -1170,11 +1170,11 @@ mod tests {
         for (path, var) in [
             ("${XDG_DATA_HOME}/victory", "${XDG_DATA_HOME}"),
             ("/srv/${USER}-victory/cache", "${USER}"),
-            ("/home/$USER/gta", "$USER"),
+            ("/home/$USER/title", "$USER"),
             ("%LOCALAPPDATA%\\victory\\cache", "%LOCALAPPDATA%"),
             ("%LocalAppData%/victory", "%LocalAppData%"),
-            ("%ProgramFiles(x86)%\\gta", "%ProgramFiles(x86)%"),
-            ("~/%USERNAME%-gta", "%USERNAME%"),
+            ("%ProgramFiles(x86)%\\title", "%ProgramFiles(x86)%"),
+            ("~/%USERNAME%-title", "%USERNAME%"),
         ] {
             let err = ensure_no_variable("x", Path::new(path))
                 .unwrap_err()
@@ -1186,9 +1186,9 @@ mod tests {
         }
         // Real folder names with `$` or `%` in them.
         for ok in [
-            "/games/gta",
+            "/games/title",
             "C:\\$Recycle.Bin\\x",
-            "/mnt/share$/gta",
+            "/mnt/share$/title",
             "/games/$HOME.old",
             "/games/100%",
             "/games/50% off/x",
@@ -1380,7 +1380,7 @@ mod tests {
     fn a_config_file_inside_the_dump_cannot_put_the_cache_there() {
         // `victory.toml` kept in the game folder with `cache_dir = "cache"`:
         // anchored at the file, the cache lands inside the dump.
-        let dump = PathBuf::from(abs("gta"));
+        let dump = PathBuf::from(abs("title"));
         let parsed = parse_file("[paths]\ngame_dir = '.'\ncache_dir = 'cache'\n").unwrap();
         let paths = parsed.anchored_at(&dump, None).unwrap();
         let env = |k: &str| (k == "VICTORY_DATA_DIR").then(|| abs("d"));
@@ -1556,7 +1556,7 @@ mod tests {
     fn top_level_path_keys_say_where_they_belong() {
         let err = format!(
             "{:#}",
-            parse_file("game_dir = '/games/gta'\n").expect_err("refused")
+            parse_file("game_dir = '/games/title'\n").expect_err("refused")
         );
         assert!(
             err.contains("game_dir must be under the [paths] table"),
@@ -1583,8 +1583,8 @@ mod tests {
         assert!(err.contains("gamedir"), "{err}");
 
         // A correct file still parses.
-        let parsed = parse_file("[paths]\ngame_dir = '/games/gta'\n").expect("parses");
-        assert_eq!(parsed.paths.game_dir, Some(PathBuf::from("/games/gta")));
+        let parsed = parse_file("[paths]\ngame_dir = '/games/title'\n").expect("parses");
+        assert_eq!(parsed.paths.game_dir, Some(PathBuf::from("/games/title")));
     }
 
     #[test]
