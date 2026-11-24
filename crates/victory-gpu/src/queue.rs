@@ -118,6 +118,38 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Queue>(this)
 }
 
+/// Pins a queued [`crate::host::HostList`] epoch until execution completes or
+/// the unrun closure is dropped on early queue teardown.
+#[cfg(windows)]
+struct InFlight(Option<Arc<crate::host::HostList>>);
+
+#[cfg(windows)]
+impl InFlight {
+    fn new(list: Arc<crate::host::HostList>) -> Self {
+        list.begin_submit();
+        Self(Some(list))
+    }
+
+    fn list(&self) -> &crate::host::HostList {
+        self.0.as_deref().expect("in-flight host list")
+    }
+
+    fn take(mut self) -> Arc<crate::host::HostList> {
+        let list = self.0.take().expect("in-flight host list");
+        list.end_submit();
+        list
+    }
+}
+
+#[cfg(windows)]
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Some(list) = self.0.take() {
+            list.end_submit();
+        }
+    }
+}
+
 /// Runs the lists' host lists and waits for them (decision 0007), once
 /// the queue's waits before them are reached. Contiguous host list segments
 /// run in a single host submission, ordered around mid-list memory waits.
@@ -135,17 +167,21 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             .collect();
         let timeline = &queue(this).timeline;
         let mut batch = Vec::new();
-        let flush = |batch: &mut Vec<Arc<crate::host::HostList>>| {
+        let flush = |batch: &mut Vec<InFlight>| {
             if batch.is_empty() {
                 return;
             }
             // Held until they run: the title may reset its lists before.
-            let host_lists = std::mem::take(batch);
+            // Every flushed batch (including segments queued behind a fence or
+            // mid-list memory wait) keeps its `InFlight` pin until execution
+            // completes.
+            let in_flight = std::mem::take(batch);
             timeline.submit(Op::Run(Box::new(move || {
                 if let Some(host) = crate::host::host() {
-                    let runs: Vec<_> = host_lists.iter().map(|l| &**l).collect();
+                    let runs: Vec<_> = in_flight.iter().map(InFlight::list).collect();
                     host.execute(&runs);
-                    for list in host_lists {
+                    for entry in in_flight {
+                        let list = entry.take();
                         if let Ok(orphan) = Arc::try_unwrap(list) {
                             host.recycle_list(orphan);
                         }
@@ -155,7 +191,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         };
         for seg in segments {
             match seg {
-                crate::list::Segment::List(list) => batch.push(list),
+                crate::list::Segment::List(list) => batch.push(InFlight::new(list)),
                 crate::list::Segment::Wait(wait) => {
                     flush(&mut batch);
                     timeline.submit(Op::WaitMemory(wait, None));
@@ -1135,6 +1171,207 @@ mod tests {
         assert_eq!(out[3].load(Ordering::Acquire), 4);
 
         for object in [list1, list2, allocator, queue] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    fn test_copy_list() -> (This, This, This, This) {
+        type CopyBuf = extern "system" fn(This, This, u64, This, u64, u64);
+
+        let null = std::ptr::null();
+        let mut allocator = null;
+        let alloc_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &alloc_iid, &mut allocator),
+            S_OK
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let mut list = null;
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+            S_OK
+        );
+        let src = crate::resource::test_buffer(64);
+        let dst = crate::resource::test_buffer(64);
+        slot::<CopyBuf>(list, 0x78)(list, dst, 0, src, 0, 64);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
+        (list, allocator, src, dst)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn queued_list_behind_fence_wait_pins_retired_objects_until_completion() {
+        type Sync = extern "system" fn(This, This, u64) -> HRESULT;
+        type Execute = extern "system" fn(This, u32, *const This);
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let (q, sig_slot) = test_queue();
+        let wait = slot::<Sync>(q, sig_slot + 8);
+        let signal = slot::<Sync>(q, sig_slot);
+        let execute = slot::<Execute>(q, 0x50);
+        let completed = |f: This| slot::<extern "system" fn(This) -> u64>(f, 0x40)(f);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let (mut ready, mut done) = (null, null);
+        assert_eq!(
+            crate::fence::create(null, 0, 0, fence_iid, &mut ready),
+            S_OK
+        );
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut done), S_OK);
+
+        let (list, allocator, src, dst) = test_copy_list();
+
+        assert_eq!(wait(q, ready, 1), S_OK);
+        execute(q, 1, &list);
+        assert_eq!(signal(q, done, 1), S_OK);
+        // Reset the title list so only the queued submission holds the pending host list.
+        assert_eq!(
+            slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50)(
+                list, allocator, null
+            ),
+            S_OK
+        );
+
+        let (counter, drops) = crate::host::DropCounter::new();
+        crate::host::retire(counter);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "queued submission behind fence wait must pin retired objects"
+        );
+
+        assert_eq!(crate::fence::signal(ready, 1), S_OK);
+        assert_eq!(completed(done), 1);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "retired object must drop once queued work finishes"
+        );
+
+        for object in [list, allocator, src, dst, q, ready, done] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn double_submitted_list_pins_retired_objects_until_both_executions_complete() {
+        type Sync = extern "system" fn(This, This, u64) -> HRESULT;
+        type Execute = extern "system" fn(This, u32, *const This);
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let (q1, sig_slot1) = test_queue();
+        let (q2, sig_slot2) = test_queue();
+        let wait1 = slot::<Sync>(q1, sig_slot1 + 8);
+        let signal1 = slot::<Sync>(q1, sig_slot1);
+        let exec1 = slot::<Execute>(q1, 0x50);
+        let wait2 = slot::<Sync>(q2, sig_slot2 + 8);
+        let signal2 = slot::<Sync>(q2, sig_slot2);
+        let exec2 = slot::<Execute>(q2, 0x50);
+        let completed = |f: This| slot::<extern "system" fn(This) -> u64>(f, 0x40)(f);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let (mut f1, mut f2, mut d1, mut d2) = (null, null, null, null);
+        for f in [&mut f1, &mut f2, &mut d1, &mut d2] {
+            assert_eq!(crate::fence::create(null, 0, 0, fence_iid, f), S_OK);
+        }
+
+        let (list, allocator, src, dst) = test_copy_list();
+
+        assert_eq!(wait1(q1, f1, 1), S_OK);
+        exec1(q1, 1, &list);
+        assert_eq!(signal1(q1, d1, 1), S_OK);
+
+        assert_eq!(wait2(q2, f2, 1), S_OK);
+        exec2(q2, 1, &list);
+        assert_eq!(signal2(q2, d2, 1), S_OK);
+
+        let (counter, drops) = crate::host::DropCounter::new();
+        crate::host::retire(counter);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        assert_eq!(crate::fence::signal(f1, 1), S_OK);
+        assert_eq!(completed(d1), 1);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "retired object must stay alive until the second submission also finishes"
+        );
+
+        assert_eq!(crate::fence::signal(f2, 1), S_OK);
+        assert_eq!(completed(d2), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        for object in [list, allocator, src, dst, q1, q2, f1, f2, d1, d2] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancelled_queued_list_drops_retired_objects_when_queue_is_released() {
+        type Sync = extern "system" fn(This, This, u64) -> HRESULT;
+        type Execute = extern "system" fn(This, u32, *const This);
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let (q, sig_slot) = test_queue();
+        let wait = slot::<Sync>(q, sig_slot + 8);
+        let execute = slot::<Execute>(q, 0x50);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let mut ready = null;
+        assert_eq!(
+            crate::fence::create(null, 0, 0, fence_iid, &mut ready),
+            S_OK
+        );
+
+        let (list, allocator, src, dst) = test_copy_list();
+
+        assert_eq!(wait(q, ready, 1), S_OK);
+        execute(q, 1, &list);
+        assert_eq!(
+            slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50)(
+                list, allocator, null
+            ),
+            S_OK
+        );
+
+        let (counter, drops) = crate::host::DropCounter::new();
+        crate::host::retire(counter);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        // Release the queue without signalling `ready`; dropping the held
+        // closure must release the InFlight guard and drop the retired object.
+        assert_eq!(release(q), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        for object in [list, allocator, src, dst, ready] {
             assert_eq!(release(object), 0);
         }
     }

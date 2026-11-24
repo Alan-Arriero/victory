@@ -437,6 +437,7 @@ impl State {
         if crate::host::host().is_none() {
             return;
         }
+        list.mark_work();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -496,20 +497,29 @@ impl State {
     }
 
     /// Binds the cached RTV/DSV snapshot onto `list` without re-reading the
-    /// title's descriptor slots.
+    /// title's descriptor slots, keeping each bound host texture alive until
+    /// `list` resets or drops.
     fn apply_targets(&self, list: &HostList) {
         let Some(host) = crate::host::host() else {
             return;
         };
+        if !self.bound_rtvs.is_empty() || self.bound_dsv.is_some() {
+            list.mark_work();
+        }
         let rtvs: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = self
             .bound_rtvs
             .iter()
-            .map(|rtv| host.rtv(rtv.host.as_ref(), rtv.desc.as_ref()))
+            .map(|rtv| {
+                if let Some(tex) = &rtv.host {
+                    list.keep(tex);
+                }
+                host.rtv(rtv.host.as_ref(), rtv.desc.as_ref())
+            })
             .collect();
-        let dsv = self
-            .bound_dsv
-            .as_ref()
-            .map(|dsv| host.dsv(&dsv.host, dsv.desc.as_ref()));
+        let dsv = self.bound_dsv.as_ref().map(|dsv| {
+            list.keep(&dsv.host);
+            host.dsv(&dsv.host, dsv.desc.as_ref())
+        });
         // SAFETY: an open list; the views were just made from live host resources.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -663,6 +673,7 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        list.mark_work();
         self.depth_sampled = false;
         let l = &list.list;
         let needs_root_heap = self.heaps[0] == 0
@@ -2583,6 +2594,139 @@ mod depth_tests {
         assert_eq!(release(sampler_heap), 0);
         assert_eq!(release(depth), 0);
         assert_eq!(release(rt), 0);
+    }
+
+    #[test]
+    fn set_targets_keeps_released_rtv_and_dsv_textures_alive_until_list_reset() {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let resource_iid = ID3D12Resource::IID;
+        let create_tex = |format, flags, initial_state| {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: flags,
+                ..Default::default()
+            };
+            let mut tex = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    (&raw const heap).cast(),
+                    0,
+                    (&raw const desc).cast(),
+                    initial_state,
+                    null.cast(),
+                    (&raw const resource_iid).cast(),
+                    &mut tex,
+                ),
+                crate::object::S_OK
+            );
+            tex
+        };
+        let release = |o: This| crate::object::slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let rtv_tex = create_tex(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32,
+        );
+        let dsv_tex = create_tex(
+            DXGI_FORMAT_D32_FLOAT,
+            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32,
+        );
+
+        let mut rtv_slot = [0u64; 16];
+        let mut dsv_slot = [0u64; 16];
+        let rtv_handle = rtv_slot.as_mut_ptr() as u64;
+        let dsv_handle = dsv_slot.as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(null, rtv_tex, null.cast(), rtv_handle);
+        crate::descriptor::create_dsv(null, dsv_tex, null.cast(), dsv_handle);
+
+        let rtv_weak =
+            std::sync::Arc::downgrade(&crate::resource::host_copy(rtv_tex).expect("rtv host copy"));
+        let dsv_weak =
+            std::sync::Arc::downgrade(&crate::resource::host_copy(dsv_tex).expect("dsv host copy"));
+
+        let list = host.new_list().expect("host list");
+        let mut state = State::default();
+        state.set_targets(&list, &[rtv_handle], dsv_handle);
+
+        // Release both title textures before executing the recorded list.
+        assert_eq!(release(rtv_tex), 0);
+        assert_eq!(release(dsv_tex), 0);
+        assert!(
+            rtv_weak.strong_count() > 0,
+            "set_targets must keep host RTV texture alive while list is open"
+        );
+        assert!(
+            dsv_weak.strong_count() > 0,
+            "set_targets must keep host DSV texture alive while list is open"
+        );
+
+        let errors_before = host.d3d12_errors();
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: plain device-removed query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(
+            host.d3d12_errors(),
+            errors_before,
+            "D3D12 debug layer reported errors on set_targets execution"
+        );
+        assert!(
+            rtv_weak.strong_count() > 0,
+            "host RTV texture must stay alive until list resets"
+        );
+        assert!(
+            dsv_weak.strong_count() > 0,
+            "host DSV texture must stay alive until list resets"
+        );
+
+        list.reset();
+        assert_eq!(rtv_weak.strong_count(), 0);
+        assert_eq!(dsv_weak.strong_count(), 0);
+
+        // Dropping a recorded list without resetting also releases the kept
+        // target textures cleanly.
+        let rtv_tex2 = create_tex(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32,
+        );
+        crate::descriptor::create_rtv(null, rtv_tex2, null.cast(), rtv_handle);
+        let rtv_weak2 = std::sync::Arc::downgrade(
+            &crate::resource::host_copy(rtv_tex2).expect("rtv2 host copy"),
+        );
+        let mut state2 = State::default();
+        state2.set_targets(&list, &[rtv_handle], 0);
+        assert_eq!(release(rtv_tex2), 0);
+        assert!(rtv_weak2.strong_count() > 0);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.d3d12_errors(), errors_before);
+        assert!(rtv_weak2.strong_count() > 0);
+        drop(list);
+        assert_eq!(rtv_weak2.strong_count(), 0);
     }
 }
 
