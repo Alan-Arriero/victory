@@ -630,8 +630,8 @@ extern "system" fn copy_texture_region(
             let Some((buffer, staging)) = list.readback(host, staging_bytes) else {
                 return;
             };
-            crate::texture::upload(list, src.resource, from_tex);
-            ensure_state(list, src.resource, COPY_SOURCE);
+            crate::texture::upload(&list, src.resource, from_tex);
+            ensure_state(&list, src.resource, COPY_SOURCE);
             let mut to_location = dst;
             to_location.resource = buffer.as_raw().cast_const().cast();
             to_location.footprint.offset = 0;
