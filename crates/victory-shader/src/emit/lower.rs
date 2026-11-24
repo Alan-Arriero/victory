@@ -6457,7 +6457,8 @@ impl<'a> Lower<'a> {
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" | "image_sample_c_cl" if self.s.pixel => (64, true),
-            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
+            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" | "image_gather4_l"
+            | "image_gather4_l_o" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -6728,6 +6729,29 @@ impl<'a> Lower<'a> {
                         &args,
                     )
                 }
+                _ if name.starts_with("image_gather4_l")
+                    && !name.starts_with("image_gather4_lz") =>
+                {
+                    if *unorm || *d16 {
+                        return Err("a gather with a level of texel coordinates or 16-bit data");
+                    }
+                    let lod = addr_packed(self, coord_base, coords)?;
+                    let lod = to_float(self, lod);
+                    let offset = if offset_word {
+                        Some(addr_u32(self, 0)?)
+                    } else {
+                        None
+                    };
+                    let texels = self.gather_at_level(h, kind, &cs, lod, offset, *dmask)?;
+                    let Operand::Vector { reg, .. } = *data else {
+                        return Err("an image result");
+                    };
+                    for (k, x) in texels.into_iter().enumerate() {
+                        let x = self.as_int(x);
+                        self.write(inst, Reg::V(reg + k as u8), x, guard);
+                    }
+                    return Ok(());
+                }
                 _ => {
                     if name == "image_gather4" {
                         return Err("a gather with implicit level");
@@ -6820,6 +6844,125 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// `image_gather4_l`: DXIL's gathers take no level, so the four texels
+    /// a bilinear fetch at level `lod` reads are loaded from that level, in
+    /// the gather's order: (i0, j1), (i1, j1), (i1, j0), (i0, j0). Channel
+    /// `dmask` of each, as floats.
+    ///
+    /// The level is the nearest one, clamped to the view's levels (a
+    /// sampler with point mip filtering; the GPU culling that uses this
+    /// passes whole levels of a depth pyramid).
+    // shortcut: texels past the edge are clamped (clamp-to-edge
+    // addressing, what depth pyramids use); wrap and border samplers would
+    // read other texels.
+    fn gather_at_level(
+        &mut self,
+        h: V,
+        kind: u32,
+        cs: &[V],
+        lod: V,
+        offset: Option<V>,
+        dmask: u8,
+    ) -> Result<[V; 4], Why> {
+        if dmask.count_ones() != 1 {
+            return Err("a gather of several channels");
+        }
+        // 2D (2) or 2D array (7) views only.
+        if !matches!(kind, 2 | 7) {
+            return Err("a gather with a level of a view other than 2D");
+        }
+        let c = self.cur;
+        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let dims_t = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        let half = self.s.m.f32(0.5f32.to_bits());
+        let clamp = |l: &mut Self, x: V, top: V| {
+            let lo = l.s.m.cmp(c, pred::SLT, x, zero);
+            let x = l.s.m.select(c, lo, zero, x);
+            let hi = l.s.m.cmp(c, pred::SGT, x, top);
+            l.s.m.select(c, hi, top, x)
+        };
+        // Nearest whole level, within the view.
+        let base = self
+            .s
+            .op(c, "getDimensions", Attr::ReadOnly, dims_t, 72, &[h, zero]);
+        let levels = self.s.m.extract(c, base, 3);
+        let last = self.s.m.bin(c, Bin::Sub, levels, one);
+        let level = self.s.m.bin(c, Bin::Add, lod, half);
+        let level = self.unary(27, level);
+        let level = self.s.m.cast(c, Cast::FpToSi, level, i32t);
+        let level = clamp(self, level, last);
+        let size = self
+            .s
+            .op(c, "getDimensions", Attr::ReadOnly, dims_t, 72, &[h, level]);
+        // The texel below and left of the sample point: floor(u * size - 0.5),
+        // then the gather's programmable offset (6-bit signed x, then y).
+        // Before it becomes an integer it is kept within 64 texels of the
+        // view (FMax/FMin, which also turn NaN into the low edge): past
+        // that, the offset (-32..31) and the clamp to the edge give the
+        // same texel, and a huge or infinite coordinate can neither fall
+        // outside i32 nor wrap round when the offset is added.
+        let margin = self.s.m.f32(64f32.to_bits());
+        let below = self.s.m.f32((-64f32).to_bits());
+        let mut lows = [zero; 2];
+        let mut tops = [zero; 2];
+        for (k, (low, top)) in lows.iter_mut().zip(&mut tops).enumerate() {
+            let n = self.s.m.extract(c, size, k as u32);
+            *top = self.s.m.bin(c, Bin::Sub, n, one);
+            let n = self.s.m.cast(c, Cast::UiToFp, n, f32t);
+            let x = self.s.m.bin(c, Bin::Mul, cs[k], n);
+            let x = self.s.m.bin(c, Bin::Sub, x, half);
+            let x = self.unary(27, x);
+            let x = self.binary(35, x, below);
+            let above = self.s.m.bin(c, Bin::Add, n, margin);
+            let x = self.binary(36, x, above);
+            *low = self.s.m.cast(c, Cast::FpToSi, x, i32t);
+            if let Some(w) = offset {
+                let left = self.s.m.i32(if k == 0 { 26 } else { 18 });
+                let t = self.s.m.bin(c, Bin::Shl, w, left);
+                let k26 = self.s.m.i32(26);
+                let o = self.s.m.bin(c, Bin::AShr, t, k26);
+                *low = self.s.m.bin(c, Bin::Add, *low, o);
+            }
+        }
+        // The array slice: the nearest, within the view.
+        let slice = if kind == 7 {
+            let s = self.s.m.bin(c, Bin::Add, cs[2], half);
+            let s = self.unary(27, s);
+            let s = self.s.m.cast(c, Cast::FpToSi, s, i32t);
+            let layers = self.s.m.extract(c, base, 2);
+            let top = self.s.m.bin(c, Bin::Sub, layers, one);
+            clamp(self, s, top)
+        } else {
+            self.s.m.undef(i32t)
+        };
+        let iu = self.s.m.undef(i32t);
+        let channel = dmask.trailing_zeros();
+        let texel = |l: &mut Self, dx: u32, dy: u32| {
+            let at = |l: &mut Self, k: usize, d: u32| {
+                let d = l.s.m.i32(d);
+                let x = l.s.m.bin(c, Bin::Add, lows[k], d);
+                clamp(l, x, tops[k])
+            };
+            let (x, y) = (at(l, 0, dx), at(l, 1, dy));
+            let r = l.s.op(
+                c,
+                "textureLoad.f32",
+                Attr::ReadOnly,
+                l.s.t.res_ret,
+                66,
+                &[h, level, x, y, slice, iu, iu, iu],
+            );
+            l.s.m.extract(c, r, channel)
+        };
+        Ok([
+            texel(self, 0, 1),
+            texel(self, 1, 1),
+            texel(self, 1, 0),
+            texel(self, 0, 0),
+        ])
     }
 
     /// The direction a cube sample's face coordinates stand for: the
