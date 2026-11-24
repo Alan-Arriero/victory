@@ -1972,8 +1972,9 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let at = src.wrapping_add(offset);
         let to = dst.wrapping_add(offset);
         let remaining = len - offset;
-        // SAFETY: the query inspects an address and fills a local structure.
+        // SAFETY: zero is valid for the fields of this Windows output structure.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: the query inspects an address and fills the local structure.
         let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
         let n = (info.BaseAddress as usize)
             .saturating_add(info.RegionSize)
