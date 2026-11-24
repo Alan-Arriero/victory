@@ -277,9 +277,10 @@ impl Shader {
 
     /// A descriptor heap handle, annotated with `props`. Indices at or past
     /// [`super::VIEW_HEAP_LIMIT`] / [`super::SAMPLER_HEAP_LIMIT`] (garbage or
-    /// negative values from dropped passes) are clamped to slot 0 so
-    /// `ResourceDescriptorHeap` / `SamplerDescriptorHeap` reads cannot
-    /// page-fault the host GPU past the heap's end.
+    /// negative values from dropped passes) are clamped to slot 0, so
+    /// `ResourceDescriptorHeap` / `SamplerDescriptorHeap` reads never go far
+    /// past any heap. The bound is the largest heap, not the one bound: an
+    /// index just past a smaller heap's end still reads past it.
     pub fn heap_handle(&mut self, block: usize, index: V, sampler: bool, props: (u32, u32)) -> V {
         self.flags |= if sampler {
             flags::SAMPLER_HEAP
@@ -583,10 +584,10 @@ impl Shader {
             features |= 0x8000;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
-            features |= 0x200_0000;
+            features |= super::SFI0_RESOURCE_HEAP;
         }
         if self.flags & flags::SAMPLER_HEAP != 0 {
-            features |= 0x400_0000;
+            features |= super::SFI0_SAMPLER_HEAP;
         }
         if self.flags & flags::ATOMIC_TYPED64 != 0 {
             features |= 0x40_0000;

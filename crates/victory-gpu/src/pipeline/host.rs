@@ -340,8 +340,10 @@ impl HostPipeline {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
+        let mut heaps = false;
         for &(shader, visibility) in &stages {
             let t = &shader.translated()?.host;
+            heaps |= t.indexes_heaps();
             let mut stage = Stage {
                 shader: shader.clone(),
                 user_data: None,
@@ -410,7 +412,7 @@ impl HostPipeline {
             bound.push(stage);
         }
         let (root, root_blob) =
-            match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+            match root_signature(&host.device, &params, &samplers, compute.is_some(), heaps) {
                 Ok(root) => root,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host root signature refused");
@@ -678,20 +680,30 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
         .to_vec()
 }
 
+/// The root signature over `params` and `samplers`. It lets shaders index
+/// the descriptor heaps directly only when one of them does (`heaps`):
+/// Windows 10's d3d12core refuses those two 1.1 flags ("Unsupported
+/// bit-flag set"), and a pipeline without such shaders works there; one
+/// with them is refused, as it cannot run on that host.
 fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
     compute: bool,
+    heaps: bool,
 ) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
     let input = if compute {
         D3D12_ROOT_SIGNATURE_FLAG_NONE
     } else {
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
     };
-    let heap_indexing = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-        | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
-    let desc_with = |flags| D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+    let heap_indexing = if heaps {
+        D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+            | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED
+    } else {
+        D3D12_ROOT_SIGNATURE_FLAG_NONE
+    };
+    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
         Version: windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1_1,
         Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
             Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
@@ -699,51 +711,24 @@ fn root_signature(
                 pParameters: params.as_ptr(),
                 NumStaticSamplers: samplers.len() as u32,
                 pStaticSamplers: samplers.as_ptr(),
-                Flags: flags,
+                Flags: input | heap_indexing,
             },
         },
     };
-    let desc = desc_with(input | heap_indexing);
     // SAFETY: the description points at live arrays; the blob is read in
     // full before it is released.
     unsafe {
         let mut blob: Option<ID3DBlob> = None;
         let mut error: Option<ID3DBlob> = None;
         if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
-            if let Some(ref error) = error {
+            if let Some(error) = error {
                 let text = std::slice::from_raw_parts(
                     error.GetBufferPointer().cast::<u8>(),
                     error.GetBufferSize(),
                 );
-                tracing::warn!("root signature: {}", String::from_utf8_lossy(text));
+                tracing::warn!(heaps, "root signature: {}", String::from_utf8_lossy(text));
             }
-            // Windows 10's d3d12core rejects the two root-signature-1.1 heap-indexing flags
-            // outright ("Unsupported bit-flag set"), and a refused signature drops every draw
-            // that uses it (drawn=0 with a black frame). Both flags only promise that shaders
-            // may index the descriptor heaps directly; the pipeline still binds the same heaps
-            // through root parameters. Retry without them so the menu draws on this host.
-            drop(error.take());
-            blob = None;
-            let retry = desc_with(input);
-            let mut retry_error: Option<ID3DBlob> = None;
-            match D3D12SerializeVersionedRootSignature(&retry, &mut blob, Some(&mut retry_error)) {
-                Ok(()) => {
-                    tracing::warn!(
-                        "root signature: retried without the 1.1 heap-indexing flags and it serialized"
-                    );
-                }
-                Err(e2) => {
-                    if let Some(error) = retry_error {
-                        let text = std::slice::from_raw_parts(
-                            error.GetBufferPointer().cast::<u8>(),
-                            error.GetBufferSize(),
-                        );
-                        tracing::warn!("root signature (retry): {}", String::from_utf8_lossy(text));
-                    }
-                    return Err(e2);
-                }
-            }
-            let _ = e;
+            return Err(e);
         }
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
@@ -818,7 +803,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
         let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
-        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let (root, root_blob) = root_signature(&host.device, &[], &[], false, false).unwrap();
         let mut g = GraphicsState::default();
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;

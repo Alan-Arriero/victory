@@ -166,7 +166,24 @@ pub struct HostShader {
     pub root_srvs: Vec<u8>,
 }
 
+/// `SFI0` feature bits of a shader that indexes the resource or the sampler
+/// descriptor heap directly.
+pub(crate) const SFI0_RESOURCE_HEAP: u64 = 0x200_0000;
+pub(crate) const SFI0_SAMPLER_HEAP: u64 = 0x400_0000;
+
 impl HostShader {
+    /// Whether the shader indexes a descriptor heap directly
+    /// (`ResourceDescriptorHeap` / `SamplerDescriptorHeap`), which its root
+    /// signature must then allow. A container without readable feature
+    /// flags counts as one that does.
+    pub fn indexes_heaps(&self) -> bool {
+        let features = Container::parse(&self.dxil).ok().and_then(|c| {
+            let data = c.part(FourCC::SFI0)?.data.get(..8)?;
+            Some(u64::from_le_bytes(data.try_into().ok()?))
+        });
+        features.is_none_or(|f| f & (SFI0_RESOURCE_HEAP | SFI0_SAMPLER_HEAP) != 0)
+    }
+
     /// Size of the user-data buffer the shader declares, in dwords (a
     /// multiple of 4; 0 when it reads none). Root constants must cover it.
     pub fn user_data_dwords(&self) -> u32 {
@@ -456,6 +473,27 @@ mod tests {
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
         }
+    }
+
+    /// Heap indexing is read from the container's feature flags; without
+    /// readable flags a shader is assumed to index heaps.
+    #[test]
+    fn heap_indexing_comes_from_the_feature_flags() {
+        let shader = |parts: &[(FourCC, &[u8])]| HostShader {
+            stage: HwStage::Ps,
+            dxil: crate::dxbc::build(parts),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+        };
+        let with = |features: u64| shader(&[(FourCC::SFI0, &features.to_le_bytes())]);
+        assert!(!with(0x4000).indexes_heaps());
+        assert!(with(0x4000 | SFI0_RESOURCE_HEAP).indexes_heaps());
+        assert!(with(SFI0_SAMPLER_HEAP).indexes_heaps());
+        assert!(shader(&[]).indexes_heaps());
+        assert!(shader(&[(FourCC::SFI0, &[0; 4])]).indexes_heaps());
     }
     use super::container::SigElement;
     #[cfg(windows)]
