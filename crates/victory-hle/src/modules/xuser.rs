@@ -234,7 +234,7 @@ extern "system" fn token_async(
     // Report success with the empty (but non-null) TOKEN result buffer rather than
     // FAILED_TO_GET_TOKEN. The title's auth path only initialises the object it later
     // dereferences when this call completes successfully; with the failure it took a null
-    // read at title+0xb5a5f8 right after XUserAddAsync (issue #348). Nothing is contacted:
+    // read in its account init right after XUserAddAsync (issue #348). Nothing is contacted:
     // the URL is never opened, the buffer stays empty, and the offline user is unchanged.
     xasync::finished(block, (&raw const TOKEN).cast(), S_OK)
 }
@@ -276,7 +276,7 @@ extern "system" fn find_for_device(_: This, _device: *const c_void, _: *mut Hand
 ///
 /// This slot was a `missing` stub (E_NOTIMPL, no output written). The title calls it during
 /// its account init right after XUserAddAsync and dereferences the output regardless, which
-/// is the null read at title+0xb5a5f8 (issue #348, second suggestion).
+/// is the null read of issue #348 (its second suggestion).
 extern "system" fn get_max_users(_: This, _: Handle, out: *mut u32) -> HRESULT {
     put(out, 1)
 }
