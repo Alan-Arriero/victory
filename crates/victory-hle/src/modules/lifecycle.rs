@@ -44,6 +44,10 @@ fn constrained() -> MutexGuard<'static, Vec<Registration>> {
 /// How long the console lets suspend routines run before it ends the title.
 const SUSPEND_DEADLINE: Duration = Duration::from_secs(1);
 
+/// How long the constrained-change routines may run before the suspend
+/// starts anyway. Ours: it keeps them from using up the suspend's second.
+const CONSTRAIN_DEADLINE: Duration = Duration::from_secs(1);
+
 const ERROR_INVALID_PARAMETER: u32 = 87;
 
 /// Adds `routine` to `list` and writes its registration id.
@@ -259,24 +263,43 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
         end();
     };
     let late = finish.clone();
+    // The suspend's deadline starts when its routines do: the constrained
+    // phase before it has a bound of its own.
+    let (suspending, started) = std::sync::mpsc::channel();
     // Not on the calling thread: titles hand the suspend to their window
     // thread and wait for it inside the routine.
     std::thread::spawn(move || {
-        constrain_then_suspend(&constrain, &suspend);
+        constrain_then_suspend(&constrain, &suspend, || {
+            let _ = suspending.send(());
+        });
         finish("title suspended");
     });
-    std::thread::spawn(move || {
-        std::thread::sleep(SUSPEND_DEADLINE);
-        late("title did not finish suspending in time");
+    std::thread::spawn(move || match started.recv_timeout(CONSTRAIN_DEADLINE) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            late("title did not finish its constrained routines in time");
+        }
+        _ => {
+            std::thread::sleep(SUSPEND_DEADLINE);
+            late("title did not finish suspending in time");
+        }
     });
 }
 
-/// Runs the constrained-change routines (constrained), then the suspend
-/// routines (quiesced), as the console does when it suspends a title.
-/// Grand Theft Auto VI's suspend routine waits for a state that only its
-/// constrained routine brings about; called alone it never returns.
-fn constrain_then_suspend(constrain: &[Registration], suspend: &[Registration]) {
-    for &(_, routine, context) in constrain.iter().chain(suspend) {
+/// Runs the constrained-change routines (constrained), then `suspending`,
+/// then the suspend routines (quiesced), as the console does when it
+/// suspends a title. Grand Theft Auto VI's suspend routine waits for a state
+/// that only its constrained routine brings about; called alone it never
+/// returns.
+fn constrain_then_suspend(
+    constrain: &[Registration],
+    suspend: &[Registration],
+    suspending: impl FnOnce(),
+) {
+    for &(_, routine, context) in constrain {
+        routine(1, context as *mut c_void);
+    }
+    suspending();
+    for &(_, routine, context) in suspend {
         routine(1, context as *mut c_void);
     }
 }
@@ -415,8 +438,13 @@ mod tests {
     #[test]
     fn constrained_routines_run_before_suspend_routines() {
         let r: Routine = recording_routine;
-        constrain_then_suspend(&[(1, r, 10), (2, r, 11)], &[(3, r, 20), (4, r, 21)]);
+        let between = std::cell::Cell::new(None);
+        constrain_then_suspend(&[(1, r, 10), (2, r, 11)], &[(3, r, 20), (4, r, 21)], || {
+            between.set(Some(CALLS.lock().unwrap().len()));
+        });
         assert_eq!(*CALLS.lock().unwrap(), [(10, 1), (11, 1), (20, 1), (21, 1)]);
+        // The suspend's deadline starts after the constrained routines.
+        assert_eq!(between.get(), Some(2));
     }
 
     #[test]
