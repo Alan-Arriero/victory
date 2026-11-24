@@ -17,6 +17,7 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    pub const VIEWPORT_RT_INDEX: u64 = 1 << 9;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
@@ -46,6 +47,20 @@ pub(crate) struct Mesh {
     pub max_primitives: u32,
     /// 1 lines, 2 triangles.
     pub topology: u8,
+}
+
+impl Mesh {
+    pub(super) const MAX_OUTPUT_BYTES: u64 = 32_768;
+
+    /// DXIL charges for declared components and rounds each output count
+    /// up to a multiple of 32 independently of the signature packing.
+    pub(super) fn output_bytes(self, vertices: &[SigElement], primitives: &[SigElement]) -> u64 {
+        let bytes = |count: u32, elements: &[SigElement]| {
+            let components: u64 = elements.iter().map(|e| u64::from(e.cols)).sum();
+            u64::from(count).next_multiple_of(32) * 4 * components
+        };
+        bytes(self.max_vertices, vertices) + bytes(self.max_primitives, primitives)
+    }
 }
 
 /// What a geometry shader declares: triangles in, triangle strips out on
@@ -629,6 +644,13 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
+        if self.threads.is_none()
+            && !self.pixel
+            && self.geometry.is_none()
+            && self.outputs.iter().any(|o| matches!(o.kind, 4 | 5))
+        {
+            self.flags |= flags::VIEWPORT_RT_INDEX;
+        }
         // Entry properties: shader flags (tag 0), thread-group size (4),
         // wave size (11).
         let mut props = Vec::new();
@@ -726,6 +748,9 @@ impl Shader {
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
         }
+        if self.flags & flags::VIEWPORT_RT_INDEX != 0 {
+            features |= 0x2000;
+        }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
         }
@@ -809,7 +834,7 @@ impl Shader {
             };
             let ops = vec![
                 c32(self, id as u32),
-                Some(self.m.md_str(&e.name)),
+                Some(self.m.md_str(e.semantic_name())),
                 c8(self, e.comp),
                 c8(self, e.kind),
                 indices,
@@ -831,6 +856,181 @@ mod tests {
     use super::super::bitcode::Term;
     use super::super::validator;
     use super::*;
+
+    use crate::dxbc::{Container, FourCC};
+
+    fn element(name: &str, row: u32, col: u8, cols: u8) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        }
+    }
+
+    fn change_part(dxil: &[u8], part: FourCC, edit: impl FnOnce(&mut [u8])) -> Vec<u8> {
+        let c = Container::parse(dxil).unwrap();
+        let part = c.part(part).unwrap();
+        let start = part.offset + 8;
+        let mut changed = dxil.to_vec();
+        edit(&mut changed[start..start + part.data.len()]);
+        let digest = container::hash(&changed[20..]);
+        changed[4..20].copy_from_slice(&digest);
+        changed
+    }
+
+    #[test]
+    fn packed_signature_records_keep_metadata_order_even_for_unused_elements() {
+        let Some(mut validator) = validator::Validator::for_test() else {
+            return;
+        };
+        let mut shader = Shader::new(false);
+        // A packed element at w precedes an unread element at x, as it does
+        // in module metadata. The signature part must preserve that order.
+        let mut high = element("HIGH", 0, 3, 1);
+        high.usage = 1;
+        shader.outputs = vec![high, element("LOW", 0, 0, 1)];
+        shader.inputs = shader.outputs.clone();
+        for e in &mut shader.inputs {
+            e.interp = 0;
+        }
+        shader.m.terminate(shader.entry, Term::Ret);
+        let mut dxil = shader.finish();
+        for (part, label, unused) in [
+            (FourCC::ISG1, "Program Input Signature", 0),
+            (FourCC::OSG1, "Program Output Signature", 15),
+        ] {
+            let mut swapped = change_part(&dxil, part, |data| {
+                assert_eq!(data[8 + 24], 8);
+                assert_eq!(data[40 + 24], 1);
+                assert_eq!(data[40 + 25], unused);
+                data[8..72].rotate_left(32);
+            });
+            let error = validator.validate(&mut swapped).unwrap_err();
+            assert!(
+                error.contains(&format!("'{label}' does not match expected for module")),
+                "{error}"
+            );
+        }
+        validator.validate(&mut dxil).unwrap();
+    }
+
+    #[test]
+    fn system_value_names_match_in_vertex_and_primitive_signatures() {
+        let Some(mut validator) = validator::Validator::for_test() else {
+            return;
+        };
+        let mut vertex = Shader::new(false);
+        let mut viewport = element("sV_vIeWpOrTaRrAyInDeX", 0, 0, 1);
+        viewport.kind = 5;
+        viewport.comp = 5;
+        viewport.interp = 1;
+        viewport.usage = 1;
+        vertex.outputs.push(viewport.clone());
+        let zero = vertex.m.i32(0);
+        let col = vertex.m.i8(0);
+        vertex.op(
+            vertex.entry,
+            "storeOutput.i32",
+            Attr::NoUnwind,
+            vertex.t.void,
+            5,
+            &[zero, zero, col, zero],
+        );
+        vertex.m.terminate(vertex.entry, Term::Ret);
+        let mut dxil = vertex.finish();
+        let mut misnamed = change_part(&dxil, FourCC::OSG1, |data| {
+            let name = crate::dxbc::u32_at(data, 12).unwrap() as usize;
+            assert_eq!(&data[name..name + 22], b"SV_ViewportArrayIndex\0");
+            data[name] = b's';
+        });
+        let error = validator.validate(&mut misnamed).unwrap_err();
+        assert!(
+            error.contains("'Program Output Signature' does not match expected for module"),
+            "{error}"
+        );
+        validator.validate(&mut dxil).unwrap();
+
+        let mut mesh = empty_mesh(1, 1);
+        viewport.usage = 0;
+        mesh.prims.push(viewport);
+        let mut dxil = mesh.finish();
+        let c = Container::parse(&dxil).unwrap();
+        let psg = c.part(FourCC::PSG1).unwrap().data;
+        let name = crate::dxbc::u32_at(psg, 12).unwrap() as usize;
+        assert_eq!(&psg[name..], b"SV_ViewportArrayIndex\0");
+        validator.validate(&mut dxil).unwrap();
+    }
+
+    fn empty_mesh(max_vertices: u32, max_primitives: u32) -> Shader {
+        let mut s = Shader::new(false);
+        s.threads = Some([32, 1, 1]);
+        s.mesh = Some(Mesh {
+            max_vertices,
+            max_primitives,
+            topology: 2,
+        });
+        let zero = s.m.i32(0);
+        s.op(
+            s.entry,
+            "setMeshOutputCounts",
+            Attr::NoUnwind,
+            s.t.void,
+            168,
+            &[zero, zero],
+        );
+        s.m.terminate(s.entry, Term::Ret);
+        s
+    }
+
+    #[test]
+    fn mesh_output_price_counts_declared_components_and_rounds_each_count() {
+        let Some(mut validator) = validator::Validator::for_test() else {
+            return;
+        };
+        for (vertices, primitives, rows, cols, prim_rows, stride, expected_bytes) in [
+            (256, 0, 8, 4, 0, 2, 32_768),
+            (256, 0, 32, 1, 0, 1, 32_768),
+            (224, 1, 9, 4, 1, 1, 32_768),
+            (224, 33, 9, 4, 1, 1, 33_280),
+            (225, 0, 9, 4, 0, 1, 36_864),
+        ] {
+            let mut s = empty_mesh(vertices, primitives);
+            for row in 0..rows {
+                s.outputs.push(SigElement {
+                    index: row,
+                    ..element("VALUE", row * stride, 0, cols)
+                });
+            }
+            for row in 0..prim_rows {
+                s.prims.push(SigElement {
+                    index: row,
+                    interp: 1,
+                    ..element("PRIM", row, 0, 4)
+                });
+            }
+            assert_eq!(
+                s.mesh.unwrap().output_bytes(&s.outputs, &s.prims),
+                expected_bytes
+            );
+            let result = validator.validate(&mut s.finish());
+            if expected_bytes <= Mesh::MAX_OUTPUT_BYTES {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error.contains("vertex plus primitive output size is greater than 32768"),
+                    "{error}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn compute_implicit_sample_validates() {
