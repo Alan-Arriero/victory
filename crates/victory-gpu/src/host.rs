@@ -254,6 +254,21 @@ fn create() -> windows::core::Result<Host> {
             }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        #[cfg(feature = "diagnostics")]
+        if debug
+            && crate::switch::on("VICTORY_D3D12_GBV")
+            && let Some(mode) =
+                parse_eager_gbv(std::env::var_os("VICTORY_D3D12_GBV_EAGER").as_deref())
+        {
+            match configure_eager_gbv(&device, mode) {
+                Ok(()) => tracing::info!(
+                    guarded = matches!(mode, EagerGbv::Guarded),
+                    "GPU validation pipeline patching front-loaded"
+                ),
+                Err(e) if matches!(mode, EagerGbv::Guarded) => return Err(e),
+                Err(e) => tracing::warn!(error = %e, "could not front-load GPU validation"),
+            }
+        }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -308,6 +323,81 @@ fn create() -> windows::core::Result<Host> {
             reused_lists: std::sync::atomic::AtomicU64::new(0),
         })
     }
+}
+
+#[cfg(feature = "diagnostics")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EagerGbv {
+    Current,
+    Guarded,
+}
+
+#[cfg(feature = "diagnostics")]
+fn parse_eager_gbv(value: Option<&std::ffi::OsStr>) -> Option<EagerGbv> {
+    let value = value?;
+    if value.is_empty() || value == "0" {
+        return None;
+    }
+    if value == "guarded" {
+        Some(EagerGbv::Guarded)
+    } else {
+        Some(EagerGbv::Current)
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn front_load_flag_for(
+    mode: D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE,
+) -> windows::core::Result<D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAGS> {
+    match mode {
+        D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_UNGUARDED_VALIDATION => Ok(
+            D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_FRONT_LOAD_CREATE_UNGUARDED_VALIDATION_SHADERS,
+        ),
+        D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_GUARDED_VALIDATION => Ok(
+            D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_FRONT_LOAD_CREATE_GUARDED_VALIDATION_SHADERS,
+        ),
+        D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_STATE_TRACKING_ONLY => Ok(
+            D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_FRONT_LOAD_CREATE_TRACKING_ONLY_SHADERS,
+        ),
+        _ => Err(windows::core::Error::from_hresult(
+            windows::Win32::Foundation::E_INVALIDARG,
+        )),
+    }
+}
+
+/// Requests validation shader compilation at PSO creation rather than first
+/// bind, preserving unrelated flags and verifying read-back settings before any
+/// pipelines are built.
+#[cfg(feature = "diagnostics")]
+fn configure_eager_gbv(device: &ID3D12Device, mode: EagerGbv) -> windows::core::Result<()> {
+    let debug = device.cast::<ID3D12DebugDevice1>()?;
+    let kind = D3D12_DEBUG_DEVICE_PARAMETER_GPU_BASED_VALIDATION_SETTINGS;
+    let size = size_of::<D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS>() as u32;
+    let mut settings = D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS::default();
+    // SAFETY: `kind` takes `D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS` of exact `size`.
+    unsafe { debug.GetDebugParameter(kind, (&raw mut settings).cast(), size)? };
+    let prior_flags = settings.PipelineStateCreateFlags.0;
+    if mode == EagerGbv::Guarded {
+        settings.DefaultShaderPatchMode =
+            D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_GUARDED_VALIDATION;
+    }
+    let flag = front_load_flag_for(settings.DefaultShaderPatchMode)?;
+    settings.PipelineStateCreateFlags.0 |= flag.0;
+    let mut observed = D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS::default();
+    // SAFETY: both structs are stack-owned for the synchronous COM calls.
+    unsafe {
+        debug.SetDebugParameter(kind, (&raw const settings).cast(), size)?;
+        debug.GetDebugParameter(kind, (&raw mut observed).cast(), size)?;
+    }
+    if observed.DefaultShaderPatchMode != settings.DefaultShaderPatchMode
+        || observed.PipelineStateCreateFlags.0 & flag.0 == 0
+        || observed.PipelineStateCreateFlags.0 & prior_flags != prior_flags
+    {
+        return Err(windows::core::Error::from_hresult(
+            windows::Win32::Foundation::E_FAIL,
+        ));
+    }
+    Ok(())
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
@@ -2981,5 +3071,106 @@ mod batch {
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod eager_gbv_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn parse_eager_gbv_respects_off_current_and_guarded_values() {
+        assert_eq!(parse_eager_gbv(None), None);
+        assert_eq!(parse_eager_gbv(Some(OsStr::new(""))), None);
+        assert_eq!(parse_eager_gbv(Some(OsStr::new("0"))), None);
+        assert_eq!(
+            parse_eager_gbv(Some(OsStr::new("1"))),
+            Some(EagerGbv::Current)
+        );
+        assert_eq!(
+            parse_eager_gbv(Some(OsStr::new("guarded"))),
+            Some(EagerGbv::Guarded)
+        );
+    }
+
+    #[test]
+    fn front_load_flag_matches_patch_mode() {
+        assert_eq!(
+            front_load_flag_for(
+                D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_GUARDED_VALIDATION
+            ),
+            Ok(
+                D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_FRONT_LOAD_CREATE_GUARDED_VALIDATION_SHADERS
+            )
+        );
+        assert_eq!(
+            front_load_flag_for(
+                D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_UNGUARDED_VALIDATION
+            ),
+            Ok(
+                D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_FRONT_LOAD_CREATE_UNGUARDED_VALIDATION_SHADERS
+            )
+        );
+        assert_eq!(
+            front_load_flag_for(
+                D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_STATE_TRACKING_ONLY
+            ),
+            Ok(
+                D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_FRONT_LOAD_CREATE_TRACKING_ONLY_SHADERS
+            )
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an isolated process with the D3D12 debug layer and a WARP software adapter"]
+    fn eager_gbv_round_trips_and_preserves_unrelated_flags_on_warp() -> windows::core::Result<()> {
+        // SAFETY: runs only in an isolated test process with debug layer and WARP.
+        unsafe {
+            let mut layer: Option<ID3D12Debug> = None;
+            D3D12GetDebugInterface(&mut layer)?;
+            let layer = layer.ok_or_else(windows::core::Error::empty)?;
+            layer.EnableDebugLayer();
+            layer
+                .cast::<ID3D12Debug1>()?
+                .SetEnableGPUBasedValidation(true);
+            let adapter = warp_adapter()?;
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            let device = device.ok_or_else(windows::core::Error::empty)?;
+
+            let debug = device.cast::<ID3D12DebugDevice1>()?;
+            let kind = D3D12_DEBUG_DEVICE_PARAMETER_GPU_BASED_VALIDATION_SETTINGS;
+            let size = size_of::<D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS>() as u32;
+            let mut settings = D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS::default();
+            debug.GetDebugParameter(kind, (&raw mut settings).cast(), size)?;
+            // Turn on an unrelated create flag (`FRONT_LOAD_CREATE_TRACKING_ONLY_SHADERS`)
+            // and verify eager configuration preserves it alongside the added front-load bit.
+            let preserved =
+                D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_FRONT_LOAD_CREATE_TRACKING_ONLY_SHADERS;
+            settings.PipelineStateCreateFlags.0 |= preserved.0;
+            debug.SetDebugParameter(kind, (&raw const settings).cast(), size)?;
+
+            configure_eager_gbv(&device, EagerGbv::Current)?;
+            let mut after_current = D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS::default();
+            debug.GetDebugParameter(kind, (&raw mut after_current).cast(), size)?;
+            assert_ne!(after_current.PipelineStateCreateFlags.0 & preserved.0, 0);
+
+            configure_eager_gbv(&device, EagerGbv::Guarded)?;
+            let mut after_guarded = D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS::default();
+            debug.GetDebugParameter(kind, (&raw mut after_guarded).cast(), size)?;
+            assert_eq!(
+                after_guarded.DefaultShaderPatchMode,
+                D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_GUARDED_VALIDATION
+            );
+            assert_ne!(
+                after_guarded.PipelineStateCreateFlags.0
+                    & D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_FRONT_LOAD_CREATE_GUARDED_VALIDATION_SHADERS
+                        .0,
+                0
+            );
+            assert_ne!(after_guarded.PipelineStateCreateFlags.0 & preserved.0, 0);
+            Ok(())
+        }
     }
 }
