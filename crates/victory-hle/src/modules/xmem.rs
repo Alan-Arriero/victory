@@ -702,7 +702,12 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
         // A zero page unmaps its address; a run of them unmaps in one call.
         let zero = page == Some(0);
         let mut run = 1;
-        while i + run < n {
+        // Under Wine keep each mapped scatter address in its own host view.
+        // Replacing part of a larger view in unmap() would briefly remove the
+        // neighboring pages too, even while other title threads use them.
+        // Unmaps may still cover a whole run of these independent views.
+        let batch = zero || pages.is_null() || !on_wine();
+        while batch && i + run < n {
             let (next, next_page) = entry(i + run);
             if next != address + run * PAGE || (next_page == Some(0)) != zero {
                 break;
@@ -1295,7 +1300,7 @@ mod tests {
         assert_eq!(XMemIsToolsMemAvailable(), 0);
     }
 
-    /// A scatter of pages at consecutive addresses maps them in one call:
+    /// A scatter of pages at consecutive addresses maps each one:
     /// each address shows its own page, pages asked for in a different order
     /// still land where they are asked for, a zero page in the middle unmaps
     /// only its own address, and an unmap run goes in one call.
@@ -1315,13 +1320,17 @@ mod tests {
             assert!(write_physical(&pages[k..], 0, &[b'0' + k as u8]));
         }
 
-        // Three pages, three consecutive addresses: one call.
+        // Three pages at consecutive addresses.
         let addresses = [at(0), at(1), at(2)];
         assert_eq!(
             XMemMapPhysicalPagesScatter(addresses.as_ptr(), 3, pages.as_ptr()),
             1
         );
         for k in 0..3 {
+            if on_wine() {
+                // A later replacement of a neighbor can unmap only its own host view.
+                assert_eq!(query(at(k)).host.AllocationBase, at(k));
+            }
             assert_eq!(
                 // SAFETY: mapped read-write.
                 unsafe { at(k).cast::<u8>().read() },
