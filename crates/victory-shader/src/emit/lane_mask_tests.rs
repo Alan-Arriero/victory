@@ -176,6 +176,12 @@ fn check(shader: &HostShader, want: &[u32; LANES]) {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
+        // A mask read as a number needs the console's 32-lane wave. A
+        // runner without a GPU gives WARP (4 lanes) for both.
+        if !runs_wave32(&host) {
+            eprintln!("{label} device has no 32-lane wave; skipped");
+            continue;
+        }
         let (root, pso) = match host.compute_pipeline(shader) {
             Ok(p) => p,
             // A mask read as a number needs the console's wave size,
@@ -206,6 +212,24 @@ fn check(shader: &HostShader, want: &[u32; LANES]) {
     if ran == 0 {
         eprintln!("no SM 6.6 device with a 32-lane wave; not run");
     }
+}
+
+/// Whether `host` can run a wave of 32 lanes.
+fn runs_wave32(host: &Host) -> bool {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+    let mut opts1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: the options struct matches the feature asked for.
+    let ok = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut opts1).cast(),
+            size_of_val(&opts1) as u32,
+        )
+    }
+    .is_ok();
+    ok && (opts1.WaveLaneCountMin..=opts1.WaveLaneCountMax).contains(&32)
 }
 
 /// The console's result: `inside` for the lanes below 10, `outside` for
