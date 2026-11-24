@@ -40,6 +40,11 @@ rustup target add x86_64-pc-windows-gnullvm
 cargo build --locked --release -p victory --target x86_64-pc-windows-gnullvm
 ```
 
+For a self-contained cross-build, set `VICTORY_BUILD_DXC` to the absolute
+path to the build host's DXC executable before running Cargo. It compiles the
+indirect-argument clamp and both rectangle shaders into the executable. If the
+system compiler rejects one at runtime, VIctory uses its embedded bytecode.
+
 ## Testing without game files
 
 `./tests/proton-smoke.sh` compiles its synthetic title with the LLVM-MinGW
