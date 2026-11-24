@@ -312,3 +312,39 @@ fn gather4_with_a_level_returns_the_four_texels_of_that_level_in_gather_order() 
         assert_eq!(got, want, "{label}");
     }
 }
+
+#[test]
+fn gather4_with_a_level_far_outside_the_view_reads_the_nearest_edge() {
+    let texels: Vec<[f32; 4]> = (0..16)
+        .map(|i| [(10 * (i / 4) + i % 4) as f32, 0.0, 0.0, 1.0])
+        .collect();
+    // (u, v) and the texel (10 * y + x) all four of the footprint clamp to.
+    // u * 4 above i32 (or infinite) must give the last column, not wrap
+    // to the first when the footprint's second column is added; far below,
+    // the first; NaN, the first.
+    let cases = [
+        (1e9, -1e9, 3.0),
+        (-1e9, 1e9, 30.0),
+        (f32::INFINITY, f32::NEG_INFINITY, 3.0),
+        (f32::NAN, f32::INFINITY, 30.0),
+    ];
+    for (u, v, texel) in cases {
+        let mut words = GATHER4_L_WAVE32.to_vec();
+        // The literals of `v_mov_b32 v2, u` and `v_mov_b32 v3, v`.
+        assert_eq!((words[12], words[14]), (0x7E04_02FF, 0x7E06_02FF));
+        words[13] = f32::to_bits(u);
+        words[15] = f32::to_bits(v);
+        let (shader, _) = build_any(&words, false);
+        let views = [
+            View::Texture(4, 4, &texels),
+            View::Texture(4, 4, &texels),
+            View::RawUav(32),
+        ];
+        let results = run(&shader, &views);
+        assert!(!results.is_empty());
+        for (label, words) in results {
+            let got: Vec<f32> = words.into_iter().map(f32::from_bits).collect();
+            assert_eq!(got, vec![texel; 32], "{label}: ({u}, {v})");
+        }
+    }
+}

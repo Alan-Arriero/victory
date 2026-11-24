@@ -6899,6 +6899,13 @@ impl<'a> Lower<'a> {
             .op(c, "getDimensions", Attr::ReadOnly, dims_t, 72, &[h, level]);
         // The texel below and left of the sample point: floor(u * size - 0.5),
         // then the gather's programmable offset (6-bit signed x, then y).
+        // Before it becomes an integer it is kept within 64 texels of the
+        // view (FMax/FMin, which also turn NaN into the low edge): past
+        // that, the offset (-32..31) and the clamp to the edge give the
+        // same texel, and a huge or infinite coordinate can neither fall
+        // outside i32 nor wrap round when the offset is added.
+        let margin = self.s.m.f32(64f32.to_bits());
+        let below = self.s.m.f32((-64f32).to_bits());
         let mut lows = [zero; 2];
         let mut tops = [zero; 2];
         for (k, (low, top)) in lows.iter_mut().zip(&mut tops).enumerate() {
@@ -6908,6 +6915,9 @@ impl<'a> Lower<'a> {
             let x = self.s.m.bin(c, Bin::Mul, cs[k], n);
             let x = self.s.m.bin(c, Bin::Sub, x, half);
             let x = self.unary(27, x);
+            let x = self.binary(35, x, below);
+            let above = self.s.m.bin(c, Bin::Add, n, margin);
+            let x = self.binary(36, x, above);
             *low = self.s.m.cast(c, Cast::FpToSi, x, i32t);
             if let Some(w) = offset {
                 let left = self.s.m.i32(if k == 0 { 26 } else { 18 });
