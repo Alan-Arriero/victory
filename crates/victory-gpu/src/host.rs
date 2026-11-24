@@ -88,11 +88,55 @@ struct RetireState {
     retired: std::collections::VecDeque<(u64, Retired)>,
 }
 
-static RETIRE_STATE: Mutex<RetireState> = Mutex::new(RetireState {
-    next_epoch: 1,
-    active_epochs: std::collections::BTreeMap::new(),
-    retired: std::collections::VecDeque::new(),
-});
+impl RetireState {
+    const fn new() -> Self {
+        Self {
+            next_epoch: 1,
+            active_epochs: std::collections::BTreeMap::new(),
+            retired: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+static RETIRE_STATE: Mutex<RetireState> = Mutex::new(RetireState::new());
+
+#[cfg(test)]
+thread_local! {
+    static RETIRE_SCOPE: std::cell::RefCell<Option<std::sync::Arc<Mutex<RetireState>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct RetireTestScope {
+    prev: Option<std::sync::Arc<Mutex<RetireState>>>,
+}
+
+#[cfg(test)]
+impl Drop for RetireTestScope {
+    fn drop(&mut self) {
+        RETIRE_SCOPE.with(|cell| *cell.borrow_mut() = self.prev.take());
+    }
+}
+
+#[cfg(test)]
+fn current_retire_scope() -> Option<std::sync::Arc<Mutex<RetireState>>> {
+    RETIRE_SCOPE.with(|cell| cell.borrow().clone())
+}
+
+#[cfg(test)]
+fn enter_retire_scope(scope: Option<std::sync::Arc<Mutex<RetireState>>>) -> RetireTestScope {
+    let prev = RETIRE_SCOPE.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), scope));
+    RetireTestScope { prev }
+}
+
+/// Isolates retirement epochs and queued drops on the current test thread (and
+/// any `HostList` created or acquired on it) from concurrent GPU tests.
+#[cfg(test)]
+pub(crate) fn isolated_retire_scope() -> RetireTestScope {
+    let fresh = std::sync::Arc::new(Mutex::new(RetireState::new()));
+    let prev = RETIRE_SCOPE.with(|cell| cell.borrow_mut().replace(fresh));
+    RetireTestScope { prev }
+}
 
 /// A retired object, dropped on whatever thread finishes the blocking epoch.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
@@ -101,23 +145,23 @@ struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 unsafe impl Send for Retired {}
 
 /// Acquires a monotonically increasing epoch (never 0) that keeps retired
-/// objects alive until [`release_epoch`] is called with it.
-fn acquire_epoch() -> u64 {
-    let mut state = RETIRE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+/// objects alive until [`release_epoch_in`] is called with it.
+fn acquire_epoch_in(retire_state: &Mutex<RetireState>) -> u64 {
+    let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
     let e = state.next_epoch;
     state.next_epoch += 1;
     *state.active_epochs.entry(e).or_default() += 1;
     e
 }
 
-/// Releases an epoch acquired with [`acquire_epoch`] and drops any retired
+/// Releases an epoch acquired with [`acquire_epoch_in`] and drops any retired
 /// objects whose blocking epochs have all completed, after releasing the lock.
-fn release_epoch(epoch: u64) {
+fn release_epoch_in(retire_state: &Mutex<RetireState>, epoch: u64) {
     if epoch == 0 {
         return;
     }
     let done: Vec<Retired> = {
-        let mut state = RETIRE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
         if let std::collections::btree_map::Entry::Occupied(mut entry) =
             state.active_epochs.entry(epoch)
         {
@@ -143,9 +187,8 @@ fn release_epoch(epoch: u64) {
     drop(done);
 }
 
-/// Drops `object` once every epoch active now has finished: at once if none is.
-pub(crate) fn retire<T: 'static>(object: T) {
-    let mut state = RETIRE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+fn retire_in<T: 'static>(retire_state: &Mutex<RetireState>, object: T) {
+    let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
     if state.active_epochs.is_empty() {
         drop(state);
         drop(object);
@@ -155,6 +198,16 @@ pub(crate) fn retire<T: 'static>(object: T) {
     state
         .retired
         .push_back((wait_for, Retired(Box::new(object))));
+}
+
+/// Drops `object` once every epoch active now has finished: at once if none is.
+pub(crate) fn retire<T: 'static>(object: T) {
+    #[cfg(test)]
+    if let Some(scope) = current_retire_scope() {
+        retire_in(&scope, object);
+        return;
+    }
+    retire_in(&RETIRE_STATE, object);
 }
 
 /// Time spent in submissions since the last frame-rate line, in
@@ -510,6 +563,10 @@ pub(crate) struct HostList {
     /// Serializes `in_flight` transitions with `epoch` updates so a concurrent
     /// `end_submit` never clears an epoch pinned by a new `begin_submit`.
     epoch_lock: Mutex<()>,
+    /// Test-only isolated retirement state captured when the list is created or
+    /// acquired so parallel GPU tests do not pin each other's drops.
+    #[cfg(test)]
+    retire_scope: Option<std::sync::Arc<Mutex<RetireState>>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -784,9 +841,15 @@ impl Host {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .pop();
-        if let Some(list) = pooled {
-            #[cfg(test)]
+        #[cfg(test)]
+        if let Some(mut list) = pooled {
             self.reused_lists.fetch_add(1, Ordering::Relaxed);
+            list.reset();
+            list.retire_scope = current_retire_scope();
+            return Ok(list);
+        }
+        #[cfg(not(test))]
+        if let Some(list) = pooled {
             list.reset();
             return Ok(list);
         }
@@ -853,6 +916,8 @@ impl Host {
                 epoch: std::sync::atomic::AtomicU64::new(0),
                 in_flight: std::sync::atomic::AtomicUsize::new(0),
                 epoch_lock: Mutex::default(),
+                #[cfg(test)]
+                retire_scope: current_retire_scope(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -866,7 +931,16 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        let exec_epoch = acquire_epoch();
+        #[cfg(test)]
+        let exec_scope = runs
+            .iter()
+            .find_map(|l| l.retire_scope.clone())
+            .or_else(current_retire_scope);
+        #[cfg(test)]
+        let exec_state: &Mutex<RetireState> = exec_scope.as_deref().unwrap_or(&RETIRE_STATE);
+        #[cfg(not(test))]
+        let exec_state: &Mutex<RetireState> = &RETIRE_STATE;
+        let exec_epoch = acquire_epoch_in(exec_state);
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -874,13 +948,17 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
-        for list in runs {
-            list.run_deferred(&mut batch);
-            firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
-                lists.push(Some(prelude));
+        {
+            #[cfg(test)]
+            let _scope = enter_retire_scope(exec_scope.clone());
+            for list in runs {
+                list.run_deferred(&mut batch);
+                firsts.push(lists.len());
+                if let Some(prelude) = list.prelude() {
+                    lists.push(Some(prelude));
+                }
+                lists.push(list.list.cast().ok());
             }
-            lists.push(list.list.cast().ok());
         }
         batch.flush();
         let prepared = std::time::Instant::now();
@@ -1005,7 +1083,7 @@ impl Host {
         }
         self.log_messages();
         drop(submitted);
-        release_epoch(exec_epoch);
+        release_epoch_in(exec_state, exec_epoch);
         woken.run();
     }
 
@@ -1375,9 +1453,17 @@ impl HostList {
         }
     }
 
+    fn retire_state(&self) -> &Mutex<RetireState> {
+        #[cfg(test)]
+        if let Some(scope) = self.retire_scope.as_deref() {
+            return scope;
+        }
+        &RETIRE_STATE
+    }
+
     fn ensure_epoch(&self, _guard: &std::sync::MutexGuard<'_, ()>) {
         if self.epoch.load(Ordering::Acquire) == 0 {
-            let e = acquire_epoch();
+            let e = acquire_epoch_in(self.retire_state());
             self.epoch.store(e, Ordering::Release);
         }
     }
@@ -1412,7 +1498,7 @@ impl HostList {
             }
         };
         if released != 0 {
-            release_epoch(released);
+            release_epoch_in(self.retire_state(), released);
         }
     }
 
@@ -1426,7 +1512,7 @@ impl HostList {
             }
         };
         if released != 0 {
-            release_epoch(released);
+            release_epoch_in(self.retire_state(), released);
         }
     }
 
@@ -3355,6 +3441,7 @@ mod tests {
 
     #[test]
     fn retire_drops_immediately_when_no_epoch_is_active() {
+        let _retire = isolated_retire_scope();
         let (counter, drops) = DropCounter::new();
         retire(counter);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -3362,6 +3449,7 @@ mod tests {
 
     #[test]
     fn idle_list_does_not_block_retirement() {
+        let _retire = isolated_retire_scope();
         let Some(host) = host() else {
             return;
         };
@@ -3374,6 +3462,7 @@ mod tests {
 
     #[test]
     fn open_marked_list_pins_retired_objects_across_other_executions() {
+        let _retire = isolated_retire_scope();
         let Some(host) = host() else {
             return;
         };
@@ -3427,6 +3516,7 @@ mod tests {
 
     #[test]
     fn active_execution_epoch_pins_objects_retired_during_execute() {
+        let _retire = isolated_retire_scope();
         let Some(host) = host() else {
             return;
         };

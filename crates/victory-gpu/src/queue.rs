@@ -1215,6 +1215,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn queued_list_behind_fence_wait_pins_retired_objects_until_completion() {
+        let _retire = crate::host::isolated_retire_scope();
         type Sync = extern "system" fn(This, This, u64) -> HRESULT;
         type Execute = extern "system" fn(This, u32, *const This);
 
@@ -1274,6 +1275,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn double_submitted_list_pins_retired_objects_until_both_executions_complete() {
+        let _retire = crate::host::isolated_retire_scope();
         type Sync = extern "system" fn(This, This, u64) -> HRESULT;
         type Execute = extern "system" fn(This, u32, *const This);
 
@@ -1332,6 +1334,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn cancelled_queued_list_drops_retired_objects_when_queue_is_released() {
+        let _retire = crate::host::isolated_retire_scope();
         type Sync = extern "system" fn(This, This, u64) -> HRESULT;
         type Execute = extern "system" fn(This, u32, *const This);
 

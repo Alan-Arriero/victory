@@ -2598,6 +2598,7 @@ mod depth_tests {
 
     #[test]
     fn set_targets_keeps_released_rtv_and_dsv_textures_alive_until_list_reset() {
+        let _retire = crate::host::isolated_retire_scope();
         use windows::Win32::Graphics::Dxgi::Common::{
             DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
         };

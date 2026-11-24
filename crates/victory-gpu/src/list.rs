@@ -2861,6 +2861,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn idle_list_state_does_not_pin_retirement_while_recorded_commands_do() {
+        let _retire = crate::host::isolated_retire_scope();
         use std::sync::atomic::Ordering;
 
         if crate::host::host().is_none() {

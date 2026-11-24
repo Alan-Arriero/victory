@@ -719,6 +719,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn unregister_drops_shadow_immediately_when_idle() {
+        let _retire = crate::host::isolated_retire_scope();
         if host().is_none() {
             return;
         }
@@ -738,6 +739,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn unregister_retires_shadow_until_active_epoch_finishes() {
+        let _retire = crate::host::isolated_retire_scope();
         let Some(host) = host() else {
             return;
         };

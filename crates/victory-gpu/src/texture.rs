@@ -480,6 +480,7 @@ mod tests {
 
     #[test]
     fn forget_drops_staging_immediately_when_idle() {
+        let _retire = crate::host::isolated_retire_scope();
         if host().is_none() {
             return;
         }
@@ -497,6 +498,7 @@ mod tests {
 
     #[test]
     fn forget_retires_staging_until_active_epoch_finishes() {
+        let _retire = crate::host::isolated_retire_scope();
         let Some(host) = host() else {
             return;
         };
