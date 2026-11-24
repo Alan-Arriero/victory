@@ -1,10 +1,14 @@
-use std::path::Path;
 use std::process::Command;
+
+// The inputs live in a temporary directory: the asset policy refuses paths
+// inside the source tree.
 
 #[test]
 fn census_fails_when_a_requested_path_is_missing() {
-    let valid = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-    let missing = valid.with_extension("missing-census-input");
+    let dir = tempfile::tempdir().unwrap();
+    let valid = dir.path().join("not-an-image.txt");
+    std::fs::write(&valid, "no PE image here").unwrap();
+    let missing = dir.path().join("missing-census-input");
     assert!(!missing.exists());
 
     let output = Command::new(env!("CARGO_BIN_EXE_victory"))
@@ -18,15 +22,17 @@ fn census_fails_when_a_requested_path_is_missing() {
         "census succeeded: {}",
         String::from_utf8_lossy(&output.stdout)
     );
-    assert!(stderr.contains("Cargo.missing-census-input"), "{stderr}");
+    assert!(stderr.contains("missing-census-input"), "{stderr}");
 }
 
 #[test]
 fn census_accepts_a_valid_path_with_no_pe_images() {
-    let valid = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let dir = tempfile::tempdir().unwrap();
+    let valid = dir.path().join("not-an-image.txt");
+    std::fs::write(&valid, "no PE image here").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_victory"))
         .arg("census")
-        .arg(valid)
+        .arg(&valid)
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
