@@ -579,7 +579,9 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
-        let bitcode = self.m.write();
+        // Compute lowering can generate unused register results that otherwise
+        // keep arithmetic and entire chains of merge values in the host module.
+        let bitcode = self.m.write(!graphics);
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
         dxil.extend((kind << 16 | 0x66).to_le_bytes());
         dxil.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());
