@@ -103,9 +103,12 @@ fn normalized_mtbuf_loads_round_every_field_value() {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let hosts: Vec<_> = [("hardware", false), ("warp", true)]
-        .into_iter()
-        .filter_map(|(name, warp)| Host::new(warp).ok().map(|h| (name, h)))
+    // `VICTORY_WARP=1` makes `Host::new(false)` WARP too: the shared list
+    // then runs it once, labelled as such.
+    let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    let hosts: Vec<_> = super::valu_tests::backends(force_warp)
+        .iter()
+        .filter_map(|&(name, warp)| Host::new(warp).ok().map(|h| (name, h)))
         .collect();
     assert!(!hosts.is_empty(), "no SM 6.6 device");
 

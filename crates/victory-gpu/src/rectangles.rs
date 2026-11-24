@@ -381,16 +381,28 @@ float half_to_f32(uint h) {
     return asfloat(sgn | ((ex + 112u) << 23u) | (man << 13u));
 }
 
+// The same bits as `primitive.rs`'s `f32_to_half`: NaN kept, subnormals,
+// rounding to nearest with ties to even.
 uint f32_to_half(float v) {
     uint bits = asuint(v);
     uint sgn = (bits >> 16u) & 0x8000u;
     int ex = (int)((bits >> 23u) & 0xffu) - 127 + 15;
     uint man = bits & 0x7fffffu;
+    if ((bits & 0x7fffffffu) > 0x7f800000u) return sgn | 0x7e00u | (man >> 13u);
     if (ex >= 31) return sgn | 0x7c00u;
-    if (ex <= 0) return sgn;
+    if (ex <= 0) {
+        if (ex < -10) return sgn;
+        uint sig = 0x800000u | man;
+        uint shift = (uint)(14 - ex);
+        uint halfway = 1u << (shift - 1u);
+        uint q = sig >> shift;
+        uint r = sig & ((1u << shift) - 1u);
+        bool up = r > halfway || (r == halfway && (q & 1u) != 0u);
+        return sgn | (q + (up ? 1u : 0u));
+    }
     // Added, not or-ed: a rounding carry out of the mantissa raises the
-    // exponent (as #260 does for primitive.rs).
-    return sgn | (((uint)ex << 10u) + ((man + 0x1000u) >> 13u));
+    // exponent.
+    return sgn | (((uint)ex << 10u) + ((man + 0xfffu + ((man >> 13u) & 1u)) >> 13u));
 }
 
 float read_comp(uint kind, uint pos) {
