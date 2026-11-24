@@ -3143,6 +3143,8 @@ impl<'a> Lower<'a> {
         let total: u32 = bits.iter().sum();
         let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let load = |l: &mut Self, at: V, n: u32| -> Vec<V> {
+            // A ResRet holds four data words; the fifth value is the status.
+            debug_assert!((1..=4).contains(&n), "a raw load of {n} words");
             let mask = l.s.m.i8((1u8 << n) - 1);
             let r = l.s.op(
                 c,
@@ -3188,7 +3190,18 @@ impl<'a> Lower<'a> {
                 let aligned = self.s.m.i32((at & !3) as u32);
                 let sh = self.s.m.i32(shift);
                 let up = self.s.m.i32(32 - shift);
-                let raw = load(self, aligned, n as u32 + 1);
+                // n + 1 aligned words, at most four to a load.
+                let base = (at & !3) as u32;
+                let mut raw = Vec::with_capacity(n + 1);
+                for first in (0..=n).step_by(4) {
+                    let count = (n + 1 - first).min(4) as u32;
+                    let from = if first == 0 {
+                        aligned
+                    } else {
+                        self.s.m.i32(base + 4 * first as u32)
+                    };
+                    raw.extend(load(self, from, count));
+                }
                 (0..n)
                     .map(|k| {
                         let lo = self.s.m.bin(c, Bin::LShr, raw[k], sh);
@@ -7354,6 +7367,18 @@ mod tests {
         let (layout, used) = fetch_tables(0, 4);
         let l = lower_with(&fetch_program(even, 3), layout, used).unwrap();
         assert_eq!(l.unaligned_typed_loads, 0);
+    }
+
+    #[test]
+    fn a_four_dword_typed_fetch_inside_a_dword_loads_at_most_four_words_at_a_time() {
+        // `tbuffer_load_format_xyzw` of format 77 at byte offset 33 needs
+        // five aligned words; one raw load returns four and then the
+        // status, so the fifth is read by a second load (the load closure
+        // asserts no load asks for more than four).
+        let odd = buffer(0x003, true, 77, 33, false, false, 0, 3, 8);
+        let (layout, used) = fetch_tables(0, 4);
+        let l = lower_with(&fetch_program(odd, 4), layout, used).unwrap();
+        assert_eq!(l.unaligned_typed_loads, 1);
     }
 
     #[test]
