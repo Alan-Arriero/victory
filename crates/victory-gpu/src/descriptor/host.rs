@@ -46,9 +46,8 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; `spare` more follow them.
     count: u32,
-    /// Dynamic slots past the title's: [`DYNAMIC`] in a view heap where
-    /// the host takes them, else [`MIN_DYNAMIC`]; [`SAMPLER_DYNAMIC`] in a
-    /// capped sampler heap, none in another.
+    /// Dynamic slots past the title's: [`DYNAMIC`] in a view heap,
+    /// [`SAMPLER_DYNAMIC`] in a capped sampler heap, none in another.
     spare: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
@@ -107,12 +106,13 @@ const _: () = assert!(SAMPLERS <= victory_shader::emit::SAMPLER_HEAP_LIMIT);
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
 /// 2^16 ran out seconds into the world (every world run on an RX 9070 XT,
-/// each a device removal shortly after; #59).
+/// each a device removal shortly after; #59). A heap the host caps (at
+/// [`PORTABLE_VIEWS`], NVIDIA) gets as many, taken from the top of the
+/// title's slots: with fewer the dynamic slots ran out there too (2^16 and
+/// 2^17 both did, in a frame asking for up to 16,000 tables), and a draw
+/// whose table is refused is dropped; the title's highest slot seen, about
+/// 720,000, stays below the 737,000 that are left.
 const DYNAMIC: u32 = 1 << 18;
-
-/// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
-const MIN_DYNAMIC: u32 = 1 << 16;
 
 /// The host's limit for shader-visible sampler heaps, on every binding
 /// tier.
@@ -170,43 +170,31 @@ impl HostHeap {
                 }
             };
         }
-        // The title slots that fit under the largest heap made beside
-        // `extra` dynamic ones.
-        let fitting = |extra: u32| count.min(MAX_VIEWS - extra);
-        if fitting(MIN_DYNAMIC) < count {
+        // The title slots that fit under the largest heap made beside the
+        // dynamic ones.
+        let count_fitting = count.min(MAX_VIEWS - DYNAMIC);
+        if count_fitting < count {
             // shortcut: as below, descriptors past the limit are left out.
             tracing::warn!(count, "host view heap capped at {MAX_VIEWS}");
         }
-        // The larger dynamic range only where the host takes it on top of
-        // every title slot; else the smaller one, and the cap after that.
-        let large = if fitting(DYNAMIC) == count {
-            make(count + DYNAMIC).ok()
-        } else {
-            None
-        };
-        let (heap, count, extra) = if let Some(heap) = large {
-            (heap, count, DYNAMIC)
-        } else {
-            let count = fitting(MIN_DYNAMIC);
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (
-                        make(PORTABLE_VIEWS).ok()?,
-                        PORTABLE_VIEWS - MIN_DYNAMIC,
-                        MIN_DYNAMIC,
-                    )
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
-                }
+        let (heap, count) = match make(count_fitting + DYNAMIC) {
+            Ok(heap) => (heap, count_fitting),
+            Err(e) if count_fitting + DYNAMIC > PORTABLE_VIEWS => {
+                // shortcut: descriptors past the host's limit are left out;
+                // a title that reaches them needs remapping.
+                tracing::warn!(
+                    error = %e,
+                    count = count_fitting,
+                    "host view heap capped at {PORTABLE_VIEWS}"
+                );
+                (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - DYNAMIC)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                return None;
             }
         };
-        Self::with(host, heap, kind, count, extra)
+        Self::with(host, heap, kind, count, DYNAMIC)
     }
 
     /// The host heap over `heap`: `count` title slots, then `extra` dynamic
