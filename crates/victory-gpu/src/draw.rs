@@ -88,6 +88,15 @@ fn fullscreen_structured_alias(vertex_hash: &str, pixel_hash: &str) -> Option<St
     }
 }
 
+/// A raw SRV describes bytes of a particular host resource. The descriptor
+/// slot keeps that resource alive for the recorded commands.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct RawBufferRange {
+    resource: usize,
+    offset: u64,
+    len: u64,
+}
+
 /// Snapshot of a resolved render-target view captured at `OMSetRenderTargets`
 /// bind time, so a mid-list wait split reapplies the original view even if the
 /// title later overwrites the descriptor slot in place.
@@ -142,9 +151,8 @@ pub(crate) struct State {
     dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
-    /// Root SRVs bound as one-view tables in this list: (host heap, title
-    /// address) → dynamic slot.
-    root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
+    /// One slot per view in each heap, including a shared null view.
+    root_srv_slots: std::collections::HashMap<(usize, Option<RawBufferRange>), u32>,
 }
 
 impl Drop for State {
@@ -246,6 +254,9 @@ impl State {
     /// Takes the dynamic descriptor slots held by this recording, so a
     /// pending host list can keep them alive until its submission finishes.
     pub(crate) fn take_dynamic(&mut self) -> Vec<(usize, u32, u32)> {
+        // A following segment must acquire its own slots before recording a bind.
+        self.fresh_tables.clear();
+        self.root_srv_slots.clear();
         std::mem::take(&mut self.dynamic)
     }
 
@@ -296,7 +307,6 @@ impl State {
     /// mid-list wait split, moving dynamic descriptor slots onto `prev_list`
     /// so they stay alive until its submission finishes.
     pub(crate) fn reapply_host(&mut self, new_list: &HostList, prev_list: &HostList) {
-        self.fresh_tables.clear();
         prev_list.keep_dynamic(self.take_dynamic());
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
@@ -745,7 +755,7 @@ impl State {
     /// Binds a root SRV as a one-view table (see
     /// [`crate::pipeline::host::bounded_root_srvs`]): a raw view of the
     /// title buffer's host copy from `address` to the copy's end, or a null
-    /// view (no address, or no host copy). One slot per address per list.
+    /// view (no address, or no host copy).
     /// False if no dynamic slot could be had (the draw is dropped).
     fn root_srv_table(
         &mut self,
@@ -765,35 +775,38 @@ impl State {
             return false;
         };
         let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-        let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
-        let index = match self.root_srv_slots.get(&key) {
-            Some(&index) => index,
-            None => {
+        let view = shadow.as_ref().and_then(|(a, s)| {
+            let offset = s.offset(*a);
+            if !offset.is_multiple_of(16) {
+                once!(
+                    address = format_args!("{a:#x}"),
+                    "a root SRV not on 16 bytes reads zeros"
+                );
+                return None;
+            }
+            let len = s.left(*a);
+            (len >= 4).then_some((&s.buffer, offset, len))
+        });
+        let heap_id = std::ptr::from_ref(heap) as usize;
+        let range = view.map(|(buffer, offset, len)| RawBufferRange {
+            resource: buffer.as_raw() as usize,
+            offset,
+            len,
+        });
+        // A title address may now resolve to a different buffer. Earlier
+        // commands still reference the old slot, so allocate on a miss.
+        let index = match self.root_srv_slots.entry((heap_id, range)) {
+            std::collections::hash_map::Entry::Occupied(slot) => *slot.get(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
-                self.root_srv_slots.insert(key, index);
-                match &shadow {
-                    Some((a, s)) => {
-                        // SAFETY: a live buffer.
-                        let base = unsafe { s.buffer.GetGPUVirtualAddress() };
-                        let offset = s.gpu(*a) - base;
-                        if offset.is_multiple_of(16) {
-                            host.raw_at(index, &s.buffer, offset, s.left(*a));
-                        } else {
-                            // Raw views start on 16 bytes; one from the
-                            // aligned start would shift every read.
-                            once!(
-                                address = format_args!("{a:#x}"),
-                                "a root SRV not on 16 bytes reads zeros"
-                            );
-                            host.null_raw_at(index);
-                        }
-                    }
+                match view {
+                    Some((buffer, offset, len)) => host.raw_at(index, buffer, offset, len),
                     None => host.null_raw_at(index),
                 }
-                index
+                self.dynamic.push((heap_id, index, 1));
+                *slot.insert(index)
             }
         };
         if let Some((a, s)) = &shadow {
@@ -1769,6 +1782,20 @@ fn rect_source(first: u32, count: u32, stride: u32, size: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{expanded_vertices, rect_source};
+
+    #[test]
+    fn bounded_root_slots_belong_to_the_recording_that_allocated_them() {
+        let mut state = super::State::default();
+        let heap = 1;
+        state.fresh_tables.insert((10, 11), 4);
+        state.root_srv_slots.insert((heap, None), 5);
+        state.dynamic.extend([(heap, 4, 1), (heap, 5, 1)]);
+
+        assert_eq!(state.take_dynamic(), [(heap, 4, 1), (heap, 5, 1)]);
+        assert!(state.fresh_tables.is_empty());
+        assert!(state.root_srv_slots.is_empty());
+        assert!(state.take_dynamic().is_empty());
+    }
 
     #[test]
     fn rectangle_vertices_inside_their_buffer() {

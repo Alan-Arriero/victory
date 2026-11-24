@@ -550,8 +550,11 @@ impl HostHeap {
     /// size, whose reads past it return zeros instead of reaching whatever
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
+        let Some(elements) = raw_element_count(len) else {
+            self.null_raw_at(index);
+            return;
+        };
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -559,7 +562,7 @@ impl HostHeap {
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_SRV {
                     FirstElement: offset / 4,
-                    NumElements: elements,
+                    NumElements: elements.get(),
                     StructureByteStride: 0,
                     Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                 },
@@ -1327,6 +1330,12 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     desc
 }
 
+/// Raw views can expose only whole four-byte elements. A trailing partial
+/// element belongs outside the view, even when it is the entire range.
+fn raw_element_count(len: u64) -> Option<std::num::NonZeroU32> {
+    std::num::NonZeroU32::new(u32::try_from(len / 4).unwrap_or(u32::MAX))
+}
+
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
 /// buffers).
 fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
@@ -1404,6 +1413,19 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_raw_view_counts_only_complete_dwords() {
+        let count = |bytes| raw_element_count(bytes).map(std::num::NonZeroU32::get);
+        for bytes in 0..4 {
+            assert_eq!(count(bytes), None);
+        }
+        for bytes in 4..8 {
+            assert_eq!(count(bytes), Some(1));
+        }
+        assert_eq!(count(8), Some(2));
+        assert_eq!(count(u64::MAX), Some(u32::MAX));
+    }
 
     /// The CPU-side block used to initialize null samplers must fit the
     /// same portable sampler limit as the shader-visible heap.
