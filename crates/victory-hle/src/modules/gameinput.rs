@@ -1888,7 +1888,11 @@ mod tests {
         while ACTIVE.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_ne!(ACTIVE.load(Ordering::SeqCst), 0, "registration delivered a callback");
+        assert_ne!(
+            ACTIVE.load(Ordering::SeqCst),
+            0,
+            "registration delivered a callback"
+        );
         let poller = std::thread::spawn(move || {
             host.lock().unwrap().pads[1] = Some(PadState::default());
             hub.poll();
@@ -1899,7 +1903,10 @@ mod tests {
         assert_eq!(registrar.join().unwrap(), S_OK);
         poller.join().unwrap();
         assert_eq!(PEAK.load(Ordering::SeqCst), 1);
-        assert!(CALLS.load(Ordering::SeqCst) >= 2, "initial and hotplug both ran");
+        assert!(
+            CALLS.load(Ordering::SeqCst) >= 2,
+            "initial and hotplug both ran"
+        );
     }
 
     #[test]

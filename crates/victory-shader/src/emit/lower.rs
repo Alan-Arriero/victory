@@ -7512,13 +7512,7 @@ fn divergent_barriers(
 ) -> HashSet<usize> {
     let n = p.blocks.len();
     let barriers: Vec<usize> = (0..n)
-        .filter(|b| {
-            !skip.contains(b)
-                && p.blocks[*b]
-                    .insts
-                    .iter()
-                    .any(|i| i.name() == "s_barrier")
-        })
+        .filter(|b| !skip.contains(b) && p.blocks[*b].insts.iter().any(|i| i.name() == "s_barrier"))
         .collect();
     if barriers.is_empty() {
         return HashSet::new();
