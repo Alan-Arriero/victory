@@ -719,12 +719,19 @@ fn v_cvt_off_f32_i4_uses_the_signed_low_nibble() {
 
     let mut cases: Vec<u32> = (0..16).collect();
     // Bits above the low nibble are ignored.
-    cases.extend([0xABCD_EF05, 0xFFFF_FFF8, 0x1234_5670, 0x8000_000F, 0x0000_00F7]);
+    cases.extend([
+        0xABCD_EF05,
+        0xFFFF_FFF8,
+        0x1234_5670,
+        0x8000_000F,
+        0x0000_00F7,
+    ]);
     let inputs: Vec<[u32; 4]> = cases.iter().map(|&x| [x, 0, 0, 0]).collect();
     run_cases(&shader, &inputs, |backend, i, inp, got| {
         let want = nibble(cases[i]).to_bits();
         assert_eq!(
-            got, want,
+            got,
+            want,
             "{backend}: v_cvt_off_f32_i4({:#010x}) = {got:#010x} ({:?}), want {want:#010x}",
             inp[0],
             f32::from_bits(got),
