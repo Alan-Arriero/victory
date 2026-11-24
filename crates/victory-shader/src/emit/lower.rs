@@ -6876,7 +6876,7 @@ impl<'a> Lower<'a> {
         }
         let (op, sample) = match name {
             "image_sample" | "image_sample_cl" | "image_sample_o" => (60, true),
-            "image_sample_lz" | "image_sample_l" => (62, true),
+            "image_sample_lz" | "image_sample_l" | "image_sample_lz_o" => (62, true),
             "image_sample_b" | "image_sample_b_cl" => (61, true),
             "image_sample_c_lz" => (65, true),
             "image_sample_d" | "image_sample_d_cl" => (63, true),
@@ -9332,6 +9332,47 @@ mod tests {
         let l = lower_with(&words, layout, used).unwrap();
         // One image handle from the joins' heap index, the same in all lanes.
         assert_eq!(l.nonuniform_handles, 0);
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut l.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+    }
+
+    #[test]
+    fn level_zero_sample_with_offsets_lowers() {
+        // image_sample_lz_o: the offset word first, then the coordinates.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0xBE88_03FF,
+            0x0000_0092, // s_mov_b32 s8, 0x92 (an immediate sampler)
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0x7E04_02FF,
+            0x0000_3F01, // v_mov_b32 v2, 0x3f01: offsets x 1, y -1
+            0x7E06_02F0, // v_mov_b32 v3, 0.5
+            0x7E08_02F0, // v_mov_b32 v4, 0.5
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF0DC_0F08,
+            0x0043_0C02, // image_sample_lz_o v[12:15], v[2:4], s[12:19], s[8:11] dmask:0xf dim:2D
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ];
+        let (_, mut used) = texture_and_uav_tables();
+        used.retain(|u| u.user_data == 0);
+        let layout = vec![root(RootType::Table, 0, 0)];
+        #[cfg_attr(not(windows), allow(unused_variables))]
+        let l = lower_with(&words, layout, used).unwrap();
         #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
