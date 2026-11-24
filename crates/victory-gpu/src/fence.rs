@@ -127,6 +127,7 @@ fn watch_loop() {
 static MEMORY_WAITERS: Mutex<Vec<(crate::timeline::MemoryWait, Instant, Weak<Timeline>)>> =
     Mutex::new(Vec::new());
 
+#[cfg(any(feature = "diagnostics", test))]
 fn parse_wait_timeout(value: Option<&str>) -> Duration {
     let ms = value
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -135,10 +136,17 @@ fn parse_wait_timeout(value: Option<&str>) -> Duration {
     Duration::from_millis(ms)
 }
 
-/// How long a GPU memory wait waits before timing out (`VICTORY_WAIT_TIMEOUT_MS`,
-/// default 2000 ms).
+/// How long a GPU memory wait waits before timing out and failing open
+/// (2000 ms; overridable with `VICTORY_WAIT_TIMEOUT_MS` in `diagnostics` builds).
 pub(crate) fn memory_wait_timeout() -> Duration {
-    parse_wait_timeout(std::env::var("VICTORY_WAIT_TIMEOUT_MS").ok().as_deref())
+    #[cfg(feature = "diagnostics")]
+    {
+        parse_wait_timeout(std::env::var("VICTORY_WAIT_TIMEOUT_MS").ok().as_deref())
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        Duration::from_millis(2000)
+    }
 }
 
 /// Returns whether `wait` is already satisfied or expired; otherwise
@@ -715,6 +723,9 @@ mod tests {
         crate::queue::Written::Value(7)
             .write((&raw const target) as *mut u8, 4)
             .run();
+        // If the background watch thread raced ahead and claimed the wakeup,
+        // wait for its in-flight `Timeline::run` pass to complete.
+        queue.submit(Op::Run(Box::new(|| {})));
         assert_eq!(done.load(Ordering::Acquire), 1);
     }
 }

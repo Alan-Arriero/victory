@@ -29,29 +29,62 @@ pub(crate) struct MemoryWait {
     pub(crate) comparison: u32,
 }
 
+/// Count of GPU memory waits that timed out and failed open (diagnostics).
+#[cfg(feature = "diagnostics")]
+static MEMORY_WAIT_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+
+/// Total GPU memory waits that have timed out so far (diagnostics).
+#[cfg(feature = "diagnostics")]
+#[allow(dead_code)]
+pub(crate) fn memory_wait_timeouts() -> u64 {
+    MEMORY_WAIT_TIMEOUTS.load(Ordering::Relaxed)
+}
+
 impl MemoryWait {
     /// Whether the memory location currently satisfies the wait condition.
+    ///
+    /// On Windows, checks that `[address, address + width)` is committed before
+    /// reading so a freed or decommitted title address resolves cleanly instead
+    /// of faulting the process.
     pub(crate) fn satisfied(&self) -> bool {
         if self.address == 0 {
             return true;
         }
+        let width = usize::from(self.width);
+        if self.address.checked_add(width as u64).is_none() {
+            tracing::warn!(
+                address = format_args!("{:#x}", self.address),
+                width = self.width,
+                "GPU memory wait address overflows; resolving wait"
+            );
+            return true;
+        }
+        #[cfg(windows)]
+        if !crate::texture::committed(self.address as *const u8, width) {
+            tracing::warn!(
+                address = format_args!("{:#x}", self.address),
+                width = self.width,
+                "GPU memory wait address is not committed; resolving wait"
+            );
+            return true;
+        }
         let (lhs, rhs) = if self.width == 4 {
             let val = if self.address.is_multiple_of(align_of::<AtomicU32>() as u64) {
-                // SAFETY: caller provides a live, aligned 32-bit title/GPU address.
+                // SAFETY: verified committed on Windows (or live test memory); aligned 32-bit read.
                 unsafe { AtomicU32::from_ptr(self.address as *mut u32) }.load(Ordering::Acquire)
             } else {
                 std::sync::atomic::fence(Ordering::Acquire);
-                // SAFETY: caller provides a live 32-bit title/GPU address.
+                // SAFETY: verified committed on Windows (or live test memory); 32-bit read.
                 unsafe { (self.address as *const u32).read_unaligned() }
             };
             (u64::from(val & self.mask), u64::from(self.reference as u32))
         } else {
             let val = if self.address.is_multiple_of(align_of::<AtomicU64>() as u64) {
-                // SAFETY: caller provides a live, aligned 64-bit title/GPU address.
+                // SAFETY: verified committed on Windows (or live test memory); aligned 64-bit read.
                 unsafe { AtomicU64::from_ptr(self.address as *mut u64) }.load(Ordering::Acquire)
             } else {
                 std::sync::atomic::fence(Ordering::Acquire);
-                // SAFETY: caller provides a live 64-bit title/GPU address.
+                // SAFETY: verified committed on Windows (or live test memory); 64-bit read.
                 unsafe { (self.address as *const u64).read_unaligned() }
             };
             (val, self.reference)
@@ -167,12 +200,29 @@ impl Timeline {
                             break;
                         }
                         if !wait.satisfied() {
+                            // Fail-open is intentional: if a console memory wait is
+                            // never satisfied (for example, an unimplemented signal
+                            // path), continuing after the 2 s stall avoids permanently
+                            // deadlocking the queue even though subsequent work runs
+                            // with the condition unmet.
+                            #[cfg(feature = "diagnostics")]
+                            let timeouts = MEMORY_WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
+                            #[cfg(feature = "diagnostics")]
                             tracing::warn!(
                                 address = format_args!("{:#x}", wait.address),
                                 comparison = wait.comparison,
                                 reference = wait.reference,
                                 width = wait.width,
-                                "GPU memory wait timed out; continuing"
+                                timeouts,
+                                "GPU memory wait timed out; continuing (fail-open)"
+                            );
+                            #[cfg(not(feature = "diagnostics"))]
+                            tracing::warn!(
+                                address = format_args!("{:#x}", wait.address),
+                                comparison = wait.comparison,
+                                reference = wait.reference,
+                                width = wait.width,
+                                "GPU memory wait timed out; continuing (fail-open)"
                             );
                         }
                     }
@@ -296,5 +346,39 @@ mod tests {
             ran.load(Ordering::Acquire),
             "timed-out memory wait did not advance timeline"
         );
+        #[cfg(feature = "diagnostics")]
+        assert!(memory_wait_timeouts() >= 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn memory_wait_resolves_uncommitted_address_without_faulting() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: reserving a single uncommitted page for read-safety verification.
+        let reserved = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!reserved.is_null());
+        let wait32 = MemoryWait {
+            address: reserved as u64,
+            reference: 1,
+            mask: u32::MAX,
+            width: 4,
+            comparison: 3,
+        };
+        let wait64 = MemoryWait {
+            address: reserved as u64,
+            reference: 1,
+            mask: u32::MAX,
+            width: 8,
+            comparison: 3,
+        };
+        assert!(wait32.satisfied());
+        assert!(wait64.satisfied());
+        // SAFETY: freeing the page we reserved above.
+        unsafe { VirtualFree(reserved, 0, MEM_RELEASE) };
+        // Freed (unmapped) address must also resolve cleanly without faulting.
+        assert!(wait32.satisfied());
+        assert!(wait64.satisfied());
     }
 }

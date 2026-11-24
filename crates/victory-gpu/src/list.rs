@@ -1522,6 +1522,13 @@ extern "system" fn wait64(this: This, address: u64, comparison: u32, reference: 
     record_wait(this, address, comparison, reference, u32::MAX, 8);
 }
 
+/// Maximum number of mid-list host command-list splits per title list.
+/// Real titles issue only a handful of mid-list memory waits per list; capping
+/// splits bounds host list allocation and `segments()` cloning on pathological
+/// wait chains.
+#[cfg(windows)]
+const MAX_WAIT_SPLITS: usize = 64;
+
 fn record_wait(this: This, address: u64, comparison: u32, reference: u64, mask: u32, width: u8) {
     const ALWAYS: u32 = 8;
     if address == 0 || comparison == ALWAYS {
@@ -1541,21 +1548,37 @@ fn record_wait(this: This, address: u64, comparison: u32, reference: u64, mask: 
         let mut host = list.host.lock().unwrap_or_else(|e| e.into_inner());
         let mut segments = list.segments.lock().unwrap_or_else(|e| e.into_inner());
         let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
-        if list
-            .has_work
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
-            && let Some(prev) = host.take()
-        {
-            prev.close();
-            segments.push(Segment::List(prev.clone()));
-            match crate::host::host().and_then(|h| h.acquire_list().ok()) {
-                Some(new) => {
-                    let new = std::sync::Arc::new(new);
-                    state.reapply_host(&new, &prev);
-                    *host = Some(new);
-                }
-                None => {
-                    tracing::warn!("no new host list after mid-list wait split");
+        let splits = segments
+            .iter()
+            .filter(|s| matches!(s, Segment::List(_)))
+            .count();
+        if list.has_work.load(std::sync::atomic::Ordering::Acquire) {
+            if splits >= MAX_WAIT_SPLITS {
+                static CAPPED: std::sync::Once = std::sync::Once::new();
+                CAPPED.call_once(|| {
+                    tracing::warn!(
+                        cap = MAX_WAIT_SPLITS,
+                        "mid-list GPU memory wait split cap reached; skipping further splits"
+                    );
+                });
+                return;
+            }
+            if list
+                .has_work
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+                && let Some(prev) = host.take()
+            {
+                prev.close();
+                segments.push(Segment::List(prev.clone()));
+                match crate::host::host().and_then(|h| h.acquire_list().ok()) {
+                    Some(new) => {
+                        let new = std::sync::Arc::new(new);
+                        state.reapply_host(&new, &prev);
+                        *host = Some(new);
+                    }
+                    None => {
+                        tracing::warn!("no new host list after mid-list wait split");
+                    }
                 }
             }
         }
