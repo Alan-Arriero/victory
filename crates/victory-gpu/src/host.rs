@@ -1817,6 +1817,7 @@ impl HostList {
         src: *const u8,
         len: usize,
     ) {
+        self.mark_work();
         let mut d = self.deferred();
         // Every draw or dispatch that binds the slot asks; until a title
         // copy intervenes another fill would copy the same bytes again.
