@@ -13,8 +13,11 @@ starting. Keep each PR focused and link the relevant issue.
 
 ## Run a small check
 
-Follow the build prerequisites in the [README](README.md). From a clone of
-your fork, run the checks that apply to your change:
+Follow the build prerequisites in the [README](README.md). On x86-64 Linux,
+`nix develop` or `nix-shell` supplies the pinned Rust toolchain, native build
+tools and Windows cross-compiler; see the
+[Linux guide](docs/linux-proton.md#development-with-nix).
+From a clone of your fork, run the checks that apply to your change:
 
 ```powershell
 cargo xtask install-hooks
