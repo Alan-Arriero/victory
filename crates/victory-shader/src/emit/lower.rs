@@ -469,7 +469,7 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
+            let is_console_lane_op = |i: &Inst| {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
@@ -480,9 +480,10 @@ impl<'a> Lower<'a> {
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
                     || numeric_selects && numeric_select(x.st, i)
-            }) || {
-                // Masks held as numbers or constant lane sets: the lane
-                // tests its own bit by its console lane.
+            };
+            // Masks held as numbers or constant lane sets: the lane
+            // tests its own bit by its console lane.
+            let masks_held = {
                 let whens = x.st.exits.iter().filter_map(|e| match *e {
                     LaneExit::Branch { when, .. } => Some(when),
                     _ => None,
@@ -504,9 +505,24 @@ impl<'a> Lower<'a> {
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
             };
+            console_lanes = insts().any(is_console_lane_op) || masks_held;
             let wave = if x.native.wave64 { 64 } else { 32 };
-            let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            let threads = cs.threads.iter().product::<u32>();
+            let one_wave = threads <= wave;
+            // A wave64 compute group of at most 32 threads has no upper-half
+            // threads. When whole-wave Active reductions are its only
+            // console-wave requirement (no LDS, no held masks, and no
+            // non-section cross-lane/mask-data ops), lowering it with
+            // WaveSize(32) matches the 64-lane reduction identically on 32-lane
+            // hosts (`thread_id()` reads `s.wave_size = 32`).
+            let one_wave32 = x.native.wave64
+                && (1..=32).contains(&threads)
+                && s.lds_dwords == 0
+                && !masks_held
+                && super::wave::single_wave32_reductions(p, |i| !is_console_lane_op(i));
+            if one_wave32 {
+                s.wave_size = Some(32);
+            } else if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
         }
@@ -9195,5 +9211,276 @@ mod select_tests {
             v.validate(&mut shader.dxil)
                 .expect("structured scalar SRV load DXIL must validate");
         }
+    }
+}
+
+#[cfg(test)]
+mod wave_size_tests {
+    use super::super::emit;
+    use crate::native::{ComputeIo, RootParam};
+    use crate::{Container, FourCC, HwStage, NativeProgram, ResourceType, RootType, UsedResource};
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// Assembles a wave64 compute program with one raw UAV table at `s0`,
+    /// lowers it, validates DXIL when `dxil.dll` is present, and returns the
+    /// lowered `HostShader` along with its `PSV0` `(min, max)` wave size.
+    fn compile_wave64_cs(
+        words: &[u32],
+        threads: [u32; 3],
+        rsrc2_extra: u32,
+    ) -> (super::super::HostShader, (u32, u32)) {
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: crate::native::StageIo::Cs(ComputeIo {
+                rsrc2: (2 << 1) | rsrc2_extra,
+                threads,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let container = crate::dxbc::build(&[]);
+        let c = Container::parse(&container).unwrap();
+        let p = crate::ir::build(&native.code, true, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let shader = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut shader.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+        let emitted = Container::parse(&shader.dxil).unwrap();
+        let sfi0 = u64::from_le_bytes(emitted.part(FourCC::SFI0).unwrap().data.try_into().unwrap());
+        assert_ne!(sfi0 & 0x4000, 0, "expected WAVE_OPS feature bit");
+        let psv = emitted.part(FourCC::PSV0).unwrap().data;
+        let min_wave = u32::from_le_bytes(psv[20..24].try_into().unwrap());
+        let max_wave = u32::from_le_bytes(psv[24..28].try_into().unwrap());
+        let psv_threads = [
+            u32::from_le_bytes(psv[40..44].try_into().unwrap()),
+            u32::from_le_bytes(psv[44..48].try_into().unwrap()),
+            u32::from_le_bytes(psv[48..52].try_into().unwrap()),
+        ];
+        assert_eq!(psv_threads, threads);
+        (shader, (min_wave, max_wave))
+    }
+
+    /// Wave64 compute program that computes `v7` from `v0` (or `v1, v0`),
+    /// runs `extra_before`, executes a whole-wave sum reduction of `v7` into
+    /// `v4`, and stores `v4` to `out[flat_tid]`.
+    fn wave64_sum_cs_words(setup_2d: bool, extra_before: &[u32], extra_after: &[u32]) -> Vec<u32> {
+        let mut words = vec![
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF408_0200,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[0:1], null
+        ];
+        if setup_2d {
+            words.extend([
+                0x340E_0283, // v_lshlrev_b32_e32 v7, 3, v1
+                0x4A0E_0107, // v_add_nc_u32_e32 v7, v7, v0
+                0x340C_0E82, // v_lshlrev_b32_e32 v6, 2, v7
+                0x4A0E_0E81, // v_add_nc_u32_e32 v7, 1, v7
+            ]);
+        } else {
+            words.extend([
+                0x340C_0082, // v_lshlrev_b32_e32 v6, 2, v0
+                0x4A0E_0081, // v_add_nc_u32_e32 v7, 1, v0
+            ]);
+        }
+        words.extend_from_slice(extra_before);
+        words.extend([
+            0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+            0xD501_0001,
+            0x0002_0E80, // v_cndmask_b32_e64 v1, 0, v7, s[0:1]
+            0x4A02_02FA,
+            0xFF01_6101, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:1
+            0x4A02_02FA,
+            0xFF01_6201, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:2
+            0x4A02_02FA,
+            0xFF01_6401, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:4
+            0x4A02_02FA,
+            0xFF01_6801, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:8
+            0xD777_0002,
+            0x0305_8301, // v_permlane16_b32 v2, v1, -1, -1
+            0xD778_0003,
+            0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1
+            0x4A08_0702, // v_add_nc_u32_e32 v4, v2, v3
+            0xD760_0002,
+            0x0001_3F04, // v_readlane_b32 s2, v4, 31
+            0xD760_0003,
+            0x0001_7F04, // v_readlane_b32 s3, v4, 63
+            0x7E0A_0203, // v_mov_b32_e32 v5, s3
+            0x4A08_0A02, // v_add_nc_u32_e32 v4, s2, v5
+            0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+            0xE070_1000,
+            0x8002_0406, // buffer_store_dword v4, v6, s[8:11], 0 offen
+        ]);
+        words.extend_from_slice(extra_after);
+        words.push(S_ENDPGM);
+        words
+    }
+
+    #[cfg(windows)]
+    fn run_cs_uav(shader: &super::super::HostShader, dwords: u32) -> Vec<(&'static str, Vec<u32>)> {
+        use super::super::host::{Dispatch, Host, Root, View};
+        use windows::Win32::Graphics::Direct3D12::*;
+        let _one = super::super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            let mut opts1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: querying D3D12_FEATURE_D3D12_OPTIONS1 into a zeroed struct.
+            let supported = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut opts1).cast(),
+                    size_of_val(&opts1) as u32,
+                )
+            }
+            .is_ok()
+                && opts1.WaveOps.as_bool()
+                && (opts1.WaveLaneCountMin..=opts1.WaveLaneCountMax).contains(&32);
+            if !supported {
+                // WARP reports WaveLaneCountMin/Max = 4, so fixed WaveSize(32)
+                // pipelines are only executable on hardware Wave32 devices.
+                eprintln!(
+                    "{label}: skipped WaveSize(32) execution (device supports {}..{})",
+                    opts1.WaveLaneCountMin, opts1.WaveLaneCountMax
+                );
+                continue;
+            }
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let res = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(dwords)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            out.push((label, res[0].clone()));
+        }
+        out
+    }
+
+    #[test]
+    fn small_wave64_whole_wave_reduction_emits_wave32_and_runs() {
+        for (threads, setup_2d, rsrc2_extra, expected_sum) in [
+            ([1, 1, 1], false, 0, 1),
+            ([32, 1, 1], false, 0, 32 * 33 / 2),
+            ([16, 1, 1], false, 0, 16 * 17 / 2),
+            ([8, 4, 1], true, 1 << 11, 32 * 33 / 2),
+        ] {
+            let words = wave64_sum_cs_words(setup_2d, &[], &[]);
+            let (shader, wave_bounds) = compile_wave64_cs(&words, threads, rsrc2_extra);
+            let _ = &shader;
+            assert_eq!(wave_bounds, (32, 32), "threads={threads:?}");
+            #[cfg(windows)]
+            {
+                let count = threads.iter().product::<u32>();
+                for (label, data) in run_cs_uav(&shader, count) {
+                    assert_eq!(
+                        data,
+                        vec![expected_sum; count as usize],
+                        "{label} threads={threads:?}"
+                    );
+                }
+            }
+        }
+
+        // Divergent control flow (`if (tid < 8)`) around the whole-wave
+        // reduction still lowers with WaveSize(32) and computes 1+...+8 = 36.
+        let body = wave64_sum_cs_words(false, &[], &[]);
+        let sec_start = body.iter().position(|&w| w == 0xBE80_25C1).unwrap();
+        let section_and_store = &body[sec_start..body.len() - 1];
+        let mut divergent = body[..sec_start].to_vec();
+        divergent.extend([
+            0x7D88_0088,                                  // v_cmp_gt_u32_e32 vcc, 8, v0
+            0xBE84_246A,                                  // s_and_saveexec_b64 s[4:5], vcc
+            0xBF88_0000 | section_and_store.len() as u32, // s_cbranch_execz -> restore
+        ]);
+        divergent.extend_from_slice(section_and_store);
+        divergent.extend([
+            0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+            S_ENDPGM,
+        ]);
+        let (shader, wave_bounds) = compile_wave64_cs(&divergent, [32, 1, 1], 0);
+        let _ = &shader;
+        assert_eq!(wave_bounds, (32, 32));
+        #[cfg(windows)]
+        for (label, data) in run_cs_uav(&shader, 32) {
+            let want: Vec<u32> = (0..32).map(|i| if i < 8 { 36 } else { 0 }).collect();
+            assert_eq!(data, want, "{label} divergent");
+        }
+    }
+
+    #[test]
+    fn large_group_and_lds_and_disallowed_wave64_reductions_keep_wave64() {
+        let base = wave64_sum_cs_words(false, &[], &[]);
+
+        // Groups larger than 32 threads ([33, 1, 1], [64, 1, 1]) keep WaveSize(64).
+        for threads in [[33, 1, 1], [64, 1, 1]] {
+            let (_, bounds) = compile_wave64_cs(&base, threads, 0);
+            assert_eq!(bounds, (64, 64), "threads={threads:?}");
+        }
+
+        // [32, 1, 1] with LDS keeps WaveSize(64).
+        let (_, bounds) = compile_wave64_cs(&base, [32, 1, 1], 1 << 15);
+        assert_eq!(bounds, (64, 64));
+
+        // [32, 1, 1] with outside-section DPP, v_mbcnt, reads_mask_as_data, or
+        // numeric_select keeps WaveSize(64).
+        for outside_op in [
+            &[0x4A0E_0EFA, 0xFF01_6107][..], // v_add_nc_u32_dpp v7, v7, v7 row_xmask:1
+            &[0xD765_0007, 0x0001_00C1][..], // v_mbcnt_lo_u32_b32 v7, -1, 0
+            &[0x7D88_0088, 0xBE84_106A, 0x4A0E_0E04][..], // v_cmp + s_bcnt1 vcc + v_add
+            &[0xBE84_038F, 0xBE85_0380, 0xD501_0007, 0x0012_0E81][..], // untracked v_cndmask
+        ] {
+            let words = wave64_sum_cs_words(false, outside_op, &[]);
+            let (_, bounds) = compile_wave64_cs(&words, [32, 1, 1], 0);
+            assert_eq!(bounds, (64, 64), "outside_op={outside_op:#x?}");
+        }
+
+        // [32, 1, 1] with a held constant mask (`masks_held`) keeps WaveSize(64).
+        let held = wave64_sum_cs_words(
+            false,
+            &[0xBE86_24FF, 0x0000_1234], // s_and_saveexec_b64 s[6:7], 0x1234
+            &[0xBEFE_0406],              // s_mov_b64 exec, s[6:7]
+        );
+        let (_, bounds) = compile_wave64_cs(&held, [32, 1, 1], 0);
+        assert_eq!(bounds, (64, 64));
     }
 }
