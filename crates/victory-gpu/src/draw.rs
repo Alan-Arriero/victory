@@ -134,9 +134,11 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (title heap, descriptor records) →
-    /// first dynamic slot.
-    fresh_tables: std::collections::HashMap<(usize, Vec<[u32; 3]>), u32>,
+    /// Tables made afresh in this list: `(title heap, slot count, records hash)`
+    /// → `(recorded table base, recorded start slot, first dynamic slot)`.
+    /// Hits are verified by re-reading the range and checking view liveness so
+    /// no per-table record vector is allocated or retained.
+    fresh_tables: std::collections::HashMap<(usize, u32, u64), (u64, u32, u32)>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -1078,13 +1080,23 @@ impl State {
                 .chain(table_aliases.iter().map(|a| a.entry))
                 .max()
                 .unwrap_or(0);
-            // Guarantee `first >= host.count() >= start_slot` so `first - start_slot`
-            // cannot underflow when a host heap is capped below `min_slot`.
+            // `UsedResource.table_offset_dwords` records the base of each static
+            // descriptor or dynamic array range in this table; translated shaders
+            // only add non-negative dynamic offsets (`lower.rs::heap_index`), so
+            // they never index below `min_slot`. Guarantee `first >= host.count()
+            // >= start_slot` so `first - start_slot` cannot underflow when a host
+            // heap is capped below `min_slot`.
             let start_slot = if host.count() >= min_slot {
                 min_slot
             } else {
                 0
             };
+            debug_assert!(
+                entries
+                    .iter()
+                    .all(|u| u.table_offset_dwords / step_dwords >= start_slot),
+                "table entry offset below start_slot"
+            );
             let n = max_slot - start_slot + 1;
             let last = u64::from(max_slot)
                 .checked_mul(step_bytes)
@@ -1095,45 +1107,88 @@ impl State {
                 }
                 continue;
             }
-            // The host heap and the exact descriptor records held by `start_slot..=max_slot`.
-            let heap_ptr = std::ptr::from_ref(heap) as usize;
-            let mut records = Vec::with_capacity(n as usize);
-            for k in start_slot..=max_slot {
-                let at = table + u64::from(k) * step_bytes;
-                // SAFETY: views are 32 bytes and samplers are 16 bytes, so `[u32; 3]`
-                // (12 bytes) fits safely inside every in-bounds slot in title memory.
-                records.push(unsafe { (at as *const [u32; 3]).read_unaligned() });
+            // Reject impossible table sizes before hashing/scanning the range
+            // (checks total dynamic capacity, not current free space, so valid
+            // cache hits still succeed when the dynamic region is full).
+            if n > host.dynamic_capacity() {
+                self.table_failed = true;
+                continue;
             }
-            let key = (heap_ptr, records);
+            // Stream the exact descriptor records in `start_slot..=max_slot` into
+            // a hash with no allocation; hits verify word-for-word equality and
+            // view liveness before reusing the compiled range.
+            let heap_ptr = std::ptr::from_ref(heap) as usize;
+            let records_hash = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                for k in start_slot..=max_slot {
+                    let at = table + u64::from(k) * step_bytes;
+                    // SAFETY: views are 32 bytes and samplers are 16 bytes, so `[u32; 3]`
+                    // (12 bytes) fits safely inside every in-bounds slot in title memory.
+                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                }
+                for alias in &table_aliases {
+                    (alias.entry - start_slot, alias.stride).hash(&mut h);
+                }
+                h.finish()
+            };
+            let key = (heap_ptr, n, records_hash);
             let offset_for = |first: u32| {
                 first
                     .checked_sub(start_slot)
                     .and_then(|base| base.checked_mul(step_bytes as u32))
             };
-            if let Some(&first) = self.fresh_tables.get(&key) {
-                let Some(byte_offset) = offset_for(first) else {
-                    self.table_failed = true;
-                    continue;
-                };
-                for alias in &table_aliases {
-                    if !entries.iter().any(|u| {
-                        u.kind != ResourceType::Cbv
-                            && u.table_offset_dwords / step_dwords == alias.entry
-                    }) {
-                        let _ = host.refresh_slot(first + (alias.entry - start_slot), list);
-                    }
-                }
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
-                    let index = first + u.table_offset_dwords / 8;
-                    if !host.refresh_slot(index, list) {
-                        let handle = table + u64::from(u.table_offset_dwords) * 4;
-                        if let Some(view) = crate::descriptor::view(handle) {
-                            self.depth_sampled |= readable(list, u, &view, read_only_depth);
+            if let Some(&(prev_table, prev_start, first)) = self.fresh_tables.get(&key) {
+                let mut reuse_ok = true;
+                for i in 0..n {
+                    let at = table + u64::from(start_slot + i) * step_bytes;
+                    // SAFETY: verified in-bounds of `heap` above.
+                    let raw = unsafe { (at as *const [u32; 3]).read_unaligned() };
+                    if prev_table != table || prev_start != start_slot {
+                        let prev_at = prev_table + u64::from(prev_start + i) * step_bytes;
+                        // SAFETY: `prev_table` + `prev_start + i` was verified
+                        // in-bounds of the same live `heap` when recorded.
+                        let prev_raw = unsafe { (prev_at as *const [u32; 3]).read_unaligned() };
+                        if raw != prev_raw {
+                            reuse_ok = false;
+                            break;
                         }
                     }
+                    // If a resource was released via `descriptor::forget`, its raw
+                    // handle words stay in title memory while `view(at)` becomes
+                    // `None`; treat that as a miss so a fresh range is built.
+                    if raw[0] == crate::descriptor::VIEW_TAG
+                        && crate::descriptor::view(at).is_none()
+                    {
+                        reuse_ok = false;
+                        break;
+                    }
                 }
-                made.push((slot, byte_offset));
-                continue;
+                if reuse_ok {
+                    let Some(byte_offset) = offset_for(first) else {
+                        self.table_failed = true;
+                        continue;
+                    };
+                    for alias in &table_aliases {
+                        if !entries.iter().any(|u| {
+                            u.kind != ResourceType::Cbv
+                                && u.table_offset_dwords / step_dwords == alias.entry
+                        }) {
+                            let _ = host.refresh_slot(first + (alias.entry - start_slot), list);
+                        }
+                    }
+                    for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                        let dyn_index = first + (u.table_offset_dwords / step_dwords - start_slot);
+                        if !host.refresh_slot(dyn_index, list) {
+                            let handle = table + u64::from(u.table_offset_dwords) * 4;
+                            if let Some(view) = crate::descriptor::view(handle) {
+                                self.depth_sampled |= readable(list, u, &view, read_only_depth);
+                            }
+                        }
+                    }
+                    made.push((slot, byte_offset));
+                    continue;
+                }
             }
             let Some(first) = host.dynamic(n) else {
                 // Without its fresh table the shader would read the title's
@@ -1149,18 +1204,20 @@ impl State {
                 self.table_failed = true;
                 continue;
             };
-            self.fresh_tables.insert(key, first);
-            self.dynamic.push((heap_ptr, first, n));
-            // The whole compact range: a shader may index entries between
-            // `start_slot` and `max_slot` not listed in `entries` (descriptor arrays).
+            // Compile the whole compact range before publishing it in
+            // `fresh_tables` / `dynamic`: a shader may index entries between
+            // `start_slot` and `max_slot` not listed in `entries` (descriptor
+            // arrays), and a transient `list.scratch` failure must not leave a
+            // partial range cached for subsequent draws.
+            let mut complete = true;
             for k in start_slot..=max_slot {
                 let index = first + (k - start_slot);
                 let at = table + u64::from(k) * step_bytes;
                 match crate::descriptor::view(at) {
                     Some(View::Constant(address, size)) if address != 0 => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.make_null(index);
-                            continue;
+                            complete = false;
+                            break;
                         };
                         list.defer_fill(to, address as *const u8, size as usize);
                         host.constant_at(index, gpu, size);
@@ -1172,14 +1229,7 @@ impl State {
                         if !aliased {
                             host.make_at(index, &view);
                         }
-                        if !host.refresh_slot(index, list) {
-                            for u in entries
-                                .iter()
-                                .filter(|u| u.table_offset_dwords / step_dwords == k)
-                            {
-                                self.depth_sampled |= readable(list, u, &view, read_only_depth);
-                            }
-                        }
+                        let _ = host.refresh_slot(index, list);
                     }
                     None => {
                         host.make_null(index);
@@ -1192,6 +1242,21 @@ impl State {
                     }
                 }
             }
+            if !complete {
+                host.release(first, n);
+                self.table_failed = true;
+                continue;
+            }
+            for u in &entries {
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                if let Some(view) = crate::descriptor::view(handle)
+                    && !matches!(view, View::Constant(..))
+                {
+                    self.depth_sampled |= readable(list, u, &view, read_only_depth);
+                }
+            }
+            self.fresh_tables.insert(key, (table, start_slot, first));
+            self.dynamic.push((heap_ptr, first, n));
             made.push((slot, byte_offset));
         }
         made
@@ -1925,16 +1990,16 @@ mod depth_tests {
             ),
             crate::object::S_OK
         );
-        let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_FLOAT,
-            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                Texture2D: D3D12_TEX2D_SRV {
-                    MipLevels: 1,
-                    ..Default::default()
-                },
-            },
+        // SAFETY: every field of `D3D12_SHADER_RESOURCE_VIEW_DESC` is an
+        // integer, float, or enum newtype; zeroing initializes padding and
+        // unused union tail bytes before `create_srv` reads it as `[u32; 10]`.
+        let mut srv_desc: D3D12_SHADER_RESOURCE_VIEW_DESC = unsafe { std::mem::zeroed() };
+        srv_desc.Format = DXGI_FORMAT_R32_FLOAT;
+        srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv_desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+            MipLevels: 1,
+            ..Default::default()
         };
         let srv = crate::descriptor::heap(views).start;
         crate::descriptor::create_srv(null, depth, (&raw const srv_desc).cast(), srv);
@@ -2549,16 +2614,16 @@ mod table_tests {
             D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
             D3D12_RESOURCE_STATE_DEPTH_WRITE,
         );
-        let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_FLOAT,
-            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                Texture2D: D3D12_TEX2D_SRV {
-                    MipLevels: 1,
-                    ..Default::default()
-                },
-            },
+        // SAFETY: every field of `D3D12_SHADER_RESOURCE_VIEW_DESC` is an
+        // integer, float, or enum newtype; zeroing initializes padding and
+        // unused union tail bytes before `create_srv` reads it as `[u32; 10]`.
+        let mut srv_desc: D3D12_SHADER_RESOURCE_VIEW_DESC = unsafe { std::mem::zeroed() };
+        srv_desc.Format = DXGI_FORMAT_R32_FLOAT;
+        srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv_desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+            MipLevels: 1,
+            ..Default::default()
         };
         let dsv_desc = [
             DXGI_FORMAT_D32_FLOAT.0 as u32,
@@ -2877,16 +2942,15 @@ mod table_tests {
         let dsv = dsv_slot.as_mut_ptr() as u64;
         crate::descriptor::create_dsv(std::ptr::null(), depth.0, &dsv_desc, dsv);
 
-        let depth_srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_FLOAT,
-            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                Texture2D: D3D12_TEX2D_SRV {
-                    MipLevels: 1,
-                    ..Default::default()
-                },
-            },
+        // SAFETY: zero-initialize padding and unused union tail bytes before
+        // `create_srv` reads the description as `[u32; 10]`.
+        let mut depth_srv_desc: D3D12_SHADER_RESOURCE_VIEW_DESC = unsafe { std::mem::zeroed() };
+        depth_srv_desc.Format = DXGI_FORMAT_R32_FLOAT;
+        depth_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        depth_srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        depth_srv_desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+            MipLevels: 1,
+            ..Default::default()
         };
 
         let views = create_title_heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 64);
@@ -2938,6 +3002,87 @@ mod table_tests {
 
         list.close();
         host.execute(&[&list]);
+    }
+
+    #[test]
+    fn released_view_invalidates_cached_fresh_table_and_rebuilds_fresh_range() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let tex = create_title_texture(
+            4,
+            4,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+        );
+        let views = create_title_heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 64);
+        let view_heap = crate::descriptor::heap(views.0);
+        let table = view_heap.start;
+        crate::descriptor::create_srv(std::ptr::null(), tex.0, std::ptr::null(), table);
+
+        let list = host.new_list().expect("liveness list");
+        let mut state = State::default();
+        state.set_heaps(&[views.0]);
+        state.set_table(false, 0, table);
+        let used = [used_table(ResourceType::Srv, 0, 0, 8)];
+
+        let made1 = state.tables(&list, &used, false);
+        assert!(!state.table_failed);
+        assert_eq!(state.dynamic.len(), 1);
+        let first1 = state.dynamic[0].1;
+        assert_eq!(made1, vec![(0, first1 * 32)]);
+
+        // Release the title texture: its raw handle words stay in `table`, but
+        // `descriptor::forget` bumped the view's generation so the cached range
+        // must not be reused.
+        drop(tex);
+        let made2 = state.tables(&list, &used, false);
+        assert!(!state.table_failed);
+        assert_eq!(
+            state.dynamic.len(),
+            2,
+            "stale released view must trigger a fresh allocation while keeping the earlier range"
+        );
+        let first2 = state.dynamic[1].1;
+        assert_ne!(first2, first1);
+        assert_eq!(made2, vec![(0, first2 * 32)]);
+
+        list.close();
+        host.execute(&[&list]);
+    }
+
+    #[test]
+    fn oversized_table_exceeding_dynamic_capacity_fails_before_allocating() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        // A capped sampler heap has 256 dynamic slots (`SAMPLER_DYNAMIC`) and
+        // `host.count() == 1792`. A fresh table starting past `host.count()`
+        // whose span exceeds `dynamic_capacity()` must be rejected cleanly
+        // before hashing or allocating.
+        let samplers = create_title_heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 4096);
+        let sampler_heap = crate::descriptor::heap(samplers.0);
+        let sampler_host = sampler_heap.host().expect("host sampler heap");
+        let cap = sampler_host.dynamic_capacity();
+        assert!(cap > 0);
+        let base_slot = sampler_host.count() + 8;
+        let table = sampler_heap.start + u64::from(base_slot) * 16;
+
+        let list = host.new_list().expect("oversized list");
+        let mut state = State::default();
+        state.set_heaps(&[std::ptr::null(), samplers.0]);
+        state.set_table(false, 0, table);
+        // Span `0..=cap` has `n = cap + 1 > dynamic_capacity()`.
+        let used = [
+            used_table(ResourceType::Sampler, 0, 0, 0),
+            used_table(ResourceType::Sampler, 0, 1, cap * 4),
+        ];
+        let made = state.tables(&list, &used, false);
+        assert!(state.table_failed);
+        assert!(made.is_empty());
+        assert!(state.fresh_tables.is_empty());
+        assert!(state.dynamic.is_empty());
     }
 }
 
