@@ -7,7 +7,9 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    DXGI_STATUS_OCCLUDED, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -15,7 +17,7 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{Interface, PCWSTR, w};
+use windows::core::{HRESULT, Interface, PCWSTR, w};
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -2230,6 +2232,13 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    last_present_issue: Option<HRESULT>,
+}
+
+/// A successful DXGI status may still mean nothing was presented.
+fn present_result(status: HRESULT) -> windows::core::Result<bool> {
+    status.ok()?;
+    Ok(status != DXGI_STATUS_OCCLUDED)
 }
 
 impl Presenter {
@@ -2386,7 +2395,8 @@ impl Meter {
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
+    /// shown or the diagnostic probe has no reading. Otherwise diagnostics
+    /// builds report whether the sampled pixels were black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
@@ -2475,10 +2485,36 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            match present_result(status) {
+                Ok(false) => {
+                    if p.last_present_issue.replace(status) != Some(status) {
+                        tracing::info!(frame, "DXGI reports the window is occluded");
+                    }
+                    return None;
+                }
+                Ok(true) => {
+                    if p.last_present_issue.take().is_some() {
+                        tracing::info!(frame, "DXGI resumed presenting frames");
+                    }
+                }
+                Err(error) => {
+                    if self.device.GetDeviceRemovedReason().is_err() {
+                        fail(format_args!(
+                            "host GPU device removed during Present: {error}{}{}",
+                            self.removal_data(&[&p.copy]),
+                            last_notes(&[&p.copy])
+                        ));
+                    }
+                    if p.last_present_issue.replace(status) != Some(status) {
+                        tracing::warn!(%error, frame, "swap chain present failed");
+                    }
+                    return None;
+                }
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
-            return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+            return probe.and_then(|b| crate::capture::black(&b));
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }
@@ -2525,6 +2561,7 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                last_present_issue: None,
             };
             p.sync_color_space(display_hdr_info().is_some());
             Ok(p)
@@ -2936,6 +2973,18 @@ fn pick_hardware_adapter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn present_result_distinguishes_occlusion_from_success_and_failure() {
+        assert!(present_result(HRESULT(0)).unwrap());
+        assert!(!present_result(DXGI_STATUS_OCCLUDED).unwrap());
+        assert_eq!(
+            present_result(DXGI_ERROR_DEVICE_REMOVED)
+                .unwrap_err()
+                .code(),
+            DXGI_ERROR_DEVICE_REMOVED
+        );
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {

@@ -639,12 +639,12 @@ pub(crate) fn probe(
 }
 
 /// Whether every pixel [`probe`] read is (near) black.
-pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
+pub(crate) fn black(buffer: &ID3D12Resource) -> Option<bool> {
     let mut data = std::ptr::null_mut();
     // SAFETY: the copies finished (every submission is waited for).
     unsafe {
         if buffer.Map(0, None, Some(&mut data)).is_err() {
-            return false;
+            return None;
         }
         let bytes =
             std::slice::from_raw_parts(data.cast::<u8>(), (SLOT * u64::from(GRID * GRID)) as usize);
@@ -659,7 +659,7 @@ pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
             levels.pop_front();
         }
         levels.push_back(level);
-        level < 8
+        Some(level < 8)
     }
 }
 

@@ -350,7 +350,7 @@ fn show(resource: Option<object::Held>) {
             drawn,
             dispatches,
             dispatched,
-            "frame presented (since the last line: draws and dispatches, and those run on the host)"
+            "title requested a present (draws and dispatches since the last report)"
         );
         #[cfg(windows)]
         if frame >= 256 {
@@ -387,8 +387,11 @@ fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
     static LAST: std::sync::Mutex<(bool, u64, u64)> = std::sync::Mutex::new((false, 0, 0));
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
     let drawn = crate::draw::drawn();
-    let black = shown.unwrap_or(false);
     let draws = crate::draw::take_frame();
+    let Some(black) = shown else {
+        last.1 = drawn;
+        return;
+    };
     if black && !last.0 {
         last.2 += 1;
         tracing::warn!(
@@ -396,10 +399,9 @@ fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
             resource = ?resource,
             state = format_args!("{state:#x}"),
             draws = drawn - last.1,
-            copied = shown.is_some(),
             black_frames = last.2,
             levels = ?crate::capture::recent_levels(),
-            "a black frame after a frame that was not"
+            "frame probe entered a run of black samples"
         );
         for d in draws {
             tracing::warn!("black frame {frame}: {d}");
