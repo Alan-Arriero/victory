@@ -254,6 +254,9 @@ impl State {
     /// Takes the dynamic descriptor slots held by this recording, so a
     /// pending host list can keep them alive until its submission finishes.
     pub(crate) fn take_dynamic(&mut self) -> Vec<(usize, u32, u32)> {
+        // A following segment must acquire its own slots before recording a bind.
+        self.fresh_tables.clear();
+        self.root_srv_slots.clear();
         std::mem::take(&mut self.dynamic)
     }
 
@@ -304,7 +307,6 @@ impl State {
     /// mid-list wait split, moving dynamic descriptor slots onto `prev_list`
     /// so they stay alive until its submission finishes.
     pub(crate) fn reapply_host(&mut self, new_list: &HostList, prev_list: &HostList) {
-        self.fresh_tables.clear();
         prev_list.keep_dynamic(self.take_dynamic());
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
@@ -1780,6 +1782,20 @@ fn rect_source(first: u32, count: u32, stride: u32, size: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{expanded_vertices, rect_source};
+
+    #[test]
+    fn bounded_root_slots_belong_to_the_recording_that_allocated_them() {
+        let mut state = super::State::default();
+        let heap = 1;
+        state.fresh_tables.insert((10, 11), 4);
+        state.root_srv_slots.insert((heap, None), 5);
+        state.dynamic.extend([(heap, 4, 1), (heap, 5, 1)]);
+
+        assert_eq!(state.take_dynamic(), [(heap, 4, 1), (heap, 5, 1)]);
+        assert!(state.fresh_tables.is_empty());
+        assert!(state.root_srv_slots.is_empty());
+        assert!(state.take_dynamic().is_empty());
+    }
 
     #[test]
     fn rectangle_vertices_inside_their_buffer() {
