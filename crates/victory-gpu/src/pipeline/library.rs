@@ -149,6 +149,25 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+/// Exact library names from the host pipeline trace. Names describe both
+/// translated stages and fixed-function state, so a shader shared with a
+/// different pipeline can still be used there.
+fn excluded_names(value: &str) -> HashSet<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .filter_map(|id| {
+            if id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                Some(id.to_ascii_lowercase())
+            } else {
+                tracing::warn!(id, "VICTORY_SKIP_HOST_PSOS expects 32-digit pipeline names");
+                None
+            }
+        })
+        .collect()
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
@@ -156,6 +175,24 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    static EXCLUDED: OnceLock<HashSet<String>> = OnceLock::new();
+    let excluded = EXCLUDED.get_or_init(|| {
+        excluded_names(&std::env::var("VICTORY_SKIP_HOST_PSOS").unwrap_or_default())
+    });
+    if excluded.contains(name) {
+        tracing::warn!(name, "skipping configured host pipeline");
+        return Err(windows::Win32::Foundation::E_ABORT.into());
+    }
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    if *TRACE.get_or_init(|| crate::switch::on("VICTORY_TRACE_PIPELINES")) {
+        // SAFETY: queries the calling thread without accessing caller memory.
+        let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+        tracing::info!(
+            tid = format_args!("{tid:04x}"),
+            name,
+            "loading or compiling host pipeline"
+        );
+    }
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
@@ -317,6 +354,48 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    #[test]
+    fn excluded_names_match_whole_host_descriptions() {
+        let a = name("mesh", b"root", &[b"ms", b"ps"], "one");
+        let b = name("mesh", b"root", &[b"ms", b"ps"], "two");
+        let value = format!(" , {},{}, {}, x", a.to_uppercase(), &b[..16], a);
+        assert_eq!(excluded_names(&value), HashSet::from([a]));
+        assert!(excluded_names("").is_empty());
+    }
+
+    #[test]
+    fn an_excluded_pipeline_skips_both_driver_calls() {
+        // The process reads the setting once. Use a child so other tests can
+        // exercise the normal path in the same suite.
+        let key = name("mesh", b"root", &[b"ms", b"ps"], "test");
+        if std::env::var("VICTORY_SKIP_HOST_PSOS").as_deref() != Ok(&key) {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pipeline::library::tests::an_excluded_pipeline_skips_both_driver_calls",
+                ])
+                .env("VICTORY_SKIP_HOST_PSOS", &key)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+            return;
+        }
+        let result = pipeline(
+            &key,
+            |_, _| panic!("library touched"),
+            || panic!("driver called"),
+        );
+        assert_eq!(
+            result.unwrap_err().code(),
+            windows::Win32::Foundation::E_ABORT
+        );
     }
 
     #[test]
