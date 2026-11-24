@@ -73,20 +73,29 @@ enum Stop {
 
 const UNTRACKED_SELECT: Why = "a select on an untracked mask";
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    match lower_program(parts, false) {
+    lower_with_wave32(parts, true)
+}
+
+pub(crate) fn lower_with_wave32(parts: &Parts, allow_wave32: bool) -> Result<Lowered, ShaderError> {
+    match lower_program(parts, false, allow_wave32) {
         Err(ShaderError::Unsupported {
             what: UNTRACKED_SELECT,
             ..
-        }) if parts.native.stage == HwStage::Cs => lower_program(parts, true),
+        }) if parts.native.stage == HwStage::Cs => lower_program(parts, true, allow_wave32),
         result => result,
     }
 }
 
-fn lower_program(parts: &Parts, numeric_selects: bool) -> Result<Lowered, ShaderError> {
+fn lower_program(
+    parts: &Parts,
+    numeric_selects: bool,
+    allow_wave32: bool,
+) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, numeric_selects).run() {
+        match Lower::new(parts, &bad, numeric_selects, allow_wave32).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -446,7 +455,12 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, numeric_selects: bool) -> Self {
+    fn new(
+        x: &'a Parts<'a>,
+        bad: &'a HashMap<Value, Why>,
+        numeric_selects: bool,
+        allow_wave32: bool,
+    ) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -515,7 +529,8 @@ impl<'a> Lower<'a> {
             // non-section cross-lane/mask-data ops), lowering it with
             // WaveSize(32) matches the 64-lane reduction identically on 32-lane
             // hosts (`thread_id()` reads `s.wave_size = 32`).
-            let one_wave32 = x.native.wave64
+            let one_wave32 = allow_wave32
+                && x.native.wave64
                 && (1..=32).contains(&threads)
                 && s.lds_dwords == 0
                 && !masks_held
@@ -9216,7 +9231,7 @@ mod select_tests {
 
 #[cfg(test)]
 mod wave_size_tests {
-    use super::super::emit;
+    use super::super::{emit, emit_with_wave32};
     use crate::native::{ComputeIo, RootParam};
     use crate::{Container, FourCC, HwStage, NativeProgram, ResourceType, RootType, UsedResource};
 
@@ -9229,6 +9244,15 @@ mod wave_size_tests {
         words: &[u32],
         threads: [u32; 3],
         rsrc2_extra: u32,
+    ) -> (super::super::HostShader, (u32, u32)) {
+        compile_wave64_cs_mode(words, threads, rsrc2_extra, true)
+    }
+
+    fn compile_wave64_cs_mode(
+        words: &[u32],
+        threads: [u32; 3],
+        rsrc2_extra: u32,
+        allow_wave32: bool,
     ) -> (super::super::HostShader, (u32, u32)) {
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -9264,7 +9288,11 @@ mod wave_size_tests {
         let st = crate::structure::structure(&p).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
         let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-        let shader = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let shader = if allow_wave32 {
+            emit(&c, &native, &p, &st, &io, &res).unwrap()
+        } else {
+            emit_with_wave32(&c, &native, &p, &st, &io, &res, false).unwrap()
+        };
         #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
@@ -9481,6 +9509,11 @@ mod wave_size_tests {
             &[0xBEFE_0406],              // s_mov_b64 exec, s[6:7]
         );
         let (_, bounds) = compile_wave64_cs(&held, [32, 1, 1], 0);
+        assert_eq!(bounds, (64, 64));
+
+        // On adapters that only support 64-lane waves (`allow_wave32 = false`),
+        // an otherwise eligible <=32-thread reduction keeps WaveSize(64).
+        let (_, bounds) = compile_wave64_cs_mode(&base, [32, 1, 1], 0, false);
         assert_eq!(bounds, (64, 64));
     }
 }

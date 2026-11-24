@@ -662,6 +662,39 @@ impl Host {
         })
     }
 
+    /// Whether the host adapter accepts `WaveSize(32)` compute shaders; logged
+    /// once. Adapters that only support 64-lane waves (`WaveLaneCountMin == 64`)
+    /// return `false` so eligible <=32-thread Wave64 reductions keep `WaveSize(64)`.
+    pub(crate) fn supports_wave32(&self) -> bool {
+        static WAVE32: OnceLock<bool> = OnceLock::new();
+        *WAVE32.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: query writes its own `D3D12_FEATURE_DATA_D3D12_OPTIONS1` struct.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS1,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let wave32 = ok
+                && wave32_supported(
+                    options.WaveOps.as_bool(),
+                    options.WaveLaneCountMin,
+                    options.WaveLaneCountMax,
+                );
+            tracing::info!(
+                wave32,
+                min = options.WaveLaneCountMin,
+                max = options.WaveLaneCountMax,
+                "host wave32 support"
+            );
+            wave32
+        })
+    }
+
     /// A recycled host list (reset and open), or a new one when the pool is
     /// empty.
     pub(crate) fn acquire_list(&self) -> windows::core::Result<HostList> {
@@ -3172,5 +3205,25 @@ mod eager_gbv_tests {
             assert_ne!(after_guarded.PipelineStateCreateFlags.0 & preserved.0, 0);
             Ok(())
         }
+    }
+}
+
+/// Whether D3D12 wave-ops capabilities allow fixed `WaveSize(32)`.
+fn wave32_supported(wave_ops: bool, min: u32, max: u32) -> bool {
+    wave_ops && min <= 32 && max >= 32
+}
+
+#[cfg(test)]
+mod wave_tests {
+    use super::wave32_supported;
+
+    #[test]
+    fn wave32_support_matches_adapter_lane_range() {
+        assert!(wave32_supported(true, 32, 32)); // NVIDIA
+        assert!(wave32_supported(true, 32, 64)); // AMD RDNA
+        assert!(wave32_supported(true, 16, 32)); // Intel Xe/Arc
+        assert!(wave32_supported(true, 4, 128)); // WARP
+        assert!(!wave32_supported(true, 64, 64)); // Wave64-only (GCN/Vega)
+        assert!(!wave32_supported(false, 32, 32)); // No wave ops
     }
 }
