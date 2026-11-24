@@ -1070,11 +1070,7 @@ fn reading<'a>(this: *const Reading) -> &'a Reading {
     // SAFETY: a reading we handed out and the title still holds.
     unsafe { &*this }
 }
-extern "system" fn reading_query(
-    this: *const c_void,
-    iid: *const [u8; 16],
-    out: Out,
-) -> HRESULT {
+extern "system" fn reading_query(this: *const c_void, iid: *const [u8; 16], out: Out) -> HRESULT {
     query_iunknown(this.cast(), iid, out, reading_add_ref)
 }
 extern "system" fn reading_add_ref(this: *const Reading) -> u32 {

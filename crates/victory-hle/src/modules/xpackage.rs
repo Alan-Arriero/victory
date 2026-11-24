@@ -617,8 +617,7 @@ mod tests {
         );
         assert_ne!(token_val, 0);
 
-        type UnregisterProgress =
-            extern "system" fn(This, *const c_void, u64, bool) -> bool;
+        type UnregisterProgress = extern "system" fn(This, *const c_void, u64, bool) -> bool;
         assert!(method::<UnregisterProgress>(&OBJECT, 0x50)(
             this,
             monitor(),
