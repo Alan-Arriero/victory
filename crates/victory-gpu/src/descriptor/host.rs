@@ -332,6 +332,12 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 impl HostHeap {
+    /// Total dynamic slot capacity of this heap (independent of current free
+    /// space), so callers can reject impossible table sizes before scanning.
+    pub(crate) fn dynamic_capacity(&self) -> u32 {
+        self.spare
+    }
+
     /// `n` consecutive free dynamic slots (view heaps and capped sampler
     /// heaps), taken until [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {

@@ -612,6 +612,10 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Monotonic count of deferred title-memory copies (`defer_copy`) recorded
+    /// since reset, used to partition fresh-table CBV snapshot reuse across
+    /// intervening buffer writes.
+    copy_gen: u64,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -1419,6 +1423,15 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.copy_gen += 1;
+    }
+
+    /// Monotonic count of deferred title-memory copies recorded on this list
+    /// since reset. Fresh-table dedupe partitions reuse by this generation so
+    /// an intervening `CopyBufferRegion`/`CopyResource` creates a new CBV
+    /// snapshot (`Fill -> Copy -> Fill`).
+    pub(crate) fn copy_gen(&self) -> u64 {
+        self.deferred().copy_gen
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -1661,8 +1674,10 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.copy_gen += 1;
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
