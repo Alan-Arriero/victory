@@ -624,23 +624,26 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     Some(Shape::Prefix(op, src, mask, ident, inclusive))
 }
 
-/// Whether `p` uses whole-wave sections only for whole-wave `Active`
-/// reductions, with no other cross-lane/mask-as-data ops or full-wave/WQM
-/// `EXEC` manipulation outside those sections.
-pub(crate) fn single_wave32_reductions(
-    p: &Program,
-    mut non_section_ok: impl FnMut(&Inst) -> bool,
-) -> bool {
-    let full_wave_exec = |name: &str| {
-        matches!(
-            name,
-            "s_or_saveexec_b64"
-                | "s_or_saveexec_b32"
-                | "s_nand_saveexec_b64"
-                | "s_nand_saveexec_b32"
-                | "s_wqm_b64"
-                | "s_wqm_b32"
-        )
+/// No upper-half threads exist. Admit only recognized, side-effect-free
+/// whole-wave `Active` reductions, with no independent lane exchange or
+/// full-wave/WQM `EXEC` manipulation outside those sections.
+pub(crate) fn single_wave32_reductions(p: &Program) -> bool {
+    let full_wave_exec = |inst: &Inst| {
+        let name = inst.name();
+        if matches!(name, "s_wqm_b64" | "s_wqm_b32") {
+            return true;
+        }
+        let full_const = match name {
+            "s_or_saveexec_b64" | "s_or_saveexec_b32" => Some(193),
+            "s_nand_saveexec_b64" | "s_nand_saveexec_b32" => Some(128),
+            _ => None,
+        };
+        full_const.is_some_and(|c| {
+            matches!(
+                &inst.fields,
+                Fields::Sop { src, .. } if src.first() == Some(&Operand::Const(c))
+            )
+        })
     };
     let mut reduces = false;
     for (b, block) in p.blocks.iter().enumerate() {
@@ -652,7 +655,7 @@ pub(crate) fn single_wave32_reductions(
             {
                 return false;
             }
-            if full_wave_exec(block.insts[sec.end].name()) {
+            if full_wave_exec(&block.insts[sec.end]) {
                 return false;
             }
             for inst in &block.insts[start + 1..sec.end] {
@@ -678,7 +681,14 @@ pub(crate) fn single_wave32_reductions(
             if in_sec {
                 continue;
             }
-            if full_wave_exec(inst.name()) || !non_section_ok(inst) {
+            let name = inst.name();
+            if full_wave_exec(inst)
+                || name.contains("permute")
+                || name.starts_with("v_permlane")
+                || name.starts_with("ds_swizzle")
+                || matches!(name, "v_readlane_b32" | "v_writelane_b32")
+                || matches!(&inst.fields, Fields::Valu(v) if v.dpp.is_some())
+            {
                 return false;
             }
         }
@@ -837,14 +847,14 @@ mod tests {
             found[&0].shapes.get(&total),
             Some(&Shape::Active(Op::AddU, x, saved, 0))
         );
-        assert!(single_wave32_reductions(&p, |_| true));
+        assert!(single_wave32_reductions(&p));
 
         // `s_nand_saveexec_b64 s[0:1], 0` is the other full-wave opener.
         let mut nand = wave64_sum_section();
         nand[0] = 0xBE80_2980;
         nand.push(0xBF81_0000);
         let p_nand = build_wave64(&nand);
-        assert!(single_wave32_reductions(&p_nand, |_| true));
+        assert!(single_wave32_reductions(&p_nand));
     }
 
     #[test]
@@ -866,14 +876,14 @@ mod tests {
             0xBF81_0000, // s_endpgm
         ]);
         let p = build_wave64(&words);
-        assert!(single_wave32_reductions(&p, |_| true));
+        assert!(single_wave32_reductions(&p));
 
         // `s_nand_saveexec_b64 s[0:1], 0` is the other full-wave opener.
         let mut nand = wave64_sum_section();
         nand[0] = 0xBE80_2980;
         nand.push(0xBF81_0000);
         let p_nand = build_wave64(&nand);
-        assert!(single_wave32_reductions(&p_nand, |_| true));
+        assert!(single_wave32_reductions(&p_nand));
     }
 
     #[test]
@@ -882,7 +892,7 @@ mod tests {
             0x4A02_0100, // v_add_nc_u32_e32 v1, v0, v0
             0xBF81_0000, // s_endpgm
         ]);
-        assert!(!single_wave32_reductions(&p, |_| true));
+        assert!(!single_wave32_reductions(&p));
     }
 
     #[test]
@@ -922,7 +932,7 @@ mod tests {
             sections(&p, 0)[&0].shapes.get(&prefix),
             Some(&Shape::Prefix(Op::AddU, x, saved, 0, true))
         );
-        assert!(!single_wave32_reductions(&p, |_| true));
+        assert!(!single_wave32_reductions(&p));
     }
 
     #[test]
@@ -939,7 +949,7 @@ mod tests {
                     .any(|s| matches!(s, Shape::Active(..))),
                 "early EXEC write still leaves earlier Shape::Active"
             );
-            assert!(!single_wave32_reductions(&p, |_| true));
+            assert!(!single_wave32_reductions(&p));
         }
     }
 
@@ -951,34 +961,33 @@ mod tests {
             &[0xF400_0100, 0xFA00_0000][..], // s_load_dword s4, s[0:1], null
         ] {
             let p = wave64_sum_program(bad, &[], &[]);
-            assert!(!single_wave32_reductions(&p, |_| true));
+            assert!(!single_wave32_reductions(&p));
         }
     }
 
     #[test]
     fn single_wave32_reductions_rejects_full_wave_exec_and_disallowed_ops_outside_section() {
+        // Normal divergent control-flow `s_or_saveexec_b64` with a register mask is allowed.
+        let p_branch = wave64_sum_program(&[], &[0xBE82_2504u32], &[]);
+        assert!(single_wave32_reductions(&p_branch));
+
         for bad in [
-            0xBE82_2504u32, // s_or_saveexec_b64 s[2:3], s[4:5]
-            0xBE82_29C1,    // s_nand_saveexec_b64 s[2:3], -1
+            0xBE82_25C1u32, // s_or_saveexec_b64 s[2:3], -1
+            0xBE82_2980,    // s_nand_saveexec_b64 s[2:3], 0
             0xBE82_0A7E,    // s_wqm_b64 s[2:3], exec
         ] {
             let p = wave64_sum_program(&[], &[bad], &[]);
-            assert!(!single_wave32_reductions(&p, |_| true));
+            assert!(!single_wave32_reductions(&p));
         }
 
-        // Outside-section DPP / v_mbcnt / v_readlane rejected via `non_section_ok`.
+        // Outside-section DPP / v_permlanex16 / v_readlane lane exchanges are rejected.
         for bad in [
             &[0x4A0E_0EFA, 0xFF01_6107][..], // v_add_nc_u32_dpp v7, v7, v7 row_xmask:1
-            &[0xD765_0007, 0x0001_00C1][..], // v_mbcnt_lo_u32_b32 v7, -1, 0
+            &[0xD778_0002, 0x0305_8301][..], // v_permlanex16_b32 v2, v1, -1, -1
             &[0xD760_0004, 0x0001_0104][..], // v_readlane_b32 s4, v4, 0
         ] {
             let p = wave64_sum_program(&[], &[], bad);
-            assert!(!single_wave32_reductions(&p, |inst| {
-                let n = inst.name();
-                !n.starts_with("v_mbcnt")
-                    && n != "v_readlane_b32"
-                    && !matches!(&inst.fields, Fields::Valu(v) if v.dpp.is_some())
-            }));
+            assert!(!single_wave32_reductions(&p));
         }
     }
 }

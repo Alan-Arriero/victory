@@ -523,18 +523,18 @@ impl<'a> Lower<'a> {
             let wave = if x.native.wave64 { 64 } else { 32 };
             let threads = cs.threads.iter().product::<u32>();
             let one_wave = threads <= wave;
-            // A wave64 compute group of at most 32 threads has no upper-half
+            // A wave64 compute group of exactly 32 threads has no upper-half
             // threads. When whole-wave Active reductions are its only
-            // console-wave requirement (no LDS, no held masks, and no
-            // non-section cross-lane/mask-data ops), lowering it with
-            // WaveSize(32) matches the 64-lane reduction identically on 32-lane
-            // hosts (`thread_id()` reads `s.wave_size = 32`).
+            // cross-lane requirement (no LDS, no held masks, and no
+            // independent lane exchange outside those sections), lowering it
+            // with WaveSize(32) matches the 64-lane reduction identically on
+            // 32-lane hosts (`thread_id()` reads `s.wave_size = 32`).
             let one_wave32 = allow_wave32
                 && x.native.wave64
-                && (1..=32).contains(&threads)
+                && threads == 32
                 && s.lds_dwords == 0
                 && !masks_held
-                && super::wave::single_wave32_reductions(p, |i| !is_console_lane_op(i));
+                && super::wave::single_wave32_reductions(p);
             if one_wave32 {
                 s.wave_size = Some(32);
             } else if console_lanes || one_wave && s.lds_dwords > 0 {
@@ -9427,9 +9427,7 @@ mod wave_size_tests {
     #[test]
     fn small_wave64_whole_wave_reduction_emits_wave32_and_runs() {
         for (threads, setup_2d, rsrc2_extra, expected_sum) in [
-            ([1, 1, 1], false, 0, 1),
             ([32, 1, 1], false, 0, 32 * 33 / 2),
-            ([16, 1, 1], false, 0, 16 * 17 / 2),
             ([8, 4, 1], true, 1 << 11, 32 * 33 / 2),
         ] {
             let words = wave64_sum_cs_words(setup_2d, &[], &[]);
@@ -9479,8 +9477,8 @@ mod wave_size_tests {
     fn large_group_and_lds_and_disallowed_wave64_reductions_keep_wave64() {
         let base = wave64_sum_cs_words(false, &[], &[]);
 
-        // Groups larger than 32 threads ([33, 1, 1], [64, 1, 1]) keep WaveSize(64).
-        for threads in [[33, 1, 1], [64, 1, 1]] {
+        // Non-32-thread groups ([1, 1, 1], [16, 1, 1], [33, 1, 1], [64, 1, 1]) keep WaveSize(64).
+        for threads in [[1, 1, 1], [16, 1, 1], [33, 1, 1], [64, 1, 1]] {
             let (_, bounds) = compile_wave64_cs(&base, threads, 0);
             assert_eq!(bounds, (64, 64), "threads={threads:?}");
         }
@@ -9489,13 +9487,12 @@ mod wave_size_tests {
         let (_, bounds) = compile_wave64_cs(&base, [32, 1, 1], 1 << 15);
         assert_eq!(bounds, (64, 64));
 
-        // [32, 1, 1] with outside-section DPP, v_mbcnt, reads_mask_as_data, or
-        // numeric_select keeps WaveSize(64).
+        // [32, 1, 1] with independent cross-lane exchange outside reduction
+        // sections keeps WaveSize(64).
         for outside_op in [
             &[0x4A0E_0EFA, 0xFF01_6107][..], // v_add_nc_u32_dpp v7, v7, v7 row_xmask:1
-            &[0xD765_0007, 0x0001_00C1][..], // v_mbcnt_lo_u32_b32 v7, -1, 0
-            &[0x7D88_0088, 0xBE84_106A, 0x4A0E_0E04][..], // v_cmp + s_bcnt1 vcc + v_add
-            &[0xBE84_038F, 0xBE85_0380, 0xD501_0007, 0x0012_0E81][..], // untracked v_cndmask
+            &[0xD778_0007, 0x0305_8307][..], // v_permlanex16_b32 v7, v7, -1, -1
+            &[0xD760_0004, 0x0001_0107][..], // v_readlane_b32 s4, v7, 0
         ] {
             let words = wave64_sum_cs_words(false, outside_op, &[]);
             let (_, bounds) = compile_wave64_cs(&words, [32, 1, 1], 0);
@@ -9515,5 +9512,60 @@ mod wave_size_tests {
         // an otherwise eligible <=32-thread reduction keeps WaveSize(64).
         let (_, bounds) = compile_wave64_cs_mode(&base, [32, 1, 1], 0, false);
         assert_eq!(bounds, (64, 64));
+    }
+
+    #[test]
+    fn sparse_mask_32_thread_wave64_float_reduction_emits_wave32_and_runs() {
+        let words = [
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF408_0100,
+            0xFA00_0000, // s_load_dwordx4 s[4:7], s[0:1], null
+            0x7E0A_02FF,
+            0x3F80_0000, // v_mov_b32 v5, 1.0
+            0x3606_0081, // v_and_b32 v3, 1, v0
+            0x7D84_0680, // v_cmp_eq_u32 vcc, 0, v3
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBE8A_25C1, // s_or_saveexec_b64 s[10:11], -1
+            0xD501_0001,
+            0x002A_0A80, // v_cndmask_b32 v1, 0, v5, s[10:11]
+            0x0602_02E9,
+            0xDE54_C101,
+            0x0602_02E9,
+            0x9360_1201,
+            0x0602_02E9,
+            0x0009_2401,
+            0x0602_02FA,
+            0xFF09_4001,
+            0xD778_0002,
+            0x0201_0101,
+            0x0602_0302,
+            0xD760_0002,
+            0x0001_4101, // v_readlane_b32 s2, v1, 32
+            0x0602_0202,
+            0xD760_0003,
+            0x0001_0101, // v_readlane_b32 s3, v1, 0
+            0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+            0x7E04_0203, // v_mov_b32 v2, s3
+            0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+            0xE070_1000,
+            0x8001_0203, // buffer_store_dword v2, v3, s[4:7], 0 offen
+            S_ENDPGM,
+        ];
+        let (shader, wave_bounds) = compile_wave64_cs(&words, [32, 1, 1], 0);
+        let _ = &shader;
+        assert_eq!(wave_bounds, (32, 32));
+        let (_, bounds_33) = compile_wave64_cs(&words, [33, 1, 1], 0);
+        assert_eq!(
+            bounds_33,
+            (64, 64),
+            "33-thread variant must stay out of the Wave32 reduction path"
+        );
+        #[cfg(windows)]
+        for (label, data) in run_cs_uav(&shader, 32) {
+            let expected: Vec<u32> = (0..32)
+                .map(|i| if i % 2 == 0 { 16.0f32.to_bits() } else { 0 })
+                .collect();
+            assert_eq!(data, expected, "{label} sparse-mask float reduction");
+        }
     }
 }
