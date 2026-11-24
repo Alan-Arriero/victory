@@ -15,10 +15,31 @@ pub(crate) fn compile_compute(name: &str, source: &str) -> windows::core::Result
     match system_compile(name, source) {
         Ok(code) => Ok(code),
         Err((e, msg)) => {
+            #[cfg(victory_bundled_hlsl)]
+            if let Some(bytes) = bundled_shader(source) {
+                tracing::info!("{name}: using build-time DXC shader");
+                return Ok(bytes.to_vec());
+            }
             tracing::info!(error = %e, "{name}: the system compiler refused it ({}); trying DXC", msg.trim());
             dxc_compile(name, source)
                 .inspect_err(|e| tracing::warn!(error = %e, "{name}: DXC failed too"))
         }
+    }
+}
+
+// Match the source so a changed shader can never pick up another helper's bytecode.
+#[cfg(victory_bundled_hlsl)]
+fn bundled_shader(source: &str) -> Option<&'static [u8]> {
+    macro_rules! bytecode {
+        ($name:literal) => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".dxil"))
+        };
+    }
+    match source {
+        include_str!("../shaders/argument_clamp.hlsl") => Some(bytecode!("argument_clamp")),
+        include_str!("../shaders/rect_rewrite.hlsl") => Some(bytecode!("rect_rewrite")),
+        include_str!("../shaders/rect_expand.hlsl") => Some(bytecode!("rect_expand")),
+        _ => None,
     }
 }
 
@@ -171,6 +192,28 @@ mod tests {
         [numthreads(1, 1, 1)]
         void main() { b.Store(0, b.Load(0)); }
     "#;
+
+    #[cfg(victory_bundled_hlsl)]
+    #[test]
+    fn bundled_helpers_have_shader_code_and_root_signatures() {
+        use victory_shader::{Container, FourCC};
+
+        for source in [
+            include_str!("../shaders/argument_clamp.hlsl"),
+            include_str!("../shaders/rect_rewrite.hlsl"),
+            include_str!("../shaders/rect_expand.hlsl"),
+        ] {
+            let expected = bundled_shader(source).unwrap();
+            let bytes = compile_compute("bundled helper", source).unwrap();
+            if system_compile("bundled helper", source).is_err() {
+                assert_eq!(bytes, expected);
+            }
+            let container = Container::parse(expected).unwrap();
+            assert!(container.part(FourCC::DXIL).is_some());
+            assert!(container.part(FourCC::RTS0).is_some());
+        }
+        assert!(bundled_shader(PROBE).is_none());
+    }
 
     /// A raw-buffer compute shader compiles with one of the two compilers
     /// whenever either is present, and both results are DXBC containers.
