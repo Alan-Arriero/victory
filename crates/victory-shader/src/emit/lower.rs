@@ -9059,6 +9059,7 @@ mod tests {
         ];
         let layout = || vec![];
         let used = || vec![];
+        #[cfg_attr(not(windows), allow(unused_variables))]
         let l = lower_with(&words, layout(), used()).unwrap();
         #[cfg(windows)]
         if let Ok(mut v) = crate::emit::validator::Validator::load(
