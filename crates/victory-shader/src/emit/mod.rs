@@ -82,6 +82,8 @@ mod diff_tests;
 pub mod host;
 #[cfg(all(test, windows))]
 mod lane_mask_tests;
+#[cfg(test)]
+mod lds_tests;
 mod lower;
 #[cfg(test)]
 mod mtbuf_tests;
