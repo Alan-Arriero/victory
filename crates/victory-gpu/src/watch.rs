@@ -170,18 +170,20 @@ struct Guards {
     /// Of those, the ones not written since a copy took them.
     clean: BTreeSet<usize>,
     /// Announced kernel writes still to land, as block ranges `[first, end)`
-    /// (one entry per announcement): their blocks are left open until they
-    /// have, however many refreshes come first. Kept as ranges, not per
-    /// block, so a title-supplied length (saturated by `fread`'s size times
-    /// count) costs nothing however large.
-    announced: Vec<(usize, usize)>,
+    /// with how many announcements of that range are open: their blocks are
+    /// left open until they have, however many refreshes come first. Kept
+    /// as ranges, not per block, so a title-supplied length (saturated by
+    /// `fread`'s size times count) costs nothing however large; counted, so
+    /// a range announced again and again (overlapped reads into the same
+    /// buffer, which never say they landed) stays one entry.
+    announced: BTreeMap<(usize, usize), u32>,
 }
 
 impl Guards {
     /// Whether an announced kernel write still to land covers `block`.
     fn announced(&self, block: usize) -> bool {
         self.announced
-            .iter()
+            .keys()
             .any(|&(first, end)| (first..end).contains(&block))
     }
 }
@@ -189,7 +191,7 @@ impl Guards {
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
-    announced: Vec::new(),
+    announced: BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -340,7 +342,9 @@ pub fn kernel_will_write(at: usize, len: usize) {
     let end = at.saturating_add(len);
     let mut g = guards();
     open(&mut g, at, end);
-    g.announced.push((at / BLOCK, end.div_ceil(BLOCK)));
+    *g.announced
+        .entry((at / BLOCK, end.div_ceil(BLOCK)))
+        .or_default() += 1;
 }
 
 /// The kernel write [`kernel_will_write`] announced for `[at, at + len)`
@@ -348,24 +352,28 @@ pub fn kernel_will_write(at: usize, len: usize) {
 pub fn kernel_wrote(at: usize, len: usize) {
     let range = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut g = guards();
-    if let Some(i) = g.announced.iter().position(|&r| r == range) {
-        g.announced.swap_remove(i);
+    if let Some(n) = g.announced.get_mut(&range) {
+        *n -= 1;
+        if *n == 0 {
+            g.announced.remove(&range);
+        }
     }
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
-/// shows is new and read-write, so it is no longer guarded.
+/// shows is new and read-write, so it is no longer guarded, and kernel
+/// writes announced wholly inside it are moot (an overlapped read that
+/// never said it landed no longer keeps those blocks open).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    let (first, end) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut g = guards();
-    let blocks: Vec<usize> = g
-        .protected
-        .range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK))
-        .copied()
-        .collect();
+    let blocks: Vec<usize> = g.protected.range(first..end).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
     }
+    g.announced
+        .retain(|&(from, to), _| !(first <= from && to <= end));
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -656,11 +664,27 @@ mod tests {
         // Kernel half of the address space: no user allocation of another
         // test running at the same time can fall in the announced range.
         let at = 0xFFFF_8000_0000_0000;
-        let before = guards().announced.len();
+        let range = (at / BLOCK, usize::MAX.div_ceil(BLOCK));
         kernel_will_write(at, usize::MAX);
         assert!(guards().announced(at / BLOCK + 12345));
         kernel_wrote(at, usize::MAX);
-        assert_eq!(guards().announced.len(), before);
+        assert!(!guards().announced.contains_key(&range));
+    }
+
+    /// A range announced again and again without landing (overlapped reads
+    /// into one buffer) is one counted entry, and a remap over it drops it.
+    #[test]
+    fn repeated_announcements_are_counted_and_a_remap_drops_them() {
+        let at = 0xFFFF_9000_0000_0000;
+        let range = (at / BLOCK, (at + BLOCK).div_ceil(BLOCK));
+        for _ in 0..1000 {
+            kernel_will_write(at, BLOCK);
+        }
+        assert_eq!(guards().announced.get(&range), Some(&1000));
+        kernel_wrote(at, BLOCK);
+        assert_eq!(guards().announced.get(&range), Some(&999));
+        title_memory_remapped(at, BLOCK);
+        assert!(!guards().announced.contains_key(&range));
     }
 
     /// A kernel read announced with `kernel_will_write` survives a refresh
