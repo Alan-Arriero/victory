@@ -50,7 +50,10 @@ If you stop, say so on the ticket so someone else can pick it up.
 
 ## Set up
 
-Follow the requirements in the [README](README.md#getting-started). Then:
+Follow the requirements in the [README](README.md#getting-started). On x86-64
+Linux, `nix develop` or `nix-shell` supplies the pinned Rust toolchain, native
+build tools and Windows cross-compiler; see the
+[Linux guide](docs/linux-proton.md#development-with-nix). Then:
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit

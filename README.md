@@ -12,6 +12,8 @@ it can and on first use where it must (shaders). See
 
 The Windows executable can also be launched under Proton on x86-64 Linux. See
 [Running with the Proton launcher](docs/proton-launcher.md).
+For a pinned Linux development environment, run `nix develop` (or `nix-shell`).
+See [Linux development with Nix](docs/linux-proton.md#development-with-nix).
 
 ## Status (2026-11-23)
 
@@ -71,9 +73,11 @@ shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 [docs/linux-proton.md](docs/linux-proton.md) for which crates build and test
 natively today, cross-building `victory.exe` and running it under Proton.
 
-Under Wine or Proton, indirect execution also needs DXC's `dxcompiler.dll` (with
-its `dxil.dll`): Wine's `d3dcompiler_47` cannot compile the indirect-argument
-clamp. It is looked for in `VICTORY_DXC` (the DLL or its folder), beside the
+Under Wine or Proton, builds without embedded helper shaders also need DXC's
+`dxcompiler.dll` (with its `dxil.dll`): Wine's `d3dcompiler_47` cannot compile
+the indirect-argument clamp. The Nix shell sets `VICTORY_BUILD_DXC` to embed
+these helpers during cross-builds. Runtime DXC is looked for in
+`VICTORY_DXC` (the DLL or its folder), beside the
 `dxil.dll` that shader validation finds, then the executable's folder and System32.
 
 To install Rust, use rustup (`winget install --id Rustlang.Rustup -e`, or
