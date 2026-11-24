@@ -104,6 +104,67 @@ pub(crate) fn separate_interpolation(elements: &mut [SigElement]) {
     }
 }
 
+/// Input, output and primitive signatures follow the resource and string tables
+/// in PSV version 1 and later. Select the producer's per-vertex output records.
+fn producer_records(mut data: &[u8], stage: u8) -> Option<std::slice::ChunksExact<'_, u8>> {
+    fn take<'a>(data: &mut &'a [u8], bytes: usize) -> Option<&'a [u8]> {
+        let (head, rest) = data.split_at_checked(bytes)?;
+        *data = rest;
+        Some(head)
+    }
+    fn word(data: &mut &[u8]) -> Option<usize> {
+        Some(u32::from_le_bytes(take(data, 4)?.try_into().ok()?) as usize)
+    }
+    let info_size = word(&mut data)?;
+    let info = take(&mut data, info_size)?;
+    if *info.get(24)? != stage {
+        return None;
+    }
+    let inputs = usize::from(*info.get(28)?);
+    let outputs = usize::from(*info.get(29)?);
+    let resources = word(&mut data)?;
+    if resources > 0 {
+        let stride = word(&mut data)?;
+        take(&mut data, resources.checked_mul(stride)?)?;
+    }
+    let names = word(&mut data)?;
+    take(&mut data, names)?;
+    let indices = word(&mut data)?;
+    take(&mut data, indices.checked_mul(4)?)?;
+    let stride = word(&mut data)?;
+    if stride < 16 {
+        return None;
+    }
+    take(&mut data, inputs.checked_mul(stride)?)?;
+    Some(take(&mut data, outputs.checked_mul(stride)?)?.chunks_exact(stride))
+}
+
+/// Preserve declared interpolation for user semantics, including flat floats.
+/// Signature chunks sort by register, while PSV records follow element order.
+pub(super) fn producer_interpolation(data: &[u8], stage: u8, outputs: &mut [SigElement]) {
+    let Some(records) = producer_records(data, stage) else {
+        return;
+    };
+    for record in records {
+        let (rows, start, packing) = (record[8], record[9], record[10]);
+        let (kind, comp, mode) = (record[11], record[12], record[13]);
+        if kind != 0 || packing & 0x40 == 0 || !(1..=7).contains(&mode) {
+            continue;
+        }
+        for e in outputs.iter_mut().filter(|e| {
+            e.kind == 0
+                && e.sig_comp() == u32::from(comp)
+                && e.col == (packing >> 4) & 3
+                && e.cols == packing & 15
+                && e.row.is_some_and(|row| {
+                    (u32::from(start)..u32::from(start) + u32::from(rows)).contains(&row)
+                })
+        }) {
+            e.interp = mode;
+        }
+    }
+}
+
 /// `ISG1`/`OSG1`: 32-byte rows, then the names.
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();
@@ -434,6 +495,69 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flat_float_retains_its_packed_producer_row() {
+        let flat = SigElement {
+            name: "VALUE".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 1,
+            row: Some(2),
+            col: 3,
+            cols: 1,
+            usage: 1,
+            half: false,
+        };
+        let integer = SigElement {
+            col: 0,
+            cols: 3,
+            comp: 5,
+            index: 1,
+            ..flat.clone()
+        };
+        let linear = SigElement {
+            row: Some(4),
+            interp: 2,
+            ..flat.clone()
+        };
+        let binding = Binding {
+            kind: 2,
+            space: 0,
+            register: 0,
+            dxil_kind: 13,
+        };
+        for stage in [1, 13] {
+            let meta = psv(&Psv {
+                stage,
+                flag: false,
+                inputs: std::slice::from_ref(&linear),
+                outputs: &[integer.clone(), linear.clone(), flat.clone()],
+                prims: &[],
+                mesh: None,
+                geometry: None,
+                bindings: std::slice::from_ref(&binding),
+                threads: [1; 3],
+                wave_size: None,
+                validator18: true,
+            });
+            let mut outputs = [
+                SigElement {
+                    interp: 2,
+                    ..flat.clone()
+                },
+                integer.clone(),
+                linear.clone(),
+            ];
+            producer_interpolation(&meta, 5, &mut outputs);
+            assert_eq!(outputs[0].interp, 2);
+            producer_interpolation(&meta[..meta.len() / 2], stage, &mut outputs);
+            assert_eq!(outputs[0].interp, 2);
+            producer_interpolation(&meta, stage, &mut outputs);
+            assert_eq!(outputs, [flat.clone(), integer.clone(), linear.clone()]);
+        }
+    }
 
     #[test]
     fn md5_core_matches_the_standard() {

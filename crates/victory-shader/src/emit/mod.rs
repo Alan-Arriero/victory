@@ -379,6 +379,13 @@ fn emit_program(
             _ => 0,
         };
     }
+    if let Some(psv) = c.part(FourCC::PSV0) {
+        match native.stage {
+            HwStage::Vs => container::producer_interpolation(psv.data, 1, &mut outputs),
+            HwStage::Ms => container::producer_interpolation(psv.data, 13, &mut outputs),
+            _ => {}
+        }
+    }
     // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
     // wants the position centroid (or per sample), as DXC declares it then.
     if pixel && outputs.iter().any(|e| matches!(e.kind, 18 | 19)) {
