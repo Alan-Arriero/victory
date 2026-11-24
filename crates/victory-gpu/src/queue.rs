@@ -119,7 +119,8 @@ extern "system" fn release(this: This) -> u32 {
 }
 
 /// Runs the lists' host lists and waits for them (decision 0007), once
-/// the queue's waits before them are reached.
+/// the queue's waits before them are reached. Contiguous host list segments
+/// run in a single host submission, ordered around mid-list memory waits.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
@@ -128,22 +129,40 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if crate::host::host().is_some() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
-        // Held until they run: the title may reset its lists before.
-        let host_lists: Vec<_> = lists
+        let segments: Vec<_> = lists
             .iter()
-            .filter_map(|&l| crate::list::host_list(l))
+            .flat_map(|&l| crate::list::segments(l))
             .collect();
-        queue(this).timeline.submit(Op::Run(Box::new(move || {
-            if let Some(host) = crate::host::host() {
-                let runs: Vec<_> = host_lists.iter().map(|l| &**l).collect();
-                host.execute(&runs);
-                for list in host_lists {
-                    if let Ok(orphan) = std::sync::Arc::try_unwrap(list) {
-                        host.recycle_list(orphan);
+        let timeline = &queue(this).timeline;
+        let mut batch = Vec::new();
+        let flush = |batch: &mut Vec<Arc<crate::host::HostList>>| {
+            if batch.is_empty() {
+                return;
+            }
+            // Held until they run: the title may reset its lists before.
+            let host_lists = std::mem::take(batch);
+            timeline.submit(Op::Run(Box::new(move || {
+                if let Some(host) = crate::host::host() {
+                    let runs: Vec<_> = host_lists.iter().map(|l| &**l).collect();
+                    host.execute(&runs);
+                    for list in host_lists {
+                        if let Ok(orphan) = Arc::try_unwrap(list) {
+                            host.recycle_list(orphan);
+                        }
                     }
                 }
+            })));
+        };
+        for seg in segments {
+            match seg {
+                crate::list::Segment::List(list) => batch.push(list),
+                crate::list::Segment::Wait(wait) => {
+                    flush(&mut batch);
+                    timeline.submit(Op::WaitMemory(wait, None));
+                }
             }
-        })));
+        }
+        flush(&mut batch);
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
@@ -966,5 +985,118 @@ mod tests {
             .write(at[1..].as_mut_ptr().cast(), 8)
             .run();
         assert!(at[1] > first);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn execute_batches_contiguous_lists_across_mid_list_waits() {
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        type Execute = extern "system" fn(This, u32, *const This);
+        type Write32 = extern "system" fn(This, u64, u32, u32, u32);
+        type Wait32 = extern "system" fn(This, u64, u32, u32, u32);
+        type Wait64 = extern "system" fn(This, u64, u32, u64, u32);
+
+        let null = std::ptr::null();
+        let (queue, _) = test_queue();
+        let execute = slot::<Execute>(queue, 0x50);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let mut allocator = null;
+        assert_eq!(
+            crate::list::create_allocator(
+                null,
+                0,
+                &crate::resource::PAGEABLE_IIDS[0],
+                &mut allocator
+            ),
+            S_OK
+        );
+        let make_list = || {
+            let mut l = null;
+            let iid = guid(
+                0x5b160d0f,
+                0xac1b,
+                0x4185,
+                [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+            );
+            assert_eq!(
+                crate::list::create_list(null, 0, 0, allocator, null, &iid, &mut l),
+                S_OK
+            );
+            l
+        };
+
+        let list1 = make_list();
+        let list2 = make_list();
+        let list_slot = crate::list::test_slot;
+
+        let gate1 = AtomicU32::new(0);
+        let gate2 = AtomicU64::new(0);
+        let out = [
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+        ];
+
+        slot::<Write32>(list1, list_slot(list1, 69))(list1, (&raw const out[0]) as u64, 1, 0, 0);
+        slot::<Wait32>(list1, list_slot(list1, 71))(
+            list1,
+            (&raw const gate1) as u64,
+            3,
+            1,
+            u32::MAX,
+        );
+        slot::<Write32>(list1, list_slot(list1, 69))(list1, (&raw const out[1]) as u64, 2, 0, 0);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list1, 0x48)(list1),
+            S_OK
+        );
+
+        slot::<Write32>(list2, list_slot(list2, 69))(list2, (&raw const out[2]) as u64, 3, 0, 0);
+        slot::<Wait64>(list2, list_slot(list2, 72))(
+            list2,
+            (&raw const gate2) as u64,
+            3,
+            0x1_0000_0001,
+            0,
+        );
+        slot::<Write32>(list2, list_slot(list2, 69))(list2, (&raw const out[3]) as u64, 4, 0, 0);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list2, 0x48)(list2),
+            S_OK
+        );
+
+        let lists = [list1, list2];
+        execute(queue, 2, lists.as_ptr());
+
+        assert_eq!(out[0].load(Ordering::Acquire), 1);
+        assert_eq!(out[1].load(Ordering::Acquire), 0);
+        assert_eq!(out[2].load(Ordering::Acquire), 0);
+        assert_eq!(out[3].load(Ordering::Acquire), 0);
+
+        gate1.store(1, Ordering::Release);
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while out[2].load(Ordering::Acquire) == 0 && std::time::Instant::now() < limit {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(out[1].load(Ordering::Acquire), 2);
+        assert_eq!(out[2].load(Ordering::Acquire), 3);
+        assert_eq!(out[3].load(Ordering::Acquire), 0);
+
+        gate2.store(0x1_0000_0001, Ordering::Release);
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while out[3].load(Ordering::Acquire) == 0 && std::time::Instant::now() < limit {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(out[3].load(Ordering::Acquire), 4);
+
+        for object in [list1, list2, allocator, queue] {
+            assert_eq!(release(object), 0);
+        }
     }
 }

@@ -105,6 +105,14 @@ pub(crate) struct State {
     depth_sampled: bool,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
+    /// Fixed-function state and target handles, cached so a mid-list wait split
+    /// can reapply them onto a fresh host list.
+    viewports: Vec<D3D12_VIEWPORT>,
+    scissors: Vec<RECT>,
+    blend_factor: Option<[f32; 4]>,
+    stencil_ref: Option<u32>,
+    target_handles: Vec<u64>,
+    depth_handle: u64,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -245,6 +253,56 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    pub(crate) fn set_viewports(&mut self, list: &HostList, items: &[D3D12_VIEWPORT]) {
+        self.viewports = items.to_vec();
+        viewports(list, &self.viewports);
+    }
+
+    pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
+        self.scissors = rects.to_vec();
+        scissors(list, &self.scissors);
+    }
+
+    pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
+        self.blend_factor = factor.copied();
+        blend_factor(list, factor);
+    }
+
+    pub(crate) fn set_stencil_ref(&mut self, list: &HostList, reference: u32) {
+        self.stencil_ref = Some(reference);
+        stencil_ref(list, reference);
+    }
+
+    /// Reapplies fixed-function state and targets onto `new_list` after a
+    /// mid-list wait split, moving dynamic descriptor slots onto `prev_list`
+    /// so they stay alive until its submission finishes.
+    pub(crate) fn reapply_host(&mut self, new_list: &HostList, prev_list: &HostList) {
+        self.fresh_tables.clear();
+        prev_list.keep_dynamic(self.take_dynamic());
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+        if self.topology != 0 {
+            self.set_topology(new_list, self.topology);
+        }
+        if !self.viewports.is_empty() {
+            viewports(new_list, &self.viewports);
+        }
+        if !self.scissors.is_empty() {
+            scissors(new_list, &self.scissors);
+        }
+        if let Some(factor) = self.blend_factor {
+            blend_factor(new_list, Some(&factor));
+        }
+        if let Some(reference) = self.stencil_ref {
+            stencil_ref(new_list, reference);
+        }
+        if !self.target_handles.is_empty() || self.depth_handle != 0 {
+            let handles = self.target_handles.clone();
+            self.set_targets(new_list, &handles, self.depth_handle);
+        }
+    }
+
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
         self.heaps = [0; 2];
         for &h in heaps {
@@ -311,6 +369,8 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        self.target_handles = handles.to_vec();
+        self.depth_handle = depth;
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -1783,6 +1843,170 @@ mod depth_tests {
         };
         assert_eq!(release(views), 0);
         assert_eq!(release(depth), 0);
+    }
+
+    #[test]
+    fn reapply_host_preserves_state_clears_fresh_tables_and_keeps_dynamic_on_prev() {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let prev_list = host.new_list().expect("prev list");
+        let new_list = host.new_list().expect("new list");
+        let null = std::ptr::null();
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let make_tex = |format, flags, initial_state| {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: flags,
+                ..Default::default()
+            };
+            let iid = ID3D12Resource::IID;
+            let mut res = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    (&raw const heap).cast(),
+                    0,
+                    (&raw const desc).cast(),
+                    initial_state,
+                    null.cast(),
+                    (&raw const iid).cast(),
+                    &mut res,
+                ),
+                crate::object::S_OK
+            );
+            res
+        };
+        let rt = make_tex(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32,
+        );
+        let depth = make_tex(
+            DXGI_FORMAT_D32_FLOAT,
+            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32,
+        );
+
+        let mut rtv_slot = [0u64; 16];
+        let rtv_handle = rtv_slot.as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(null, rt, null.cast(), rtv_handle);
+        let mut dsv_slot = [0u64; 16];
+        let dsv_handle = dsv_slot.as_mut_ptr() as u64;
+        crate::descriptor::create_dsv(null, depth, null.cast(), dsv_handle);
+
+        // Create a sampler heap so dynamic slots are constrained and measurable.
+        #[repr(C)]
+        struct ViewHeap {
+            desc: D3D12_DESCRIPTOR_HEAP_DESC,
+            placement: [u64; 2],
+        }
+        let desc = ViewHeap {
+            desc: D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                NumDescriptors: 4096,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            },
+            placement: [0; 2],
+        };
+        let heap_iid = ID3D12DescriptorHeap::IID;
+        let mut sampler_heap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                (&raw const desc).cast(),
+                (&raw const heap_iid).cast(),
+                &mut sampler_heap,
+            ),
+            crate::object::S_OK
+        );
+        let title_heap = crate::descriptor::heap(sampler_heap);
+        let host_heap = title_heap.host().expect("host sampler heap");
+        let dyn_slot = host_heap.dynamic(200).expect("dynamic sampler slots");
+
+        let mut state = State::default();
+        let vp = [D3D12_VIEWPORT {
+            Width: 64.0,
+            Height: 32.0,
+            MaxDepth: 1.0,
+            ..Default::default()
+        }];
+        let sc = [RECT {
+            left: 1,
+            top: 2,
+            right: 64,
+            bottom: 32,
+        }];
+        let blend = [0.25, 0.5, 0.75, 1.0];
+        state.set_topology(&prev_list, 4);
+        state.set_viewports(&prev_list, &vp);
+        state.set_scissors(&prev_list, &sc);
+        state.set_blend_factor(&prev_list, Some(&blend));
+        state.set_stencil_ref(&prev_list, 9);
+        state.set_targets(&prev_list, &[rtv_handle], dsv_handle);
+        state.host_pipeline = 0x1234;
+        state.host_roots = [0x11, 0x22];
+        state.host_heaps = [0x33, 0x44];
+        state.fresh_tables.insert((0xdead, 0xbeef), 1);
+        state
+            .dynamic
+            .push((std::ptr::from_ref(title_heap) as usize, dyn_slot, 200));
+
+        state.reapply_host(&new_list, &prev_list);
+
+        assert!(state.fresh_tables.is_empty());
+        assert!(state.dynamic.is_empty());
+        assert_eq!(state.host_pipeline, 0);
+        assert_eq!(state.host_roots, [0; 2]);
+        assert_eq!(state.host_heaps, [0; 2]);
+        assert_eq!(state.topology, 4);
+        assert_eq!(state.viewports.len(), 1);
+        assert_eq!(state.viewports[0].Width, 64.0);
+        assert_eq!(state.scissors.len(), 1);
+        assert_eq!(state.scissors[0].left, 1);
+        assert_eq!(state.blend_factor, Some(blend));
+        assert_eq!(state.stencil_ref, Some(9));
+        assert_eq!(state.target_handles, vec![rtv_handle]);
+        assert_eq!(state.depth_handle, dsv_handle);
+        assert_eq!(state.targets, vec![rt as usize]);
+        assert_eq!(state.depth.map(|d| d.resource), Some(depth as usize));
+
+        // Dynamic slots moved onto `prev_list` stay reserved until `prev_list` drops.
+        let rest = host_heap.dynamic(200);
+        assert!(rest.is_none(), "kept dynamic slots should still be held");
+
+        prev_list.close();
+        new_list.close();
+        host.execute(&[&prev_list, &new_list]);
+        drop(prev_list);
+        assert!(
+            host_heap.dynamic(200).is_some(),
+            "dropping prev_list must release kept dynamic slots"
+        );
+
+        let release = |object: This| {
+            crate::object::slot::<extern "system" fn(This) -> u32>(object, 0x10)(object)
+        };
+        assert_eq!(release(sampler_heap), 0);
+        assert_eq!(release(depth), 0);
+        assert_eq!(release(rt), 0);
     }
 }
 
