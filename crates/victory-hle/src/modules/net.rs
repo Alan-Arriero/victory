@@ -135,10 +135,40 @@ fn loopback(ip: IpAddr) -> bool {
     ip.to_canonical().is_loopback()
 }
 
-/// `localhost` or a loopback literal (bracketed IPv6 too).
+/// The local host name query via `gethostname` from host `ws2_32.dll`.
+fn local_hostname() -> Option<String> {
+    static HOSTNAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HOSTNAME
+        .get_or_init(|| {
+            let mut buf = [0 as c_char; 256];
+            let rc = host!("ws2_32.dll", "gethostname": extern "system" fn(*mut c_char, i32) -> i32)(
+                buf.as_mut_ptr(),
+                buf.len() as i32,
+            );
+            if rc == 0 {
+                // SAFETY: NUL-terminated by successful gethostname.
+                let s = unsafe { CStr::from_ptr(buf.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned();
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+            None
+        })
+        .clone()
+}
+
+fn is_local_hostname(name: &str) -> bool {
+    local_hostname().is_some_and(|host| host.eq_ignore_ascii_case(name))
+}
+
+/// `localhost`, the local hostname, or a loopback literal (bracketed IPv6 too).
 fn loopback_name(name: &str) -> bool {
     let bare = name.trim_start_matches('[').trim_end_matches(']');
-    bare.eq_ignore_ascii_case("localhost") || bare.parse().is_ok_and(loopback)
+    bare.eq_ignore_ascii_case("localhost")
+        || is_local_hostname(bare)
+        || bare.parse().is_ok_and(loopback)
 }
 
 fn shown(addr: Option<impl ToString>) -> String {
@@ -190,13 +220,14 @@ fn reachable_name(name: Option<String>) -> bool {
     }
 }
 
-/// Names answered without asking the network: none, `localhost`, IP
-/// literals (connecting to one is vetted separately).
+/// Names answered without asking the network: none, `localhost`, local hostname,
+/// IP literals (connecting to one is vetted separately).
 fn resolvable(name: Option<String>) -> bool {
     match name {
         Some(name)
             if !(name.is_empty()
                 || name.eq_ignore_ascii_case("localhost")
+                || is_local_hostname(&name)
                 || name.parse::<IpAddr>().is_ok()) =>
         {
             once("network name lookup blocked", name);
@@ -553,6 +584,14 @@ pub extern "system" fn bind(s: Socket, name: *const u8, len: i32) -> i32 {
 
 // Forward lookups.
 
+fn blocked_lookup(result: *mut *mut c_void) -> i32 {
+    if !result.is_null() {
+        // SAFETY: a non-null result points to the caller's output slot.
+        unsafe { result.write(std::ptr::null_mut()) };
+    }
+    WSAHOST_NOT_FOUND
+}
+
 pub extern "system" fn getaddrinfo(
     node: *const c_char,
     service: *const c_char,
@@ -560,7 +599,7 @@ pub extern "system" fn getaddrinfo(
     result: *mut *mut c_void,
 ) -> i32 {
     if !resolvable(narrow(node)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_lookup(result);
     }
     host!("ws2_32.dll", "getaddrinfo": extern "system" fn(*const c_char, *const c_char, *const c_void, *mut *mut c_void) -> i32)(
         node, service, hints, result,
@@ -574,7 +613,7 @@ pub extern "system" fn GetAddrInfoW(
     result: *mut *mut c_void,
 ) -> i32 {
     if !resolvable(wide(node)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_lookup(result);
     }
     host!("ws2_32.dll", "GetAddrInfoW": extern "system" fn(*const u16, *const u16, *const c_void, *mut *mut c_void) -> i32)(
         node, service, hints, result,
@@ -594,7 +633,7 @@ pub extern "system" fn GetAddrInfoExA(
     handle: *mut Handle,
 ) -> i32 {
     if !resolvable(narrow(name)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_lookup(result);
     }
     host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
@@ -614,7 +653,7 @@ pub extern "system" fn GetAddrInfoExW(
     handle: *mut Handle,
 ) -> i32 {
     if !resolvable(wide(name)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_lookup(result);
     }
     host!("ws2_32.dll", "GetAddrInfoExW": extern "system" fn(*const u16, *const u16, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
@@ -992,6 +1031,51 @@ mod tests {
     }
 
     #[test]
+    fn blocked_name_lookups_clear_the_result() {
+        let ansi = c"blocked.invalid".as_ptr();
+        let wide: Vec<u16> = "blocked.invalid\0".encode_utf16().collect();
+        let wide = wide.as_ptr();
+        let null = std::ptr::null();
+        let null_mut = std::ptr::null_mut();
+        let check = |lookup: &dyn Fn(*mut *mut c_void) -> i32| {
+            let mut result = std::ptr::dangling_mut::<c_void>();
+            assert_eq!(lookup(&mut result), WSAHOST_NOT_FOUND);
+            assert!(result.is_null());
+            assert_eq!(lookup(std::ptr::null_mut()), WSAHOST_NOT_FOUND);
+        };
+        check(&|result| getaddrinfo(ansi, std::ptr::null(), null, result));
+        check(&|result| GetAddrInfoW(wide, std::ptr::null(), null, result));
+        check(&|result| {
+            GetAddrInfoExA(
+                ansi,
+                std::ptr::null(),
+                0,
+                null,
+                null,
+                result,
+                null,
+                null_mut,
+                null,
+                std::ptr::null_mut(),
+            )
+        });
+        check(&|result| {
+            GetAddrInfoExW(
+                wide,
+                std::ptr::null(),
+                0,
+                null,
+                null,
+                result,
+                null,
+                null_mut,
+                null,
+                std::ptr::null_mut(),
+            )
+        });
+    }
+
+    #[test]
     fn only_loopback_is_reachable() {
         // Also starts Winsock for the raw calls below.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1086,6 +1170,22 @@ mod tests {
             ),
             WSAHOST_NOT_FOUND
         );
+
+        // Local machine hostname is resolvable.
+        if let Some(host) = local_hostname() {
+            let mut host_result = null;
+            let host_c = std::ffi::CString::new(host.clone()).unwrap();
+            let rc = getaddrinfo(
+                host_c.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut host_result,
+            );
+            assert_eq!(rc, 0, "local hostname {host} must be resolvable");
+            if !host_result.is_null() {
+                host!("ws2_32.dll", "freeaddrinfo": extern "system" fn(*mut c_void))(host_result);
+            }
+        }
         let mut text = [0 as c_char; 64];
         let away = v4(AWAY, 80);
         assert_eq!(

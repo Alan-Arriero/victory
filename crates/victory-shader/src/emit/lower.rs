@@ -881,17 +881,21 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::WAVE_OPS;
         let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        if let (Op::AddF, Some(inclusive)) = (op, prefix) {
+            let r = self.float_prefix_sum(x, id, inclusive);
+            return Ok(self.as_int(r));
+        }
         let arg = if float { self.as_float(x) } else { x };
         let ty = if float { f32t } else { i32t };
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
-            (Op::AddU | Op::AddF, Some(inclusive)) => {
+            (Op::AddU, Some(inclusive)) => {
                 let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
                 let r = self.s.op(
                     c,
-                    &format!("wavePrefixOp.{sfx}"),
+                    "wavePrefixOp.i32",
                     Attr::NoUnwind,
-                    ty,
+                    i32t,
                     121,
                     &[arg, k0, k1],
                 );
@@ -963,6 +967,85 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if float { self.as_int(r) } else { r })
+    }
+
+    /// `Op::AddF` prefix sum over active host lanes from cross-lane reads
+    /// instead of `wavePrefixOp.f32`, which on AMD Radeon drivers corrupts a
+    /// lane whose own term is NaN, infinity or large enough to round away
+    /// earlier terms.
+    fn float_prefix_sum(&mut self, x: V, id: V, inclusive: bool) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let me = self.lane_index();
+        let t = self.s.m.bool(true);
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let ballot = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[t]);
+        let (words, rounds) = match self.s.wave_size {
+            Some(32) => (1, 5),
+            Some(64) => (2, 6),
+            _ => (4, 7),
+        };
+        let (z, one, k5, k31, none) = (
+            self.s.m.i32(0),
+            self.s.m.i32(1),
+            self.s.m.i32(5),
+            self.s.m.i32(31),
+            self.s.m.i32(u32::MAX),
+        );
+        let word_idx = self.s.m.bin(c, Bin::LShr, me, k5);
+        let bit_idx = self.s.m.bin(c, Bin::And, me, k31);
+        let low_mask = self.s.m.bin(c, Bin::Shl, one, bit_idx);
+        let low_mask = self.s.m.bin(c, Bin::Sub, low_mask, one);
+        let mut prev = none;
+        for j in 0..words {
+            let w = self.s.m.extract(c, ballot, j);
+            let m = if words == 1 {
+                low_mask
+            } else {
+                let kj = self.s.m.i32(j);
+                let below = self.s.m.cmp(c, pred::IULT, kj, word_idx);
+                let same = self.s.m.cmp(c, pred::EQ, kj, word_idx);
+                let m = self.s.m.select(c, same, low_mask, z);
+                self.s.m.select(c, below, none, m)
+            };
+            let mw = self.s.m.bin(c, Bin::And, w, m);
+            let clz = self
+                .s
+                .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[mw]);
+            let mut cand = self.s.m.bin(c, Bin::Sub, k31, clz);
+            if j > 0 {
+                let base = self.s.m.i32(32 * j);
+                cand = self.s.m.bin(c, Bin::Or, cand, base);
+            }
+            let has = self.s.m.cmp(c, pred::NE, mw, z);
+            prev = self.s.m.select(c, has, cand, prev);
+        }
+        let (mut acc, mut p) = if inclusive {
+            (self.as_float(x), prev)
+        } else {
+            let has = self.s.m.cmp(c, pred::NE, prev, none);
+            let at = self.s.m.select(c, has, prev, me);
+            let px = self.read_lane(x, at);
+            let pp = self.read_lane(prev, at);
+            let x0 = self.s.m.select(c, has, px, id);
+            let has2 = self.s.m.cmp(c, pred::NE, pp, none);
+            let p0 = self.s.m.select(c, has2, prev, none);
+            (self.as_float(x0), p0)
+        };
+        for _ in 0..rounds {
+            let has = self.s.m.cmp(c, pred::NE, p, none);
+            let at = self.s.m.select(c, has, p, me);
+            let ai = self.as_int(acc);
+            let other = self.read_lane(ai, at);
+            let other = self.as_float(other);
+            let next = self.read_lane(p, at);
+            let sum = self.s.m.bin(c, Bin::Add, other, acc);
+            acc = self.s.m.select(c, has, sum, acc);
+            p = self.s.m.select(c, has, next, none);
+        }
+        acc
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
@@ -1361,7 +1444,13 @@ impl<'a> Lower<'a> {
             None => (v, false),
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
-        if !self.x.st.active.contains(&lo) {
+        // A mask also set in every lane that does not run where it is
+        // written: the ballot leaves those lanes out, so they are added.
+        // Compute only, where host lane n is console lane n.
+        let outside = !self.x.st.active.contains(&lo)
+            && self.x.st.outside.contains(&lo)
+            && matches!(self.x.native.io, StageIo::Cs(_));
+        if !self.x.st.active.contains(&lo) && !outside {
             return Err("a lane mask holding lanes elsewhere read as data");
         }
         let (x, y) = match self.ballots.get(&lo) {
@@ -1385,7 +1474,20 @@ impl<'a> Lower<'a> {
                     .s
                     .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
                 self.s.flags |= flags::WAVE_OPS;
-                let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                let mut xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                if outside {
+                    let t = self.s.m.bool(true);
+                    let here = self
+                        .s
+                        .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[t]);
+                    let ones = self.s.m.i32(u32::MAX);
+                    let mut add = |word: V, n: u32| {
+                        let present = self.s.m.extract(at, here, n);
+                        let away = self.s.m.bin(at, Bin::Xor, present, ones);
+                        self.s.m.bin(at, Bin::Or, word, away)
+                    };
+                    xy = (add(xy.0, 0), add(xy.1, 1));
+                }
                 self.ballots.insert(lo, xy);
                 xy
             }
@@ -4830,6 +4932,17 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.cast(c, op, a, self.s.t.f32);
                 float(self, r)
             }
+            "v_cvt_off_f32_i4" => {
+                // The low nibble as a signed 4-bit integer, over 16.
+                let a = s(self, 0)?;
+                let k28 = self.s.m.i32(28);
+                let a = self.s.m.bin(c, Bin::Shl, a, k28);
+                let a = self.s.m.bin(c, Bin::AShr, a, k28);
+                let f = self.s.m.cast(c, Cast::SiToFp, a, self.s.t.f32);
+                let k = self.s.m.f32(0.0625f32.to_bits());
+                let r = self.s.m.bin(c, Bin::Mul, f, k);
+                float(self, r)
+            }
             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
                 // Each source is f32, or with op_sel_hi the low (op_sel: high)
                 // f16 half; neg_hi is the absolute value here.
@@ -8093,10 +8206,16 @@ impl<'a> Lower<'a> {
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
+                let arg = phi.args[n];
+                let st = self.x.st;
+                // A number joined in (a constant before a branch) only where
+                // the join was checked to hold per lane.
+                let checked = st.active.contains(&phi.value) || st.outside.contains(&phi.value);
+                let m = *st
+                    .masks
+                    .get(&arg)
+                    .or_else(|| st.numbers.get(&arg).filter(|_| checked))
+                    .ok_or_else(|| unsupported(offset, "a lane-mask join of an untracked mask"))?;
                 let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
             }
