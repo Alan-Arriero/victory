@@ -2687,6 +2687,8 @@ mod depth_tests {
 
         let list = host.new_list().expect("host list");
         let mut state = State::default();
+        let _ = host.log_messages();
+        let errors_before = host.d3d12_errors();
         state.set_targets(&list, &[rtv_handle], dsv_handle);
         assert!(
             list.kept_contains(crate::resource::host_resource(rtv_tex).expect("rtv host resource")),
@@ -2709,8 +2711,6 @@ mod depth_tests {
             "set_targets must keep host DSV texture alive while list is open"
         );
 
-        let _ = host.log_messages();
-        let errors_before = host.d3d12_errors();
         list.close();
         host.execute(&[&list]);
         // SAFETY: plain device-removed query.
