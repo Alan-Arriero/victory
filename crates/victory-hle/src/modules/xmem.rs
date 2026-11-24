@@ -690,23 +690,19 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
             (!pages.is_null()).then(|| *pages.add(i)),
         )
     };
-    // Addresses given in runs of consecutive pages map in one call, so a run
-    // pays one unmap, one view and one commit (per section run) instead of
-    // three system calls per page. Pages that are
-    // not consecutive slices of one section still map one by one inside the
-    // call, and a run that spans two placeholders falls back to the per-page
-    // calls below.
+    // Keep each mapped scatter address in its own host view on every host
+    // (Windows and Wine alike): replacing or unmapping one page of a larger
+    // view in `unmap()` calls `UnmapViewOfFile2` on the whole view before
+    // remapping its neighbors, briefly unmapping pages other title threads may
+    // be reading concurrently. Consecutive unmaps (null `pages` or page 0)
+    // still batch into one call over these independent views.
     let mut i = 0;
     while i < n {
         let (address, page) = entry(i);
         // A zero page unmaps its address; a run of them unmaps in one call.
         let zero = page == Some(0);
         let mut run = 1;
-        // Under Wine keep each mapped scatter address in its own host view.
-        // Replacing part of a larger view in unmap() would briefly remove the
-        // neighboring pages too, even while other title threads use them.
-        // Unmaps may still cover a whole run of these independent views.
-        let batch = zero || pages.is_null() || !on_wine();
+        let batch = zero || pages.is_null();
         while batch && i + run < n {
             let (next, next_page) = entry(i + run);
             if next != address + run * PAGE || (next_page == Some(0)) != zero {
@@ -1327,10 +1323,8 @@ mod tests {
             1
         );
         for k in 0..3 {
-            if on_wine() {
-                // A later replacement of a neighbor can unmap only its own host view.
-                assert_eq!(query(at(k)).host.AllocationBase, at(k));
-            }
+            // A later replacement of a neighbor can unmap only its own host view.
+            assert_eq!(query(at(k)).host.AllocationBase, at(k));
             assert_eq!(
                 // SAFETY: mapped read-write.
                 unsafe { at(k).cast::<u8>().read() },
@@ -1382,6 +1376,71 @@ mod tests {
         );
         assert_eq!(query(at(0)).host.State, MEM_RESERVE);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// Unmapping or remapping one scatter-mapped page must not briefly unmap
+    /// an adjacent scatter-mapped page while another thread reads it.
+    #[test]
+    fn scatter_neighbor_unmap_does_not_fault_concurrent_reader() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let pages = allocate(4);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            4 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        let at = |k: usize| a.wrapping_byte_add(k * PAGE);
+        let addresses = [at(0), at(1), at(2), at(3)];
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addresses.as_ptr(), 4, pages.as_ptr()),
+            1
+        );
+
+        let sentinel: u64 = 0x1122_3344_5566_7788;
+        let read_addr = at(2).wrapping_byte_add(PAGE - 0x110) as usize;
+        // SAFETY: page 2 is mapped read-write and aligned for `u64`.
+        unsafe { (read_addr as *mut u64).write(sentinel) };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = stop.clone();
+        let reader = std::thread::spawn(move || {
+            let mut reads = 0u64;
+            while !reader_stop.load(Ordering::Relaxed) {
+                // SAFETY: page 2 stays mapped for the lifetime of this thread.
+                let value = unsafe { (read_addr as *const u64).read_volatile() };
+                assert_eq!(value, sentinel);
+                reads += 1;
+            }
+            reads
+        });
+
+        let neighbor = [at(3)];
+        let unmap_page = [0usize];
+        let remap_page = [pages[3]];
+        for _ in 0..256 {
+            assert_eq!(
+                XMemMapPhysicalPagesScatter(neighbor.as_ptr(), 1, unmap_page.as_ptr()),
+                1
+            );
+            assert_eq!(
+                XMemMapPhysicalPagesScatter(neighbor.as_ptr(), 1, remap_page.as_ptr()),
+                1
+            );
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let reads = reader.join().expect("reader thread should not fault");
+        assert!(reads > 0);
+
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addresses.as_ptr(), 4, std::ptr::null()),
+            1
+        );
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
     }
 
     #[test]
