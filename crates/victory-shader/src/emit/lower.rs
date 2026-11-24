@@ -1228,6 +1228,9 @@ impl<'a> Lower<'a> {
                             )
                         }
                     }
+                    // A scalar parked in a VGPR lane (`ir::unspill`), read where
+                    // the paths only seem to allow it before any save.
+                    None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
