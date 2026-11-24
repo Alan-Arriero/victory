@@ -209,6 +209,25 @@ impl HostHeap {
         Self::with(host, heap, kind, count, extra)
     }
 
+    /// All slots are allocated dynamically and held by recordings.
+    pub(super) fn root_views() -> Option<Self> {
+        const SLOTS: u32 = 4096;
+        let host = host()?;
+        let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        // SAFETY: a shader-visible view heap of a supported size.
+        let heap = unsafe {
+            host.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: SLOTS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+        }
+        .ok()?;
+        Self::with(host, heap, kind, 0, SLOTS)
+    }
+
     /// The host heap over `heap`: `count` title slots, then `extra` dynamic
     /// ones, all made null.
     fn with(
@@ -620,11 +639,6 @@ impl HostHeap {
             )
         };
         self.keep(index, Kept::Empty);
-    }
-
-    /// Whether this is a sampler heap.
-    pub(crate) fn is_sampler(&self) -> bool {
-        self.sampler
     }
 
     /// The shader-visible handle of slot `index`.

@@ -639,21 +639,13 @@ impl State {
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         self.depth_sampled = false;
         let l = &list.list;
-        // Heaps first: a root signature with directly indexed heaps must be
-        // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
-            // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
-            self.host_roots = [0; 2];
+        let needs_root_heap = self.heaps[0] == 0
+            && p.stages.iter().any(|stage| {
+                !stage.root_uavs.is_empty()
+                    || (!stage.root_srvs.is_empty() && crate::pipeline::host::bounded_root_srvs())
+            });
+        if !self.bind_heaps(list, needs_root_heap) {
+            return false;
         }
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
@@ -782,6 +774,34 @@ impl State {
         true
     }
 
+    /// The host heap must precede the root signature, including when switching
+    /// between the renderer's view heap and either of the title's heaps.
+    fn bind_heaps(&mut self, list: &HostList, needs_root_heap: bool) -> bool {
+        let mut keys = self.heaps;
+        if keys[0] == 0 && needs_root_heap {
+            keys[0] = crate::descriptor::ROOT_VIEW_HEAP;
+        }
+        if keys != self.host_heaps {
+            let mut heaps = Vec::new();
+            for key in keys {
+                if key == 0 {
+                    continue;
+                }
+                let Some(heap) = crate::descriptor::recording_heap(key) else {
+                    once!("a bound descriptor heap could not be created on the host");
+                    return false;
+                };
+                list.keep(&heap.heap);
+                heaps.push(Some(heap.heap.clone()));
+            }
+            // SAFETY: an open list and shader-visible heaps retained for the recording.
+            unsafe { list.list.SetDescriptorHeaps(&heaps) };
+            self.host_heaps = keys;
+            self.host_roots = [0; 2];
+        }
+        true
+    }
+
     /// Bind a bounded raw buffer. Writable views have no declared size, so
     /// limit the span the renderer may write and copy back to one MiB.
     fn root_buffer_table(
@@ -792,14 +812,9 @@ impl State {
         compute: bool,
         access: RawAccess,
     ) -> bool {
-        let Some((heap, host)) = self
-            .heaps
-            .iter()
-            .filter(|&&h| h != 0)
-            .map(|&h| crate::descriptor::heap(h as This))
-            .find_map(|h| h.host().filter(|x| !x.is_sampler()).map(|x| (h, x)))
-        else {
-            once!("a raw root view without a bound view heap: the draw is dropped");
+        let heap_id = self.host_heaps[0];
+        let Some(host) = crate::descriptor::recording_heap(heap_id) else {
+            once!("a raw root view without a host heap: the draw is dropped");
             return false;
         };
         let shadow = address
@@ -820,7 +835,6 @@ impl State {
             };
             (len >= 4).then_some((&s.buffer, offset, len))
         });
-        let heap_id = std::ptr::from_ref(heap) as usize;
         let range = view.map(|(buffer, offset, len)| RawBufferRange {
             resource: buffer.as_raw() as usize,
             offset,
@@ -1844,6 +1858,21 @@ fn rect_source(first: u32, count: u32, stride: u32, size: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{expanded_vertices, rect_source};
+
+    #[test]
+    fn bounded_root_views_bind_without_a_title_heap() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let mut state = super::State::default();
+        assert!(state.bind_heaps(&list, true));
+        assert_eq!(state.host_heaps, [crate::descriptor::ROOT_VIEW_HEAP, 0]);
+        assert_eq!(state.heaps, [0, 0]);
+        assert!(state.bind_heaps(&list, false));
+        assert_eq!(state.host_heaps, [0, 0]);
+        list.close();
+    }
 
     #[test]
     fn bounded_root_slots_belong_to_the_recording_that_allocated_them() {
