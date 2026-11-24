@@ -1242,8 +1242,9 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
-        let rects = self.needs_rect_expansion();
-        let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
+        let prepared = self.prepare(list, false);
+        let rects = prepared && self.needs_rect_expansion();
+        let ran = prepared && (!rects || self.rectangles(list, vertices, first));
         if ran {
             // Rectangles were expanded into their own vertex buffers (their
             // count checked to fit by `rectangles`).
@@ -1272,7 +1273,7 @@ impl State {
 
     fn needs_rect_expansion(&self) -> bool {
         self.topology == RECTANGLES
-            && !crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rects)
+            && crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| !p.rects)
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
@@ -1351,11 +1352,12 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
-        let needs_expansion = self.needs_rect_expansion();
+        let prepared = self.prepare(list, true);
+        let needs_expansion = prepared && self.needs_rect_expansion();
         if needs_expansion {
             once!("indexed rectangles not drawn");
         }
-        let ran = !needs_expansion && self.prepare(list, true);
+        let ran = prepared && !needs_expansion;
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
@@ -1434,18 +1436,24 @@ impl State {
             },
             None => None,
         };
-        let needs_expansion = matches!(kind, DRAW | INDEXED) && self.needs_rect_expansion();
-        if kind == INDEXED && needs_expansion {
-            once!("indirect indexed rectangles not drawn");
-            why("indexed rectangles not supported");
-            return false;
-        }
-        if kind == DRAW && needs_expansion {
+        // Pipeline creation can still be in flight. Select the rectangle path
+        // only from a finished pipeline, whose geometry stage is now known.
+        let fallback = if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES {
             let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
                 #[cfg(feature = "diagnostics")]
                 crate::pipeline::note_drop(self.pipeline as This);
                 return false;
             };
+            (!p.rects).then_some(p)
+        } else {
+            None
+        };
+        if let Some(p) = fallback {
+            if kind == INDEXED {
+                once!(shaders = %p.name, "indirect indexed rectangles not drawn");
+                why("indexed rectangles not supported");
+                return false;
+            }
             if p.compute || p.mesh {
                 why(&format!(
                     "pipeline mismatch (compute {}, mesh {}, topology {})",
