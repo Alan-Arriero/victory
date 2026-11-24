@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
-use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
+use super::bitcode::{Attr, Bin, Cast, Module, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
@@ -4949,14 +4949,7 @@ impl<'a> Lower<'a> {
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
-                let mask = if self.x.native.wave64 { 63 } else { 31 };
-                let lane = match lane {
-                    V::Const(k) => self.s.m.i32(k & mask),
-                    _ => {
-                        let m = self.s.m.i32(mask);
-                        self.s.m.bin(c, Bin::And, lane, m)
-                    }
-                };
+                let lane = wave_lane(&mut self.s.m, c, lane, self.x.native.wave64);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
                 if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
@@ -4972,14 +4965,7 @@ impl<'a> Lower<'a> {
                 // RDNA2 ignores EXEC for v_writelane_b32 so compilers can spill
                 // SGPRs into inactive lanes.
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
-                let mask = if self.x.native.wave64 { 63 } else { 31 };
-                let lane = match lane {
-                    V::Const(k) => self.s.m.i32(k & mask),
-                    _ => {
-                        let m = self.s.m.i32(mask);
-                        self.s.m.bin(c, Bin::And, lane, m)
-                    }
-                };
+                let lane = wave_lane(&mut self.s.m, c, lane, self.x.native.wave64);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a lane write");
                 };
@@ -8245,6 +8231,20 @@ fn post_dominators(succs: &[Vec<usize>], preds: &[Vec<usize>], exit: usize) -> V
     ipdom
 }
 
+/// The lane `v_readlane_b32` / `v_writelane_b32` names, wrapped to the wave
+/// (`& 31`, `& 63` in wave64). A constant stays a constant: its value is the
+/// lane, not its place in the constant pool (`V::Const` holds the place).
+fn wave_lane(m: &mut Module, block: usize, lane: V, wave64: bool) -> V {
+    let mask = if wave64 { 63 } else { 31 };
+    match m.int_value(lane) {
+        Some(k) => m.i32(k as u32 & mask),
+        None => {
+            let mask = m.i32(mask);
+            m.bin(block, Bin::And, lane, mask)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
@@ -9189,6 +9189,23 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    /// A constant lane is wrapped by its value: lane 40 is lane 8 in wave32
+    /// and 40 in wave64, whatever its place in the constant pool.
+    #[test]
+    fn a_constant_lane_wraps_by_its_value_not_its_pool_place() {
+        let mut m = super::Module::default();
+        // Constants interned first, so lane 40's place in the pool is a
+        // small index, not 40 (nor 8 or 40 once wrapped).
+        for k in 100..103 {
+            m.i32(k);
+        }
+        let lane = m.i32(40);
+        let wave32 = super::wave_lane(&mut m, 0, lane, false);
+        let wave64 = super::wave_lane(&mut m, 0, lane, true);
+        assert_eq!(m.int_value(wave32), Some(8));
+        assert_eq!(m.int_value(wave64), Some(40));
     }
 
     #[test]
