@@ -8802,6 +8802,7 @@ mod select_tests {
         let st = crate::structure::structure(&p).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
         let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        #[cfg_attr(not(windows), allow(unused_mut))]
         let mut shader = emit(&c, &native, &p, &st, &io, &res).unwrap();
         assert!(!shader.dxil.is_empty());
         #[cfg(windows)]
