@@ -7,7 +7,6 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
-#[cfg(windows)]
 mod translate;
 
 use std::num::NonZeroUsize;
@@ -171,24 +170,13 @@ fn dispatch(command: Command) -> Result<()> {
             pipelines,
             list,
             jobs,
-        } => {
-            #[cfg(windows)]
-            {
-                translate::run(
-                    paths,
-                    validate,
-                    pipelines,
-                    list,
-                    jobs.map(NonZeroUsize::get),
-                )
-            }
-            // The translator validates and runs shaders on the host GPU.
-            #[cfg(not(windows))]
-            {
-                let _ = (paths, validate, pipelines, list, jobs);
-                anyhow::bail!("translating shaders requires Windows")
-            }
-        }
+        } => translate::run(
+            paths,
+            validate,
+            pipelines,
+            list,
+            jobs.map(NonZeroUsize::get),
+        ),
         Command::Run {
             exe,
             unimplemented,
