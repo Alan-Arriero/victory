@@ -24,6 +24,13 @@ mod capture;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+/// Diagnostics: counters raised by this crate's callers (the title's page
+/// scatters), which ride the frame line with the copy statistics.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod stats {
+    pub use super::copystat::{C, add};
+}
+
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -65,4 +72,4 @@ mod watch;
 #[cfg(windows)]
 pub use host::{HdrDisplayInfo, display_hdr_info, on_failure};
 #[cfg(windows)]
-pub use watch::{title_memory_remapped, writing as kernel_will_write};
+pub use watch::{kernel_will_write, kernel_wrote, title_memory_remapped};

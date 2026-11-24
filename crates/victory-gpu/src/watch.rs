@@ -169,11 +169,29 @@ struct Guards {
     protected: BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
     clean: BTreeSet<usize>,
+    /// Announced kernel writes still to land, as block ranges `[first, end)`
+    /// with how many announcements of that range are open: their blocks are
+    /// left open until they have, however many refreshes come first. Kept
+    /// as ranges, not per block, so a title-supplied length (saturated by
+    /// `fread`'s size times count) costs nothing however large; counted, so
+    /// a range announced again and again (overlapped reads into the same
+    /// buffer, which never say they landed) stays one entry.
+    announced: BTreeMap<(usize, usize), u32>,
+}
+
+impl Guards {
+    /// Whether an announced kernel write still to land covers `block`.
+    fn announced(&self, block: usize) -> bool {
+        self.announced
+            .keys()
+            .any(|&(first, end)| (first..end).contains(&block))
+    }
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
+    announced: BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -199,7 +217,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
-            } else {
+            } else if !g.announced(block) {
                 run.get_or_insert(block);
                 continue;
             }
@@ -348,26 +366,53 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks.
-/// The runtime calls it (as `kernel_will_write`) before the title's kernel
-/// reads into its own memory.
-pub fn writing(at: usize, len: usize) {
+/// For the title's kernel reads, which other threads' refreshes can
+/// overtake, the runtime calls [`kernel_will_write`] instead.
+pub(crate) fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
 }
 
-/// The runtime mapped or unmapped title memory `[at, at + len)`: what it
-/// shows is new and read-write, so it is no longer guarded.
-pub fn title_memory_remapped(at: usize, len: usize) {
+/// Before the title's kernel read into its memory `[at, at + len)`: opens
+/// the guarded blocks there and keeps them open until [`kernel_wrote`]. A
+/// refresh on another thread in between would otherwise guard them again,
+/// and the read would fail.
+pub fn kernel_will_write(at: usize, len: usize) {
+    let end = at.saturating_add(len);
     let mut g = guards();
-    let blocks: Vec<usize> = g
-        .protected
-        .range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK))
-        .copied()
-        .collect();
+    open(&mut g, at, end);
+    *g.announced
+        .entry((at / BLOCK, end.div_ceil(BLOCK)))
+        .or_default() += 1;
+}
+
+/// The kernel write [`kernel_will_write`] announced for `[at, at + len)`
+/// has landed (or failed); its blocks can be guarded again.
+pub fn kernel_wrote(at: usize, len: usize) {
+    let range = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    let mut g = guards();
+    if let Some(n) = g.announced.get_mut(&range) {
+        *n -= 1;
+        if *n == 0 {
+            g.announced.remove(&range);
+        }
+    }
+}
+
+/// The runtime mapped or unmapped title memory `[at, at + len)`: what it
+/// shows is new and read-write, so it is no longer guarded, and kernel
+/// writes announced wholly inside it are moot (an overlapped read that
+/// never said it landed no longer keeps those blocks open).
+pub fn title_memory_remapped(at: usize, len: usize) {
+    let (first, end) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    let mut g = guards();
+    let blocks: Vec<usize> = g.protected.range(first..end).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
     }
+    g.announced
+        .retain(|&(from, to), _| !(first <= from && to <= end));
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -756,5 +801,91 @@ mod tests {
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// `fread`'s size times count saturates to `usize::MAX`: announcing and
+    /// landing that kernel read is one range, not a step per block of the
+    /// whole address space, and landing it leaves nothing announced.
+    #[test]
+    fn a_saturated_kernel_read_is_announced_in_one_step() {
+        // Kernel half of the address space: no user allocation of another
+        // test running at the same time can fall in the announced range.
+        let at = 0xFFFF_8000_0000_0000;
+        let range = (at / BLOCK, usize::MAX.div_ceil(BLOCK));
+        kernel_will_write(at, usize::MAX);
+        assert!(guards().announced(at / BLOCK + 12345));
+        kernel_wrote(at, usize::MAX);
+        assert!(!guards().announced.contains_key(&range));
+    }
+
+    /// A range announced again and again without landing (overlapped reads
+    /// into one buffer) is one counted entry, and a remap over it drops it.
+    #[test]
+    fn repeated_announcements_are_counted_and_a_remap_drops_them() {
+        let at = 0xFFFF_9000_0000_0000;
+        let range = (at / BLOCK, (at + BLOCK).div_ceil(BLOCK));
+        for _ in 0..1000 {
+            kernel_will_write(at, BLOCK);
+        }
+        assert_eq!(guards().announced.get(&range), Some(&1000));
+        kernel_wrote(at, BLOCK);
+        assert_eq!(guards().announced.get(&range), Some(&999));
+        title_memory_remapped(at, BLOCK);
+        assert!(!guards().announced.contains_key(&range));
+    }
+
+    /// A kernel read announced with `kernel_will_write` survives a refresh
+    /// on another thread before it lands; once `kernel_wrote` says it has,
+    /// the next refresh guards its block again.
+    #[test]
+    fn an_announced_kernel_read_survives_a_refresh_before_it() {
+        use std::io::{Read, Seek, Write};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"from the disk").unwrap();
+        let read = |file: &mut std::fs::File| {
+            file.rewind().unwrap();
+            // SAFETY: 13 bytes of our view, nothing else refers to them.
+            let into = unsafe { std::slice::from_raw_parts_mut((view + 100) as *mut u8, 13) };
+            file.read(into).is_ok_and(|n| n == 13)
+        };
+        kernel_will_write(view + 100, 13); // the title's thread, in `ReadFile`
+        let _ = guard(view, view + 2 * BLOCK); // a refresh on another thread
+        assert!(
+            read(&mut file),
+            "the refresh guarded the block again under the read"
+        );
+        kernel_wrote(view + 100, 13);
+        assert_eq!(
+            guard(view, view + 2 * BLOCK),
+            Some((view / PAGE..view / PAGE + 1).collect())
+        );
+        assert!(!read(&mut file), "guarded again once the read is done");
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                },
+            )
+        };
+        title_memory_remapped(view, 2 * BLOCK);
     }
 }

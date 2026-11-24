@@ -10,6 +10,7 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
@@ -357,6 +358,11 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 // mapping is a view of consecutive slices in place of a host placeholder.
 
 const PAGE: usize = 64 << 10;
+/// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
+/// 16. The title stores `number >> 4` in 21 bits.
+const FRAMES: usize = PAGE >> 12;
+const PAGE_NUMBER_LIMIT: usize = (1 << 21) * FRAMES;
+const FIRST_PAGE_NUMBER: usize = 0x10_0000;
 
 struct Section(HANDLE);
 
@@ -383,15 +389,47 @@ struct Slice {
 #[derive(Default)]
 struct Physical {
     next_page: usize,
+    free_pages: Vec<usize>,
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
 }
 
+impl Physical {
+    fn allocate(&mut self, section: Arc<Section>, numbers: &mut [MaybeUninit<usize>]) -> bool {
+        let fresh = numbers.len().saturating_sub(self.free_pages.len());
+        if fresh > (PAGE_NUMBER_LIMIT - self.next_page) / FRAMES {
+            return false;
+        }
+        for (index, out) in numbers.iter_mut().enumerate() {
+            let number = self.free_pages.pop().unwrap_or_else(|| {
+                let number = self.next_page;
+                self.next_page += FRAMES;
+                number
+            });
+            self.pages.insert(
+                number,
+                Slice {
+                    section: section.clone(),
+                    index,
+                },
+            );
+            out.write(number);
+        }
+        true
+    }
+
+    fn free(&mut self, number: usize) {
+        if self.pages.remove(&number).is_some() {
+            self.free_pages.push(number);
+        }
+    }
+}
+
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
     Mutex::new(Physical {
         // Page numbers are opaque to titles; 0 stays unused.
-        next_page: 0x10_0000,
+        next_page: FIRST_PAGE_NUMBER,
         ..Default::default()
     })
 });
@@ -414,6 +452,11 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
+    if n > (PAGE_NUMBER_LIMIT - FIRST_PAGE_NUMBER) / FRAMES {
+        // SAFETY: checked non-null.
+        unsafe { count.write(0) };
+        return 0;
+    }
     // A pagefile-backed section of `size` bytes, its pages committed when
     // first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
@@ -444,27 +487,15 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
-    let mut physical = physical();
-    let first = physical.next_page;
-    physical.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
+    // SAFETY: the title passes room for `n` page numbers, which may be uninitialized.
+    let numbers = unsafe { std::slice::from_raw_parts_mut(pages.cast(), n) };
+    if !physical().allocate(Arc::new(Section(handle)), numbers) {
+        // SAFETY: checked non-null.
+        unsafe { count.write(0) };
+        return 0;
     }
     1
 }
-
-/// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
-/// 16: Grand Theft Auto VI keeps them as 21-bit `number >> 4` and rebuilds
-/// them with `<< 4` (128 GiB of pages at most).
-const FRAMES: usize = PAGE >> 12;
 
 /// Pages still mapped stay readable through their views until unmapped.
 pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
@@ -474,7 +505,7 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     let mut physical = physical();
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+        physical.free(unsafe { *pages.add(i) });
     }
     1
 }
@@ -652,21 +683,70 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
-    for i in 0..n {
-        // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
-        let (address, page) = unsafe {
-            (
-                *addresses.add(i),
-                if pages.is_null() || *pages.add(i) == 0 {
-                    std::ptr::null()
-                } else {
-                    pages.add(i)
-                },
-            )
-        };
-        if XMemMapPhysicalPages(address, 1, page).is_null() {
-            return 0;
+    // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
+    let entry = |i: usize| unsafe {
+        (
+            *addresses.add(i) as usize,
+            (!pages.is_null()).then(|| *pages.add(i)),
+        )
+    };
+    // Addresses given in runs of consecutive pages map in one call, so a run
+    // pays one unmap, one view and one commit (per section run) instead of
+    // three system calls per page. Pages that are
+    // not consecutive slices of one section still map one by one inside the
+    // call, and a run that spans two placeholders falls back to the per-page
+    // calls below.
+    let mut i = 0;
+    while i < n {
+        let (address, page) = entry(i);
+        // A zero page unmaps its address; a run of them unmaps in one call.
+        let zero = page == Some(0);
+        let mut run = 1;
+        while i + run < n {
+            let (next, next_page) = entry(i + run);
+            if next != address + run * PAGE || (next_page == Some(0)) != zero {
+                break;
+            }
+            run += 1;
         }
+        let mapped = if zero || pages.is_null() {
+            XMemMapPhysicalPages(address as *mut c_void, run, std::ptr::null())
+        } else {
+            // SAFETY: `i < n`, and the title passes `n` pages when `pages`
+            // is not null; the run starts at `i` and stays inside them.
+            XMemMapPhysicalPages(address as *mut c_void, run, unsafe { pages.add(i) })
+        };
+        #[cfg(feature = "diagnostics")]
+        {
+            use victory_gpu::stats::{C, add};
+            add(C::Scatter, 1);
+            add(C::ScatterPages, run as u64);
+            add(C::ScatterMaps, 1);
+        }
+        if mapped.is_null() {
+            if run == 1 {
+                return 0;
+            }
+            // One range crossing two placeholders cannot be one view: map the
+            // run a page at a time, as before.
+            for k in i..i + run {
+                let (address, _) = entry(k);
+                let page = match (zero, pages.is_null()) {
+                    (true, _) | (_, true) => std::ptr::null(),
+                    // SAFETY: `k < i + run <= n` page numbers were passed.
+                    _ => unsafe { pages.add(k) },
+                };
+                if XMemMapPhysicalPages(address as *mut c_void, 1, page).is_null() {
+                    return 0;
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    use victory_gpu::stats::{C, add};
+                    add(C::ScatterMaps, 1);
+                }
+            }
+        }
+        i += run;
     }
     1
 }
@@ -1215,6 +1295,86 @@ mod tests {
         assert_eq!(XMemIsToolsMemAvailable(), 0);
     }
 
+    /// A scatter of pages at consecutive addresses maps them in one call:
+    /// each address shows its own page, pages asked for in a different order
+    /// still land where they are asked for, a zero page in the middle unmaps
+    /// only its own address, and an unmap run goes in one call.
+    #[test]
+    fn scatter_maps_runs_of_consecutive_addresses() {
+        let pages = allocate(3);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            3 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        let at = |k: usize| a.wrapping_byte_add(k * PAGE);
+        for k in 0..3 {
+            assert!(write_physical(&pages[k..], 0, &[b'0' + k as u8]));
+        }
+
+        // Three pages, three consecutive addresses: one call.
+        let addresses = [at(0), at(1), at(2)];
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addresses.as_ptr(), 3, pages.as_ptr()),
+            1
+        );
+        for k in 0..3 {
+            assert_eq!(
+                // SAFETY: mapped read-write.
+                unsafe { at(k).cast::<u8>().read() },
+                b'0' + k as u8,
+                "page {k} at its address"
+            );
+        }
+
+        // Ask for them out of order: each still lands where it is named.
+        let addresses = [at(2), at(0)];
+        let swapped = [pages[0], pages[2]];
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addresses.as_ptr(), 2, swapped.as_ptr()),
+            1
+        );
+        assert_eq!(
+            // SAFETY: mapped read-write.
+            unsafe { at(2).cast::<u8>().read() },
+            b'0'
+        );
+        assert_eq!(
+            // SAFETY: mapped read-write.
+            unsafe { at(0).cast::<u8>().read() },
+            b'2'
+        );
+
+        // A zero page ends the run it is in: its address is unmapped, the
+        // page after it still maps.
+        let addresses = [at(1), at(2)];
+        let mixed = [0usize, pages[1]];
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addresses.as_ptr(), 2, mixed.as_ptr()),
+            1
+        );
+        assert_eq!(query(at(1)).host.State, MEM_RESERVE);
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { at(2).cast::<u8>().read() }, b'1');
+
+        // Three consecutive addresses without pages unmap as one run.
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addresses.as_ptr(), 2, std::ptr::null()),
+            1
+        );
+        assert_eq!(query(at(1)).host.State, MEM_RESERVE);
+        assert_eq!(query(at(2)).host.State, MEM_RESERVE);
+        assert_eq!(
+            XMemMapPhysicalPagesScatter([at(0)].as_ptr(), 1, std::ptr::null()),
+            1
+        );
+        assert_eq!(query(at(0)).host.State, MEM_RESERVE);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
     #[test]
     fn mapping_no_pages_changes_nothing() {
         let pages = allocate(2);
@@ -1271,6 +1431,40 @@ mod tests {
     fn page_bytes(page: usize) -> Vec<u8> {
         let slice = physical().pages.get(&page).cloned().expect("known page");
         View::map(&slice, 1).expect("mapped").bytes().to_vec()
+    }
+
+    #[test]
+    fn freed_page_numbers_can_be_reused_at_the_limit() {
+        let section = || {
+            let numbers = allocate(1);
+            let section = physical().pages[&numbers[0]].section.clone();
+            assert_eq!(XMemFreePhysicalPages(1, numbers.as_ptr()), 1);
+            section
+        };
+        let mut table = Physical {
+            next_page: PAGE_NUMBER_LIMIT - FRAMES,
+            ..Physical::default()
+        };
+        let mut number = [MaybeUninit::new(0)];
+        assert!(table.allocate(section(), &mut number));
+        // SAFETY: the initialized slot was filled by allocate.
+        let last = unsafe { number[0].assume_init() };
+        assert_eq!(last >> 4, (1 << 21) - 1);
+        assert!(!table.allocate(section(), &mut number));
+
+        let mut old_view = View::map(&table.pages[&last], 1).unwrap();
+        old_view.bytes()[0] = 7;
+        table.free(last);
+        table.free(last);
+        // A second free must not grant another use of the same number.
+        let mut two = [MaybeUninit::new(0); 2];
+        assert!(!table.allocate(section(), &mut two));
+        assert!(table.allocate(section(), &mut number));
+        // SAFETY: the initialized slot was filled by allocate.
+        assert_eq!(unsafe { number[0].assume_init() }, last);
+        let mut new_view = View::map(&table.pages[&last], 1).unwrap();
+        assert_eq!(new_view.bytes()[0], 0);
+        assert_eq!(old_view.bytes()[0], 7);
     }
 
     #[test]

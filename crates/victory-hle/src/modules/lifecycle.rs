@@ -1,8 +1,9 @@
 //! The title's life cycle. A console title is never told it is closing:
-//! quitting it or launching a new game first suspends it (its suspend
-//! routines run, and it has a second to save) and then ends the process.
-//! Closing the title's window does the same here; a new launch then starts
-//! `victory` again, which waits for this process to be gone.
+//! quitting it or launching a new game first constrains it (its
+//! constrained-change routines run), then suspends it (its suspend routines
+//! run, and it has a second to save) and then ends the process. Closing the
+//! title's window does the same here; a new launch then starts `victory`
+//! again, which waits for this process to be gone.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
@@ -19,21 +20,39 @@ use windows_sys::core::{PCSTR, PCWSTR, w};
 
 use crate::{HleModule, hle_export};
 
-type Routine = extern "system" fn(quiesced: u8, context: *mut c_void);
+/// A suspend routine (`quiesced`) or a constrained-change routine
+/// (`constrained`): both take a flag and the title's context.
+type Routine = extern "system" fn(flag: u8, context: *mut c_void);
 
-/// Registration id, routine and context of each suspend routine.
-static ROUTINES: Mutex<Vec<(usize, Routine, usize)>> = Mutex::new(Vec::new());
+/// Registration id, routine and context.
+type Registration = (usize, Routine, usize);
 
-fn routines() -> MutexGuard<'static, Vec<(usize, Routine, usize)>> {
+/// Each suspend routine.
+static ROUTINES: Mutex<Vec<Registration>> = Mutex::new(Vec::new());
+
+/// Each constrained-change routine.
+static CONSTRAINED: Mutex<Vec<Registration>> = Mutex::new(Vec::new());
+
+fn routines() -> MutexGuard<'static, Vec<Registration>> {
     ROUTINES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn constrained() -> MutexGuard<'static, Vec<Registration>> {
+    CONSTRAINED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// How long the console lets suspend routines run before it ends the title.
 const SUSPEND_DEADLINE: Duration = Duration::from_secs(1);
 
+/// How long the constrained-change routines may run before the suspend
+/// starts anyway. Ours: it keeps them from using up the suspend's second.
+const CONSTRAIN_DEADLINE: Duration = Duration::from_secs(1);
+
 const ERROR_INVALID_PARAMETER: u32 = 87;
 
-pub extern "system" fn RegisterAppStateChangeNotification(
+/// Adds `routine` to `list` and writes its registration id.
+fn register(
+    mut list: MutexGuard<'static, Vec<Registration>>,
     routine: Option<Routine>,
     context: *mut c_void,
     registration: *mut usize,
@@ -46,14 +65,36 @@ pub extern "system" fn RegisterAppStateChangeNotification(
     }
     static NEXT: AtomicUsize = AtomicUsize::new(1);
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    routines().push((id, routine, context as usize));
+    list.push((id, routine, context as usize));
     // SAFETY: checked non-null; the title passes room for its registration.
     unsafe { registration.write(id) };
     0
 }
 
+pub extern "system" fn RegisterAppStateChangeNotification(
+    routine: Option<Routine>,
+    context: *mut c_void,
+    registration: *mut usize,
+) -> u32 {
+    register(routines(), routine, context, registration)
+}
+
 pub extern "system" fn UnregisterAppStateChangeNotification(registration: usize) {
     routines().retain(|&(id, ..)| id != registration);
+}
+
+/// The host's own version never calls the routine (a desktop app is never
+/// constrained), so a title waiting for it would never suspend.
+pub extern "system" fn RegisterAppConstrainedChangeNotification(
+    routine: Option<Routine>,
+    context: *mut c_void,
+    registration: *mut usize,
+) -> u32 {
+    register(constrained(), routine, context, registration)
+}
+
+pub extern "system" fn UnregisterAppConstrainedChangeNotification(registration: usize) {
+    constrained().retain(|&(id, ..)| id != registration);
 }
 
 /// The window procedure a title window had before ours.
@@ -203,8 +244,13 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
     if ENDING.swap(true, Ordering::SeqCst) {
         return;
     }
+    let constrain = constrained().clone();
     let suspend = routines().clone();
-    tracing::info!(routines = suspend.len(), "{why}: suspending the title");
+    tracing::info!(
+        constrained = constrain.len(),
+        routines = suspend.len(),
+        "{why}: suspending the title"
+    );
     // Whoever comes first (the routines or the deadline) runs `then`; the
     // other waits for it, so the process never ends halfway through.
     let then = std::sync::Arc::new(Mutex::new(Some(then)));
@@ -217,18 +263,45 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
         end();
     };
     let late = finish.clone();
+    // The suspend's deadline starts when its routines do: the constrained
+    // phase before it has a bound of its own.
+    let (suspending, started) = std::sync::mpsc::channel();
     // Not on the calling thread: titles hand the suspend to their window
     // thread and wait for it inside the routine.
     std::thread::spawn(move || {
-        for (_, routine, context) in suspend {
-            routine(1, context as *mut c_void);
-        }
+        constrain_then_suspend(&constrain, &suspend, || {
+            let _ = suspending.send(());
+        });
         finish("title suspended");
     });
-    std::thread::spawn(move || {
-        std::thread::sleep(SUSPEND_DEADLINE);
-        late("title did not finish suspending in time");
+    std::thread::spawn(move || match started.recv_timeout(CONSTRAIN_DEADLINE) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            late("title did not finish its constrained routines in time");
+        }
+        _ => {
+            std::thread::sleep(SUSPEND_DEADLINE);
+            late("title did not finish suspending in time");
+        }
     });
+}
+
+/// Runs the constrained-change routines (constrained), then `suspending`,
+/// then the suspend routines (quiesced), as the console does when it
+/// suspends a title. Grand Theft Auto VI's suspend routine waits for a state
+/// that only its constrained routine brings about; called alone it never
+/// returns.
+fn constrain_then_suspend(
+    constrain: &[Registration],
+    suspend: &[Registration],
+    suspending: impl FnOnce(),
+) {
+    for &(_, routine, context) in constrain {
+        routine(1, context as *mut c_void);
+    }
+    suspending();
+    for &(_, routine, context) in suspend {
+        routine(1, context as *mut c_void);
+    }
 }
 
 /// Set in the environment of a relaunched `victory`: an inherited handle
@@ -305,6 +378,8 @@ pub(crate) fn module() -> HleModule {
         exports: vec![
             hle_export!(RegisterAppStateChangeNotification),
             hle_export!(UnregisterAppStateChangeNotification),
+            hle_export!(RegisterAppConstrainedChangeNotification),
+            hle_export!(UnregisterAppConstrainedChangeNotification),
             hle_export!(CreateWindowExW),
             hle_export!(CreateWindowExA),
         ],
@@ -331,6 +406,45 @@ mod tests {
         UnregisterAppStateChangeNotification(a);
         let left: Vec<_> = routines().iter().map(|r| r.0).collect();
         assert_eq!(left, [b]);
+    }
+
+    #[test]
+    fn constrained_registrations_come_and_go() {
+        let (mut a, mut b) = (0, 0);
+        assert_eq!(
+            RegisterAppConstrainedChangeNotification(Some(noop), std::ptr::null_mut(), &mut a),
+            0
+        );
+        assert_eq!(
+            RegisterAppConstrainedChangeNotification(Some(noop), std::ptr::null_mut(), &mut b),
+            0
+        );
+        assert_eq!(
+            RegisterAppConstrainedChangeNotification(None, std::ptr::null_mut(), &mut a),
+            ERROR_INVALID_PARAMETER
+        );
+        UnregisterAppConstrainedChangeNotification(a);
+        let left: Vec<_> = constrained().iter().map(|r| r.0).collect();
+        assert_eq!(left, [b]);
+    }
+
+    /// What `recording_routine` saw: (context, flag) per call, in order.
+    static CALLS: Mutex<Vec<(usize, u8)>> = Mutex::new(Vec::new());
+
+    extern "system" fn recording_routine(flag: u8, context: *mut c_void) {
+        CALLS.lock().unwrap().push((context as usize, flag));
+    }
+
+    #[test]
+    fn constrained_routines_run_before_suspend_routines() {
+        let r: Routine = recording_routine;
+        let between = std::cell::Cell::new(None);
+        constrain_then_suspend(&[(1, r, 10), (2, r, 11)], &[(3, r, 20), (4, r, 21)], || {
+            between.set(Some(CALLS.lock().unwrap().len()));
+        });
+        assert_eq!(*CALLS.lock().unwrap(), [(10, 1), (11, 1), (20, 1), (21, 1)]);
+        // The suspend's deadline starts after the constrained routines.
+        assert_eq!(between.get(), Some(2));
     }
 
     #[test]

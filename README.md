@@ -76,6 +76,12 @@ its `dxil.dll`): Wine's `d3dcompiler_47` cannot compile the indirect-argument
 clamp. It is looked for in `VICTORY_DXC` (the DLL or its folder), beside the
 `dxil.dll` that shader validation finds, then the executable's folder and System32.
 
+To install Rust, use rustup (`winget install --id Rustlang.Rustup -e`, or
+the installer from https://rustup.rs). The first `cargo` command in this
+repository then fetches the pinned toolchain. Building needs the MSVC C++
+build tools: Visual Studio or its Build Tools with the "Desktop development
+with C++" workload.
+
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
@@ -91,7 +97,7 @@ the files in its cache.
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
+cargo test --workspace -- --test-threads=1 # serializes D3D12 tests; no game data
 cargo run -p victory -- config           # check your paths
 ```
 

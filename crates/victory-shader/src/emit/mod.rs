@@ -80,7 +80,11 @@ mod container;
 mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod lane_mask_tests;
 mod lower;
+#[cfg(test)]
+mod mtbuf_tests;
 mod sampler;
 mod shader;
 mod threading;
@@ -91,6 +95,8 @@ mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 mod wave;
+#[cfg(all(test, windows))]
+mod wave_prefix_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -603,6 +609,111 @@ mod tests {
         }
     }
 
+    /// A wave32 compute program with the whole-wave section the console
+    /// compiler makes of an inclusive OR prefix (`WaveMultiPrefixBitOr`
+    /// over every lane, plus the lane's own value): row_shr DPP steps
+    /// inside each row of 16, then lane 15 joined into the upper row. Each
+    /// lane stores its result at its own offset of a raw UAV.
+    fn or_prefix_cs() -> NativeProgram {
+        const fn sop1(op: u32, sdst: u32, src0: u32) -> u32 {
+            0xBE80_0000 | sdst << 16 | op << 8 | src0
+        }
+        const fn vop2(op: u32, vdst: u32, src0: u32, vsrc1: u32) -> u32 {
+            op << 25 | vdst << 17 | vsrc1 << 9 | src0
+        }
+        const fn vop3(op: u32, vdst: u32, src0: u32, src1: u32, src2: u32) -> [u32; 2] {
+            [0x35 << 26 | op << 16 | vdst, src0 | src1 << 9 | src2 << 18]
+        }
+        /// v_or_b32_dpp v1, v1, v1 row_shr:n bound_ctrl:1.
+        const fn or_shr(n: u32) -> [u32; 2] {
+            [
+                vop2(0x1C, 1, 0xFA, 1),
+                1 | (0x110 | n) << 8 | 1 << 19 | 0xF << 24 | 0xF << 28,
+            ]
+        }
+        let (exec_lo, v0, v1) = (126, 256, 257);
+        let mut words = vec![
+            sop1(0x03, 1, 0x80), // s_mov_b32 s1, 0
+        ];
+        // s_load_dwordx4 s[8:11], s[0:1], 0
+        words.extend([0x3D << 26 | 0x02 << 18 | 8 << 6, 125 << 25]);
+        words.push(sop1(0x3D, 2, 193)); // s_or_saveexec_b32 s2, -1
+        words.extend(vop3(0x101, 1, 0x80, v0, 2)); // v_cndmask_b32 v1, 0, v0, s2
+        for n in [1, 2, 4, 8] {
+            words.extend(or_shr(n));
+        }
+        words.extend(vop3(0x360, 3, v1, 128 + 15, 0)); // v_readlane_b32 s3, v1, 15
+        words.extend([sop1(0x03, exec_lo, 0xFF), 0xFFFF_0000]); // s_mov_b32 exec_lo, 0xffff0000
+        words.push(vop2(0x1C, 1, 3, 1)); // v_or_b32 v1, s3, v1
+        words.push(sop1(0x03, exec_lo, 2)); // s_mov_b32 exec_lo, s2
+        words.push(vop2(0x1A, 2, 0x82, 0)); // v_lshlrev_b32 v2, 2, v0
+        // buffer_store_dword v1, v2, s[8:11], 0 offen
+        words.extend([
+            0x38 << 26 | 0x1C << 18 | 1 << 12,
+            0x80 << 24 | 2 << 16 | 1 << 8 | 2,
+        ]);
+        words.push(0xBF81_0000); // s_endpgm
+        NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![crate::native::RootParam {
+                root: crate::native::RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![crate::native::UsedResource {
+                kind: crate::native::ResourceType::Uav,
+                root: crate::native::RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1, // one user SGPR: s0
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        }
+    }
+
+    /// The OR prefix becomes `WaveMultiPrefixOp` (DXIL has no plain bitwise
+    /// prefix) instead of failing the translation.
+    #[test]
+    fn a_bitwise_wave_prefix_is_a_multi_prefix() {
+        let native = or_prefix_cs();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let container = crate::dxbc::build(&[]);
+        let c = Container::parse(&container).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let shapes: Vec<_> = (0..p.blocks.len())
+            .flat_map(|b| wave::sections(&p, b).into_values())
+            .flat_map(|s| s.shapes.into_values())
+            .collect();
+        assert!(
+            shapes
+                .iter()
+                .any(|s| matches!(s, wave::Shape::Prefix(wave::Op::Or, _, _, 0, true))),
+            "{shapes:?}"
+        );
+        assert!(!out.dxil.is_empty());
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+    }
+
     /// A pixel shader writing a constant colour.
     #[cfg(windows)]
     fn constant_color() -> Vec<u8> {
@@ -669,6 +780,18 @@ mod tests {
             v.validate(&mut vs.dxil.clone()).unwrap();
         }
         host.pipeline(&vs, &ps).unwrap();
+        // vkd3d-proton does not enforce the DXIL container checksum. The
+        // successful pipeline above is still exercised under Wine.
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: both names are NUL terminated, and the module is checked
+        // before looking up its export. The export is never called.
+        let under_wine = unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        };
+        if under_wine {
+            return;
+        }
         // The runtime checks the container hash: no hash or a wrong one is
         // refused. (Recent runtimes also take sixteen 0x01 bytes, a bypass
         // value; ours works with older ones too.)
@@ -772,6 +895,74 @@ mod tests {
         assert_eq!(center[4 + 1], 0, "center interpolation is per pixel");
         let sample = psv_of(1 << 0);
         assert_eq!(sample[4 + 1], 1, "PSInfo.SampleFrequency");
+    }
+
+    /// A `v_interp_p1*` that no second half completes is lowered only when
+    /// nothing but second halves reads its register: a first half's result
+    /// read as data (here exported) is refused, not exported as zero.
+    #[test]
+    fn a_first_interpolation_half_is_never_read_as_data() {
+        let lower = |words: &[u32]| {
+            let native = super::NativeProgram {
+                stage: super::HwStage::Ps,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![],
+                used: vec![],
+                io: crate::native::StageIo::Ps {
+                    inputs: vec![crate::native::PsInput {
+                        usage: crate::native::Usage::Generic,
+                        row: 0,
+                        mask: 0b1111,
+                        attr: 0,
+                        flat: false,
+                        fp16: false,
+                        pack2: false,
+                        row2: 0,
+                    }],
+                    input_addr: 1 << 1,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let el = |name: &str, kind, usage| SigElement {
+                name: name.into(),
+                index: 0,
+                kind,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage,
+                half: false,
+            };
+            let isg1 = super::container::signature(&[el("TEXCOORD", 0, 0)], true);
+            let osg1 = super::container::signature(&[el("SV_Target", 16, 15)], false);
+            let bytes =
+                crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
+            let c = super::Container::parse(&bytes).unwrap();
+            let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            super::emit(&c, &native, &p, &st, &io, &res).map(|_| ())
+        };
+        // exp mrt0, v2, v2, v2, v2 done vm; s_endpgm
+        let export = [0xF800_180F, 0x0202_0202, 0xBF81_0000];
+        // An extra first half into v3 that nothing reads still lowers.
+        let unread = [&[0xC808_0000, 0xC80C_0000, 0xC809_0001][..], &export].concat();
+        assert_eq!(lower(&unread), Ok(()));
+        // A first half exported without its second half is refused.
+        let lone = [&[0xC808_0000][..], &export].concat();
+        let refused = lower(&lone).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("the first half of an interpolation"),
+            "{refused}"
+        );
     }
 
     /// A pixel shader reading channel z of an input whose element starts at

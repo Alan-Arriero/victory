@@ -119,7 +119,8 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    for &(label, warp) in super::valu_tests::backends(force_warp) {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -241,6 +242,25 @@ fn lanes_sample_the_entry_their_offset_names_in_the_console_waterfall() {
 }
 
 #[test]
+fn lanes_sample_the_entry_their_index_names_when_scaled_in_the_loop() {
+    use crate::resource::tests::{
+        WATERFALL_ADDED_BASE_INDEX_WAVE32, WATERFALL_SCALED_INDEX_WAVE32,
+    };
+    let want: Vec<f32> = (0..32).map(|l| [1.0, 2.0][l & 1]).collect();
+    for words in [
+        WATERFALL_SCALED_INDEX_WAVE32,
+        WATERFALL_ADDED_BASE_INDEX_WAVE32,
+    ] {
+        let shader = build(words, false);
+        let results = sampled(&shader);
+        assert!(!results.is_empty());
+        for (label, red) in results {
+            assert_eq!(red, want, "{label}");
+        }
+    }
+}
+
+#[test]
 fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
     use crate::resource::tests::cmpx_waterfall;
     // Lanes below 16 hold the first descriptor, the others the second.
@@ -252,6 +272,29 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
         for (label, red) in results {
             assert_eq!(red, want, "{label}, folded {folded}");
         }
+    }
+}
+
+#[test]
+fn lanes_sample_their_arm_after_a_redundant_masked_write() {
+    use crate::resource::tests::WATERFALL_JOINED_WAVE32;
+    let mut words = WATERFALL_JOINED_WAVE32.to_vec();
+    let at = words.iter().position(|&w| w == 0x887E_147E).unwrap() + 1;
+    words.splice(
+        at..at,
+        [
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0 (lane < 16)
+            0xBE92_3C6A, // s_and_saveexec_b32 s18, vcc_lo
+            0x7E08_0218, // v_mov_b32 v4, s24 (same word the then arm wrote)
+            0xBEFE_0312, // s_mov_b32 exec_lo, s18
+        ],
+    );
+    let shader = build(&words, false);
+    let results = sampled(&shader);
+    assert!(!results.is_empty());
+    let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
+    for (label, red) in results {
+        assert_eq!(red, want, "{label}");
     }
 }
 
