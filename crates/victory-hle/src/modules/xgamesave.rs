@@ -196,7 +196,11 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     };
     let version = dir.join(format!("v{number}"));
     let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
-    let mut names = parse_manifest(&std::fs::read(version.join(MANIFEST))?).ok_or_else(bad)?;
+    // The version directory exists, so a missing or unreadable manifest is a
+    // malformed committed container, not an absent one. Callers distinguish
+    // NotFound (no container yet) from this case.
+    let manifest = std::fs::read(version.join(MANIFEST)).map_err(|_| bad())?;
+    let mut names = parse_manifest(&manifest).ok_or_else(bad)?;
     let blobs = names.split_off(2);
     let [name, display] = <[String; 2]>::try_from(names).map_err(|_| bad())?;
     for old in &committed[..committed.len() - 1] {
@@ -900,6 +904,10 @@ extern "system" fn write_blob(
         // SAFETY: the title passes `size` bytes.
         unsafe { std::slice::from_raw_parts(data, size) }.to_vec()
     };
+    if update.changes.iter().any(|(n, _)| *n == name) {
+        // GDK permits only one write or delete of a blob per update.
+        return E_INVALIDARG;
+    }
     update.changes.push((name, Some(data)));
     S_OK
 }
@@ -907,7 +915,9 @@ extern "system" fn write_blob(
 extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char) -> HRESULT {
     // SAFETY: as in `write_blob`.
     match (unsafe { update.as_mut() }, text(name)) {
-        (Some(update), Some(name)) if !name.is_empty() => {
+        (Some(update), Some(name))
+            if !name.is_empty() && !update.changes.iter().any(|(n, _)| *n == name) =>
+        {
             update.changes.push((name, None));
             S_OK
         }
@@ -1054,6 +1064,34 @@ mod tests {
             "one".into(),
             vec![("a".into(), "old a".into()), ("b".into(), "old b".into())],
         ))
+    }
+
+    #[test]
+    fn a_committed_container_without_its_manifest_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(update(dir.path(), "one", &[("a", Some("old a"))]), S_OK);
+        assert_eq!(update(dir.path(), "two", &[("b", Some("new b"))]), S_OK);
+        let container = container_dir(dir.path(), "Slot");
+        let newest = current(&container).unwrap().unwrap();
+        assert_eq!(newest.number, 2);
+        std::fs::remove_file(newest.dir.join(MANIFEST)).unwrap();
+        assert_eq!(
+            update(dir.path(), "three", &[("c", Some("new c"))]),
+            NO_ACCESS,
+            "a malformed committed container is not an empty one"
+        );
+        let versions: Vec<_> = std::fs::read_dir(&container)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .strip_prefix('v')
+                    .is_some_and(|n| n.parse::<u64>().is_ok())
+            })
+            .collect();
+        assert_eq!(versions.len(), 1, "no new version was committed");
     }
 
     /// Run by the crash test in a child process; does nothing otherwise.
@@ -1341,7 +1379,13 @@ mod tests {
         type Delete = extern "system" fn(This, *mut Update, *const c_char) -> HRESULT;
         assert_eq!(
             method::<Delete>(&OBJECT, 0xd0)(this, update, c"gone".as_ptr()),
-            S_OK
+            E_INVALIDARG,
+            "the same blob was already written in this update"
+        );
+        assert_eq!(
+            write(this, update, c"world".as_ptr(), b"again".as_ptr(), 5),
+            E_INVALIDARG,
+            "a second write of the same blob is refused too"
         );
         type Submit = extern "system" fn(This, *const Update, *mut AsyncBlock) -> HRESULT;
         let mut b = block();
@@ -1375,7 +1419,7 @@ mod tests {
             enumerate_containers(this, provider, context, Some(seen)),
             S_OK
         );
-        assert_eq!(found, [("Slot_1".into(), "Chapter 1".into(), 2, 7)]);
+        assert_eq!(found, [("Slot_1".into(), "Chapter 1".into(), 3, 8)]);
 
         let mut container = std::ptr::null_mut();
         assert_eq!(

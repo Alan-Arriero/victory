@@ -184,6 +184,7 @@ struct Lower<'a> {
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
+    atomic_descriptor_loads: HashSet<Site>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
@@ -210,6 +211,11 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// IR blocks whose `s_barrier` is control-dependent on a non-uniform
+    /// (per-lane) branch: emitting `SYNC_THREAD_GROUP` (bit 0) there
+    /// deadlocks 32-lane hosts when warps diverge, so only the memory fence
+    /// bits are emitted.
+    fence_only_barrier: HashSet<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -371,6 +377,61 @@ fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Opti
         .collect()
 }
 
+/// Loads whose eight SGPRs are used only as one image atomic's resource.
+/// The atomic rebuilds the heap index from the load address.
+fn atomic_descriptor_loads(p: &Program, res: &Resources) -> HashSet<Site> {
+    let mut loads = HashSet::new();
+    let mut readers = HashMap::new();
+    for d in &res.descriptors {
+        let Source::Loaded { load, first: 0 } = d.source else {
+            continue;
+        };
+        let atomic = &p.blocks[d.site.0].insts[d.site.1];
+        let Fields::Image {
+            rsrc: Operand::Scalar { code, dwords: 8 },
+            ..
+        } = atomic.fields
+        else {
+            continue;
+        };
+        let inst = &p.blocks[load.0].insts[load.1];
+        if !atomic.name().starts_with("image_atomic_")
+            || inst.name() != "s_load_dwordx8"
+            || code > crate::ir::VCC - 8
+            || inst.writes.len() != 8
+        {
+            continue;
+        }
+        if inst.writes.iter().all(|&(reg, v)| {
+            matches!(reg, Reg::S(n) if (code..code + 8).contains(&n)) && atomic.read(reg) == Some(v)
+        }) {
+            loads.insert(load);
+            for &(_, v) in &inst.writes {
+                readers.insert(v, (load, d.site));
+            }
+        }
+    }
+    if !loads.is_empty() {
+        for (b, block) in p.blocks.iter().enumerate() {
+            for v in block.phis.iter().flat_map(|phi| &phi.args) {
+                if let Some((load, _)) = readers.get(v) {
+                    loads.remove(load);
+                }
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                for (_, v) in &inst.reads {
+                    if let Some(&(load, reader)) = readers.get(v)
+                        && reader != (b, i)
+                    {
+                        loads.remove(&load);
+                    }
+                }
+            }
+        }
+    }
+    loads
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -485,6 +546,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let fence_only_barrier = divergent_barriers(p, x.st, &no_barrier);
         Lower {
             s,
             x,
@@ -505,6 +567,7 @@ impl<'a> Lower<'a> {
             user_data: None,
             user_reads: BTreeMap::new(),
             samplers: Vec::new(),
+            atomic_descriptor_loads: atomic_descriptor_loads(p, x.res),
             descriptors: x
                 .res
                 .descriptors
@@ -525,6 +588,7 @@ impl<'a> Lower<'a> {
             numeric_selects,
             flat: None,
             no_barrier,
+            fence_only_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -1271,6 +1335,19 @@ impl<'a> Lower<'a> {
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
             Operand::Literal(x) => Ok(self.s.m.i32(x)),
             Operand::Attr { .. } => Err("an attribute operand"),
+        }
+    }
+
+    /// GFX10 puts an inline f16 constant in the low half of the operand.
+    fn f16_operand(&mut self, inst: &Inst, op: &Operand) -> Result<V, Why> {
+        match *op {
+            Operand::Const(c @ 240..=248) => {
+                let h = [
+                    0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
+                ][usize::from(c - 240)];
+                Ok(self.s.m.i32(h))
+            }
+            _ => self.operand(inst, op),
         }
     }
 
@@ -2088,18 +2165,28 @@ impl<'a> Lower<'a> {
         self.s
             .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
         let flat = self.mesh_thread();
-        let guard = (threads > mesh.max_primitives).then(|| self.s.m.cmp(e, pred::IULT, flat, p));
-        let at = self.begin_guarded(guard);
         let z = self.s.m.i32(0);
-        self.s.op(
-            self.cur,
-            "emitIndices",
-            Attr::NoUnwind,
-            void,
-            169,
-            &[flat, z, z, z],
-        );
-        self.end_guarded(at, &[]);
+        let passes = mesh.max_primitives.div_ceil(threads.max(1));
+        for pass in 0..passes {
+            let idx = if pass == 0 {
+                flat
+            } else {
+                let off = self.s.m.i32(pass * threads);
+                self.s.m.bin(self.cur, Bin::Add, flat, off)
+            };
+            let need_guard = (pass + 1) * threads > mesh.max_primitives;
+            let guard = need_guard.then(|| self.s.m.cmp(self.cur, pred::IULT, idx, p));
+            let at = self.begin_guarded(guard);
+            self.s.op(
+                self.cur,
+                "emitIndices",
+                Attr::NoUnwind,
+                void,
+                169,
+                &[idx, z, z, z],
+            );
+            self.end_guarded(at, &[]);
+        }
         Ok(())
     }
 
@@ -2341,6 +2428,81 @@ impl<'a> Lower<'a> {
                 (u32::from(*offset1) * scale, w),
             ]
         };
+        // Bytes and halves: the dword holding them, and their bit position
+        // in it (naturally aligned, so they never straddle dwords).
+        // `_d16` reads fill a register's low half (`_d16_hi` its high half)
+        // and keep the other; `_d16_hi` writes take the data's high half.
+        let base = name.trim_end_matches("_hi").trim_end_matches("_d16");
+        let sub = match base {
+            "ds_read_u8" | "ds_read_i8" | "ds_write_b8" => Some(8u32),
+            "ds_read_u16" | "ds_read_i16" | "ds_write_b16" => Some(16),
+            _ => None,
+        };
+        let sub = sub.filter(|_| {
+            base == name
+                || name.ends_with("_d16") && base.starts_with("ds_read")
+                || name.ends_with("_d16_hi")
+        });
+        if let Some(bits) = sub {
+            let p = dword(self, offset);
+            let o = self.s.m.i32(offset);
+            let at = self.s.m.bin(c, Bin::Add, a, o);
+            let three = self.s.m.i32(3);
+            let byte = self.s.m.bin(c, Bin::And, at, three);
+            let sh = self.s.m.bin(c, Bin::Shl, byte, three);
+            let mask = self.s.m.i32((1u32 << bits) - 1);
+            if name.starts_with("ds_read") {
+                let reg = dst_reg.ok_or("an LDS read result")?;
+                let w = self.s.m.load(c, p);
+                let x = self.s.m.bin(c, Bin::LShr, w, sh);
+                let x = if base.contains("_i") {
+                    let k = self.s.m.i32(32 - bits);
+                    let x = self.s.m.bin(c, Bin::Shl, x, k);
+                    self.s.m.bin(c, Bin::AShr, x, k)
+                } else {
+                    self.s.m.bin(c, Bin::And, x, mask)
+                };
+                let x = if base == name {
+                    x
+                } else {
+                    let old = match inst.read(Reg::V(reg)) {
+                        Some(v) => self.i32_of(v)?,
+                        None => self.s.m.i32(0),
+                    };
+                    let half = self.s.m.i32(0xFFFF);
+                    let x = self.s.m.bin(c, Bin::And, x, half);
+                    let (x, keep) = if name.ends_with("_hi") {
+                        let k16 = self.s.m.i32(16);
+                        (self.s.m.bin(c, Bin::Shl, x, k16), half)
+                    } else {
+                        (x, self.s.m.i32(0xFFFF_0000))
+                    };
+                    let old = self.s.m.bin(c, Bin::And, old, keep);
+                    self.s.m.bin(c, Bin::Or, old, x)
+                };
+                self.write(inst, Reg::V(reg), x, guard);
+            } else {
+                // Clear, then set: two atomics, so lanes writing other
+                // bytes of the dword keep theirs.
+                let mut x = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
+                if name != base {
+                    // The data's high half.
+                    let k16 = self.s.m.i32(16);
+                    x = self.s.m.bin(c, Bin::LShr, x, k16);
+                }
+                let x = self.s.m.bin(c, Bin::And, x, mask);
+                let x = self.s.m.bin(c, Bin::Shl, x, sh);
+                let m = self.s.m.bin(c, Bin::Shl, mask, sh);
+                let ones = self.s.m.i32(u32::MAX);
+                let keep = self.s.m.bin(c, Bin::Xor, m, ones);
+                use super::bitcode::Rmw;
+                let at = self.begin_guarded(guard);
+                self.s.m.atomic(self.cur, Rmw::And, p, keep);
+                self.s.m.atomic(self.cur, Rmw::Or, p, x);
+                self.end_guarded(at, &[]);
+            }
+            return Ok(());
+        }
         if let Some(rest) = name.strip_prefix("ds_read") {
             let reg = dst_reg.ok_or("an LDS read result")?;
             if rest.starts_with('2') || matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
@@ -2539,7 +2701,15 @@ impl<'a> Lower<'a> {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
-                let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
+                // Omit SYNC_THREAD_GROUP (1) when control-dependent on a
+                // per-lane branch, where a 32-lane host deadlocks if one
+                // warp skips the barrier while another waits on it.
+                let sync = if self.fence_only_barrier.contains(&b) {
+                    0
+                } else {
+                    1
+                };
+                let mode = sync | 8 | if self.writes_uavs { 2 } else { 0 };
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
                 self.s
@@ -3263,6 +3433,9 @@ impl<'a> Lower<'a> {
     }
 
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
+        if self.atomic_descriptor_loads.contains(&site) {
+            return Ok(());
+        }
         const OTHER: Why = "a descriptor's address or format read as data";
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
@@ -4590,15 +4763,9 @@ impl<'a> Lower<'a> {
                 _ => return Err("a byte select on a 16-bit operation"),
             }
         }
-        let x = match (op, self.src0) {
-            (_, Some(x)) if k == 0 => x,
-            (Operand::Const(c @ 240..=248), _) => {
-                let h = [
-                    0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
-                ][usize::from(c - 240)];
-                self.s.m.i32(h)
-            }
-            _ => self.operand(inst, &op)?,
+        let x = match self.src0 {
+            Some(x) if k == 0 => x,
+            _ => self.f16_operand(inst, &op)?,
         };
         let c = self.cur;
         let x = if high {
@@ -5016,22 +5183,18 @@ impl<'a> Lower<'a> {
 
     /// Half `high` of source `k` of a packed (VOP3P) operation, in the low
     /// 16 bits: op_sel picks the half the low result reads, op_sel_hi the
-    /// half the high result reads. Inline float constants are f16 values.
-    fn packed_src(&mut self, inst: &Inst, k: usize, high: bool) -> Result<V, Why> {
+    /// half the high result reads. Packed integer instructions see the f32
+    /// bits of an inline float constant.
+    fn packed_src(&mut self, inst: &Inst, k: usize, high: bool, float: bool) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
         let sel = if high { v.opsel_hi } else { v.opsel } >> k & 1 != 0;
-        let x = match op {
-            Operand::Const(c @ 240..=248) => {
-                let h = [
-                    0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
-                ][usize::from(c - 240)];
-                // shortcut: taken to fill both halves.
-                self.s.m.i32(h | h << 16)
-            }
-            _ => self.operand(inst, &op)?,
+        let x = if float {
+            self.f16_operand(inst, &op)?
+        } else {
+            self.operand(inst, &op)?
         };
         let c = self.cur;
         let x = if sel {
@@ -5067,7 +5230,7 @@ impl<'a> Lower<'a> {
         for high in [false, true] {
             let mut xs = Vec::new();
             for k in 0..n {
-                let h = self.packed_src(inst, k, high)?;
+                let h = self.packed_src(inst, k, high, float)?;
                 if float {
                     let mut f = self
                         .s
@@ -6961,8 +7124,27 @@ impl<'a> Lower<'a> {
         {
             return Err("a 16-bit output the stage data does not mark");
         }
-        // A mesh lane writes its own vertex or primitive, where it exports.
+        // A mesh lane writes its own vertex or primitive, where it exports;
+        // guard against threads past the declared vertex/primitive maximum.
         let at = if mesh {
+            let m = self.s.mesh.expect("mesh");
+            let threads = self.s.threads.expect("mesh")[0];
+            let limit = if primitive {
+                m.max_primitives
+            } else {
+                m.max_vertices
+            };
+            let guard = if threads > limit {
+                let flat = self.mesh_thread();
+                let lim = self.s.m.i32(limit);
+                let in_bounds = self.s.m.cmp(self.cur, pred::IULT, flat, lim);
+                Some(match guard {
+                    Some(g) => self.s.m.bin(self.cur, Bin::And, g, in_bounds),
+                    None => in_bounds,
+                })
+            } else {
+                guard
+            };
             self.begin_guarded(guard)
         } else {
             None
@@ -7024,20 +7206,41 @@ impl<'a> Lower<'a> {
     }
 
     /// Mesh: `exp prim` as the lane's primitive. Bit 31 culls it (all
-    /// indices 0: no area).
+    /// indices 0: no area); any vertex index at or past `max_vertices` is
+    /// also culled so out-of-range indices never fault the host rasterizer.
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
+        let mesh = self.s.mesh.expect("mesh");
+        let threads = self.s.threads.expect("mesh")[0];
+        let flat = self.mesh_thread();
+        let guard = if threads > mesh.max_primitives {
+            let mp = self.s.m.i32(mesh.max_primitives);
+            let in_bounds = self.s.m.cmp(self.cur, pred::IULT, flat, mp);
+            Some(match guard {
+                Some(g) => self.s.m.bin(self.cur, Bin::And, g, in_bounds),
+                None => in_bounds,
+            })
+        } else {
+            guard
+        };
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
-        let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![self.mesh_thread()];
+        let mv = self.s.m.i32(mesh.max_vertices);
+        let mut bad = self.s.m.cmp(c, pred::SLT, x, z);
+        let mut idxs = [z; 3];
         for k in 0..3 {
             let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
-            args.push(self.s.m.select(c, culled, z, i));
+            let oob = self.s.m.cmp(c, pred::IUGE, i, mv);
+            bad = self.s.m.bin(c, Bin::Or, bad, oob);
+            idxs[k as usize] = i;
+        }
+        let mut args = vec![flat];
+        for i in idxs {
+            args.push(self.s.m.select(c, bad, z, i));
         }
         let void = self.s.t.void;
         self.s
@@ -7297,6 +7500,165 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// IR blocks containing `s_barrier` (not already in `skip`) that are
+/// control-dependent, directly or through other branches, on a non-uniform
+/// (per-lane) branch: whether a thread reaches the barrier then depends on
+/// its lane. Emitting `SYNC_THREAD_GROUP` in such a block deadlocks 32-lane
+/// hosts whenever warps diverge. A per-lane branch that reconverges before
+/// the barrier does not count: the barrier post-dominates both its sides
+/// (or neither, past a later uniform branch that alone decides).
+fn divergent_barriers(
+    p: &crate::ir::Program,
+    st: &crate::structure::Structured,
+    skip: &HashSet<usize>,
+) -> HashSet<usize> {
+    let n = p.blocks.len();
+    let barriers: Vec<usize> = (0..n)
+        .filter(|b| !skip.contains(b) && p.blocks[*b].insts.iter().any(|i| i.name() == "s_barrier"))
+        .collect();
+    if barriers.is_empty() {
+        return HashSet::new();
+    }
+    let divergent: Vec<bool> = (0..n)
+        .map(|u| match st.exits[u] {
+            LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } => {
+                taken != not_taken
+                    && st
+                        .bools
+                        .support(when)
+                        .iter()
+                        .any(|a| !matches!(a, Atom::Uniform(_)))
+            }
+            _ => false,
+        })
+        .collect();
+    if !divergent.contains(&true) {
+        return HashSet::new();
+    }
+    // The CFG with a virtual exit (`n`) after every block that ends the
+    // program.
+    let exit = n;
+    let mut preds: Vec<Vec<usize>> = p.blocks.iter().map(|b| b.preds.clone()).collect();
+    preds.push(
+        (0..n)
+            .filter(|&b| matches!(st.exits[b], LaneExit::End))
+            .collect(),
+    );
+    let mut succs = vec![Vec::new(); n + 1];
+    for (b, ps) in preds.iter().enumerate() {
+        for &pred in ps {
+            succs[pred].push(b);
+        }
+    }
+    let ipdom = post_dominators(&succs, &preds, exit);
+    // `controls[x]`: the branches `x` is directly control-dependent on, the
+    // blocks `a` with a successor `x` post-dominates and `a` itself is not
+    // strictly post-dominated by `x`.
+    let mut controls = vec![Vec::new(); n + 1];
+    for a in 0..n {
+        let Some(stop) = ipdom[a] else {
+            continue;
+        };
+        for &s in &succs[a] {
+            let mut r = s;
+            while r != stop {
+                if !controls[r].contains(&a) {
+                    controls[r].push(a);
+                }
+                match ipdom[r] {
+                    Some(up) if up != r => r = up,
+                    _ => break,
+                }
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    for b in barriers {
+        let mut seen = vec![false; n + 1];
+        let mut stack = vec![b];
+        seen[b] = true;
+        'search: while let Some(cur) = stack.pop() {
+            for &a in &controls[cur] {
+                if divergent[a] {
+                    out.insert(b);
+                    break 'search;
+                }
+                if !seen[a] {
+                    seen[a] = true;
+                    stack.push(a);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Immediate post-dominators over `succs`/`preds` with `exit` as root
+/// (Cooper, Harvey and Kennedy's iteration on the reversed graph); `None`
+/// for a block that never reaches `exit`.
+fn post_dominators(succs: &[Vec<usize>], preds: &[Vec<usize>], exit: usize) -> Vec<Option<usize>> {
+    let m = succs.len();
+    // Postorder of the reversed graph from `exit`.
+    let mut order = Vec::with_capacity(m);
+    let mut seen = vec![false; m];
+    let mut stack = vec![(exit, 0usize)];
+    seen[exit] = true;
+    while let Some(top) = stack.last_mut() {
+        let (b, i) = *top;
+        if let Some(&pred) = preds[b].get(i) {
+            top.1 += 1;
+            if !seen[pred] {
+                seen[pred] = true;
+                stack.push((pred, 0));
+            }
+        } else {
+            order.push(b);
+            stack.pop();
+        }
+    }
+    let mut number = vec![usize::MAX; m];
+    for (k, &b) in order.iter().enumerate() {
+        number[b] = k;
+    }
+    let mut ipdom = vec![None; m];
+    ipdom[exit] = Some(exit);
+    let intersect = |ipdom: &[Option<usize>], mut a: usize, mut b: usize| {
+        while a != b {
+            while number[a] < number[b] {
+                a = ipdom[a].expect("processed");
+            }
+            while number[b] < number[a] {
+                b = ipdom[b].expect("processed");
+            }
+        }
+        a
+    };
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in order.iter().rev() {
+            if b == exit {
+                continue;
+            }
+            let mut new = None;
+            for &s in &succs[b] {
+                if ipdom[s].is_some() {
+                    new = Some(new.map_or(s, |x| intersect(&ipdom, x, s)));
+                }
+            }
+            if new.is_some() && ipdom[b] != new {
+                ipdom[b] = new;
+                changed = true;
+            }
+        }
+    }
+    ipdom
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Numeric, Parts, buffer_format, half_shift, lower};
@@ -7304,6 +7666,57 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// The blocks of `words` (a wave32 program) whose `s_barrier` loses its
+    /// thread-group sync.
+    fn fence_only(words: &[u32]) -> Vec<usize> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let mut out: Vec<_> = super::divergent_barriers(&p, &st, &Default::default())
+            .into_iter()
+            .collect();
+        out.sort();
+        out
+    }
+
+    // v_cmp_gt_u32 vcc, v0, v1; s_and_saveexec_b32 s0, vcc_lo: a per-lane if.
+    const PER_LANE_IF: [u32; 2] = [0x7D88_0300, 0xBE80_3C6A];
+    // s_or_b32 exec_lo, exec_lo, s0: the if's end.
+    const END_IF: u32 = 0x887E_007E;
+
+    /// A barrier inside a per-lane `if` runs in some lanes only.
+    #[test]
+    fn a_barrier_under_a_per_lane_branch_is_fence_only() {
+        let words = [
+            PER_LANE_IF[0],
+            PER_LANE_IF[1],
+            0xBF88_0001, // s_cbranch_execz over the barrier
+            0xBF8A_0000, // s_barrier
+            END_IF,
+            S_ENDPGM,
+        ];
+        assert_eq!(fence_only(&words).len(), 1);
+    }
+
+    /// A per-lane `if` that ends before a uniform `if` around the barrier
+    /// leaves the barrier to the uniform condition alone: every thread of
+    /// the group reaches it or none does, so it keeps its sync.
+    #[test]
+    fn a_barrier_after_a_reconverged_branch_keeps_its_sync() {
+        let words = [
+            PER_LANE_IF[0],
+            PER_LANE_IF[1],
+            0xBF88_0001, // s_cbranch_execz over the move
+            0x7E04_0300, // v_mov_b32 v2, v0
+            END_IF,
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0xBF85_0001, // s_cbranch_scc1 over the barrier
+            0xBF8A_0000, // s_barrier
+            S_ENDPGM,
+        ];
+        assert_eq!(fence_only(&words), Vec::<usize>::new());
+    }
 
     /// Lowers a compute program of constants and returns the lowered result.
     fn lower_words(words: &[u32]) -> Result<super::Lowered, crate::ShaderError> {

@@ -7,8 +7,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+use victory_shader::emit;
+#[cfg(windows)]
 use victory_shader::emit::host::{self, Host};
-use victory_shader::emit::{self, validator::Validator};
+#[cfg(windows)]
+use victory_shader::emit::validator::Validator;
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
@@ -670,4 +673,65 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(not(windows))]
+use offline::{Host, Validator, host};
+
+/// Off Windows there is no D3D12 host or DXIL validator: asking for either
+/// fails, and the translation itself still runs.
+#[cfg(not(windows))]
+mod offline {
+    use victory_shader::emit::HostShader;
+
+    const NEEDS_WINDOWS: &str = "needs Windows (D3D12 and dxil.dll)";
+
+    pub enum Validator {}
+
+    impl Validator {
+        pub fn default_path() -> Option<std::path::PathBuf> {
+            None
+        }
+
+        pub fn load(_: Option<&std::path::Path>) -> Result<Self, String> {
+            Err(NEEDS_WINDOWS.into())
+        }
+
+        pub fn validate(&mut self, _: &mut [u8]) -> Result<(), String> {
+            match *self {}
+        }
+    }
+
+    pub enum Host {}
+
+    impl Host {
+        pub fn new(_: bool) -> Result<Self, String> {
+            Err(NEEDS_WINDOWS.into())
+        }
+
+        pub fn pipeline(&self, _: &HostShader, _: &HostShader) -> Result<(), String> {
+            match *self {}
+        }
+
+        pub fn mesh_pipeline(&self, _: &HostShader, _: &HostShader) -> Result<(), String> {
+            match *self {}
+        }
+
+        pub fn compute_pipeline(&self, _: &HostShader) -> Result<(), String> {
+            match *self {}
+        }
+    }
+
+    pub mod host {
+        use victory_shader::emit::HostShader;
+
+        /// Only asked for alongside a [`super::Host`], which never exists here.
+        pub fn stub_ps() -> HostShader {
+            unreachable!("no host GPU off Windows")
+        }
+
+        pub fn stub_vs(_: &HostShader) -> Result<HostShader, String> {
+            Err(super::NEEDS_WINDOWS.into())
+        }
+    }
 }

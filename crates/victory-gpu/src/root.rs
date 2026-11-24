@@ -212,7 +212,7 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};

@@ -66,6 +66,12 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
+/// The largest view heap made: translated shaders send indices at or past
+/// it to slot 0, so a larger heap would lose its top slots to them.
+const MAX_VIEWS: u32 = victory_shader::emit::VIEW_HEAP_LIMIT;
+const _: () = assert!(PORTABLE_VIEWS <= MAX_VIEWS && DYNAMIC < PORTABLE_VIEWS);
+const _: () = assert!(SAMPLERS <= victory_shader::emit::SAMPLER_HEAP_LIMIT);
+
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
@@ -119,6 +125,13 @@ impl HostHeap {
             );
         }
         let extra = if sampler { 0 } else { DYNAMIC };
+        let count = if !sampler && count.saturating_add(extra) > MAX_VIEWS {
+            // shortcut: as below, descriptors past the limit are left out.
+            tracing::warn!(count, "host view heap capped at {MAX_VIEWS}");
+            MAX_VIEWS - extra
+        } else {
+            count
+        };
         let (heap, count) = match make(count + extra) {
             Ok(heap) => (heap, count),
             Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {

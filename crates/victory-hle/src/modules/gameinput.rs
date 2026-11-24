@@ -340,6 +340,10 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// Events waiting for the single delivery loop.
+    queue: VecDeque<Event>,
+    /// One thread drains `queue`; other producers only append.
+    delivering: bool,
 }
 
 pub struct Hub {
@@ -384,6 +388,8 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                queue: VecDeque::new(),
+                delivering: false,
             }),
             returned: Condvar::new(),
         }));
@@ -425,12 +431,32 @@ impl Hub {
         self.deliver(events);
     }
 
-    /// Runs callbacks, never under our lock: they call back into us. One
-    /// unregistered since the event was taken does not run, and
-    /// `UnregisterCallback` waits for one that runs.
+    /// Runs callbacks one at a time, in the order they were queued, never
+    /// under our lock: they call back into us. A callback delivered from a
+    /// callback joins the same queue instead of nesting. One unregistered
+    /// since the event was queued does not run, and `UnregisterCallback`
+    /// waits for one that runs.
     fn deliver(&self, events: Vec<Event>) {
+        {
+            let mut state = self.state();
+            state.queue.extend(events);
+            if state.delivering {
+                return;
+            }
+            state.delivering = true;
+        }
         let me = std::thread::current().id();
-        for e in events {
+        loop {
+            let e = {
+                let mut state = self.state();
+                match state.queue.pop_front() {
+                    Some(e) => e,
+                    None => {
+                        state.delivering = false;
+                        return;
+                    }
+                }
+            };
             let r = e.registration;
             {
                 let mut state = self.state();
@@ -1105,7 +1131,8 @@ mod host {
 
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
+        GetAsyncKeyState, GetKeyState, GetKeyboardLayout, HKL, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
+        ToUnicodeEx,
     };
     use windows_sys::Win32::UI::Input::XboxController::{
         XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
@@ -1208,14 +1235,19 @@ mod host {
                     .collect();
                 down.extend(held);
             }
-            down.into_iter()
-                .map(|vk| KeyState {
+            let state = keyboard_state(&down, caps_lock());
+            let layout = layout();
+            down.iter()
+                .map(|&vk| {
                     // SAFETY: plain query.
-                    scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
-                    virtual_key: vk,
-                    // shortcut: no characters (code point 0); Grand Theft
-                    // Auto VI reads scan codes and virtual keys only.
-                    ..Default::default()
+                    let scan_code = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) };
+                    let (code_point, dead_key) = character(vk, scan_code, &state, layout);
+                    KeyState {
+                        scan_code,
+                        code_point,
+                        virtual_key: vk,
+                        dead_key,
+                    }
                 })
                 .collect()
         }
@@ -1273,6 +1305,82 @@ mod host {
             .collect()
     }
 
+    /// The keyboard state `ToUnicodeEx` reads with the keys `held` down:
+    /// each held key, the generic Shift, Ctrl and Alt from either side's key
+    /// (devices report sides only), and Caps Lock's toggle.
+    fn keyboard_state(held: &[u8], caps_lock: bool) -> [u8; 256] {
+        const DOWN: u8 = 0x80;
+        const TOGGLED: u8 = 1;
+        let mut state = [0u8; 256];
+        for &vk in held {
+            state[usize::from(vk)] = DOWN;
+            let generic = match vk {
+                0xA0 | 0xA1 => Some(0x10), // shift
+                0xA2 | 0xA3 => Some(0x11), // control
+                0xA4 | 0xA5 => Some(0x12), // alt
+                _ => None,
+            };
+            if let Some(g) = generic {
+                state[g] = DOWN;
+            }
+        }
+        if caps_lock {
+            state[0x14] |= TOGGLED;
+        }
+        state
+    }
+
+    fn caps_lock() -> bool {
+        // SAFETY: plain query.
+        let state = unsafe { GetKeyState(0x14) };
+        state & 1 != 0
+    }
+
+    /// The foreground window's keyboard layout (the title's while it has
+    /// focus; this thread's when there is no foreground window).
+    fn layout() -> HKL {
+        // SAFETY: plain queries; a null window gives thread 0, this thread.
+        unsafe {
+            GetKeyboardLayout(GetWindowThreadProcessId(
+                GetForegroundWindow(),
+                std::ptr::null_mut(),
+            ))
+        }
+    }
+
+    /// The character key `vk` types in `layout` with `state`: its code point
+    /// (0 when it types none, or several at once), and whether it is a dead
+    /// key, whose code point is then the accent's spacing form. Pending dead
+    /// keys are not combined: the thread's keyboard state is left alone.
+    fn character(vk: u8, scan_code: u32, state: &[u8; 256], layout: HKL) -> (u32, bool) {
+        /// `ToUnicodeEx` flag: keep the keyboard state (Windows 10 1607 on).
+        const KEEP_STATE: u32 = 4;
+        let mut text = [0u16; 8];
+        // SAFETY: the state is the 256 bytes the call reads; the buffer's
+        // length is passed with it.
+        let n = unsafe {
+            ToUnicodeEx(
+                u32::from(vk),
+                scan_code & 0xFF,
+                state.as_ptr(),
+                text.as_mut_ptr(),
+                text.len() as i32,
+                KEEP_STATE,
+                layout,
+            )
+        };
+        let units = match n {
+            0 => return (0, false),
+            ..0 => &text[..1],
+            n => &text[..(n as usize).min(text.len())],
+        };
+        let mut chars = char::decode_utf16(units.iter().copied());
+        match (chars.next(), chars.next()) {
+            (Some(Ok(c)), None) => (u32::from(c), n < 0),
+            _ => (0, false),
+        }
+    }
+
     /// The foreground window is one of ours (the title's or our fallback).
     fn focused() -> bool {
         let mut process = 0;
@@ -1303,6 +1411,32 @@ mod host {
             ),
             (1.0, -1.0, 1.0, 0.0)
         );
+    }
+
+    #[test]
+    fn either_sides_modifier_holds_the_generic_one() {
+        let state = keyboard_state(&[0xA1, 0xA2, 0x41], false);
+        for vk in [0xA1, 0x10, 0xA2, 0x11, 0x41] {
+            assert_eq!(state[vk], 0x80, "{vk:#x}");
+        }
+        for vk in [0xA0, 0xA3, 0x12, 0x14] {
+            assert_eq!(state[vk], 0, "{vk:#x}");
+        }
+        assert_eq!(keyboard_state(&[], true)[0x14], 1);
+    }
+
+    #[test]
+    fn keys_type_their_characters() {
+        // Space and Enter type the same in every layout; F1 types nothing.
+        let layout = layout();
+        let typed = |vk: u8, held: &[u8]| {
+            // SAFETY: plain query.
+            let scan = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) };
+            character(vk, scan, &keyboard_state(held, false), layout)
+        };
+        assert_eq!(typed(0x20, &[0x20]), (0x20, false));
+        assert_eq!(typed(0x0D, &[0x0D]), (0x0D, false));
+        assert_eq!(typed(0x70, &[0x70]), (0, false));
     }
 }
 
@@ -1694,6 +1828,85 @@ mod tests {
         assert_eq!(FROM_INSIDE.load(Ordering::SeqCst), 1);
         poller.join().unwrap();
         leave.join().unwrap();
+    }
+
+    #[test]
+    fn callbacks_from_registration_and_poll_are_serialized() {
+        use std::sync::atomic::AtomicBool;
+        static ACTIVE: AtomicU32 = AtomicU32::new(0);
+        static PEAK: AtomicU32 = AtomicU32::new(0);
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        extern "system" fn tracked(
+            _: u64,
+            _: *mut c_void,
+            _: *const Device,
+            _: u64,
+            _: u32,
+            _: u32,
+        ) {
+            let active = ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+            PEAK.fetch_max(active, Ordering::SeqCst);
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            while !RELEASE.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+        let (hub, host) = fake();
+        type Register = extern "system" fn(
+            This,
+            *const Device,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            Option<DeviceCallback>,
+            *mut u64,
+        ) -> HRESULT;
+        let register = slot::<Register, _>(&hub.object, 0x48);
+        ACTIVE.store(0, Ordering::SeqCst);
+        PEAK.store(0, Ordering::SeqCst);
+        CALLS.store(0, Ordering::SeqCst);
+        RELEASE.store(false, Ordering::SeqCst);
+        // Blocking enumeration delivers its first callback on the registering
+        // thread, which stays inside it while the poll thread runs.
+        let registrar = std::thread::spawn(move || {
+            let mut token = 0;
+            register(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                1,
+                2,
+                std::ptr::null_mut(),
+                Some(tracked),
+                &mut token,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while ACTIVE.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_ne!(
+            ACTIVE.load(Ordering::SeqCst),
+            0,
+            "registration delivered a callback"
+        );
+        let poller = std::thread::spawn(move || {
+            host.lock().unwrap().pads[1] = Some(PadState::default());
+            hub.poll();
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(ACTIVE.load(Ordering::SeqCst), 1, "only one callback runs");
+        RELEASE.store(true, Ordering::SeqCst);
+        assert_eq!(registrar.join().unwrap(), S_OK);
+        poller.join().unwrap();
+        assert_eq!(PEAK.load(Ordering::SeqCst), 1);
+        assert!(
+            CALLS.load(Ordering::SeqCst) >= 2,
+            "initial and hotplug both ran"
+        );
     }
 
     #[test]

@@ -267,6 +267,17 @@ impl State {
         }
     }
 
+    pub(crate) fn clear_vertex_buffers(&mut self, start: u32, count: u32) {
+        for slot in self
+            .vertex
+            .iter_mut()
+            .skip(start as usize)
+            .take(count as usize)
+        {
+            *slot = VertexView::default();
+        }
+    }
+
     pub(crate) fn set_index_buffer(&mut self, view: Option<&IndexView>) {
         self.index = view.copied().unwrap_or_default();
     }
@@ -553,6 +564,7 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
+            self.frame_op(&format!("dispatch {x}x{y}x{z}"), true, false);
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -563,18 +575,73 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
+            #[cfg(feature = "diagnostics")]
+            self.frame_op(&format!("dispatch {x}x{y}x{z}"), true, false);
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
+            #[cfg(feature = "diagnostics")]
+            self.frame_op_why(
+                &format!("dispatch {x}x{y}x{z}"),
+                true,
+                false,
+                Some("a graphics pipeline"),
+            );
             return;
         }
         self.bind(list, p, true);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        self.frame_op(&format!("dispatch {x}x{y}x{z}"), true, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// In frames listed for capture, at debug level: one line per draw or
+    /// dispatch with its render targets and depth (named as in
+    /// `VICTORY_DUMP_TARGETS` files) and whether it ran, else why it was
+    /// dropped (diagnostics builds).
+    #[cfg(feature = "diagnostics")]
+    fn frame_op(&self, kind: &str, compute: bool, ran: bool) {
+        self.frame_op_why(kind, compute, ran, None);
+    }
+
+    /// [`State::frame_op`] with the reason a drop happened before a pipeline
+    /// was looked at (else the pipeline's).
+    #[cfg(feature = "diagnostics")]
+    fn frame_op_why(&self, kind: &str, compute: bool, ran: bool, why: Option<&str>) {
+        if !tracing::enabled!(tracing::Level::DEBUG)
+            || !crate::capture::listed(crate::queue::presented() + 1)
+        {
+            return;
+        }
+        let targets: Vec<String> = if compute {
+            Vec::new()
+        } else {
+            self.targets.iter().map(|t| format!("{t:#x}")).collect()
+        };
+        let outcome = if ran {
+            "ran".to_owned()
+        } else {
+            match why {
+                Some(why) => format!("DROPPED: {why}"),
+                None => format!(
+                    "DROPPED: {}",
+                    crate::pipeline::drop_reason(self.pipeline as This)
+                ),
+            }
+        };
+        let text = self.op_text(kind.to_owned(), compute);
+        tracing::debug!(
+            "frame {} op: pipeline {:#x} topology {} targets {targets:?} depth {:#x} -> {outcome} || {text}",
+            crate::queue::presented() + 1,
+            self.pipeline,
+            self.topology,
+            self.depth.map_or(0, |d| d.resource)
+        );
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -639,6 +706,8 @@ impl State {
                 }
                 Err(_) => false,
             };
+        #[cfg(feature = "diagnostics")]
+        self.frame_op("mesh", false, ran);
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -812,8 +881,9 @@ impl State {
         if !tracing::enabled!(tracing::Level::DEBUG) {
             return;
         }
+        // Listed frames: `frame_op` logs every operation instead.
         let listed = crate::capture::listed(crate::queue::presented() + 1);
-        let logged = listed || TRACED.fetch_add(1, Ordering::Relaxed) < 64;
+        let logged = !listed && TRACED.fetch_add(1, Ordering::Relaxed) < 64;
         let targets: Vec<String> = self
             .targets
             .iter()
@@ -883,9 +953,10 @@ impl State {
         let rects = self.topology == RECTANGLES;
         let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
         if ran {
-            // Rectangles were expanded into their own vertex buffers.
+            // Rectangles were expanded into their own vertex buffers (their
+            // count checked to fit by `rectangles`).
             let (count, from) = if rects {
-                (vertices / 3 * 6, 0)
+                (expanded_vertices(vertices).unwrap_or(0), 0)
             } else {
                 (vertices, first)
             };
@@ -898,6 +969,8 @@ impl State {
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        self.frame_op("draw", false, ran);
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -911,6 +984,12 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
+        // The draw runs `count / 3 * 6` vertices, a count the host takes in
+        // 32 bits.
+        if expanded_vertices(count).is_none() {
+            once!(count, "too many rectangle vertices");
+            return false;
+        }
         let rects = u64::from(count / 3);
         for slot in 0..32 {
             let elements: Vec<(u32, u32)> = p
@@ -924,16 +1003,20 @@ impl State {
             }
             let v = self.vertex[slot as usize];
             let stride = u64::from(v.stride);
-            let from = v.address + u64::from(first) * stride;
-            if v.address == 0
-                || stride == 0
-                || u64::from(first + count) * stride > u64::from(v.size)
-                || crate::shadow::find(from, rects * 3 * stride).is_none()
-            {
+            let source = rect_source(first, count, v.stride, v.size)
+                .filter(|_| v.address != 0)
+                .map(|offset| v.address + offset)
+                .filter(|&from| crate::shadow::find(from, rects * 3 * stride).is_some());
+            let Some(from) = source else {
                 once!(slot, "rectangle vertices outside their buffer");
                 return false;
-            }
-            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
+            };
+            // The expanded vertices' view takes its size in 32 bits.
+            let Ok(span) = u32::try_from(rects * 6 * stride) else {
+                once!(slot, "rectangle vertices too many to expand");
+                return false;
+            };
+            let Some((gpu, to)) = list.scratch(u64::from(span)) else {
                 return false;
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
@@ -951,7 +1034,7 @@ impl State {
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
-                SizeInBytes: (rects * 6 * stride as u64) as u32,
+                SizeInBytes: span,
                 StrideInBytes: v.stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
@@ -985,6 +1068,8 @@ impl State {
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        self.frame_op("draw_indexed", false, ran);
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -1011,6 +1096,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
+            self.frame_op(&format!("indirect kind {kind}"), kind == 2, false);
             return false;
         }
         const DRAW: u32 = 0;
@@ -1024,6 +1110,13 @@ impl State {
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
+            #[cfg(feature = "diagnostics")]
+            self.frame_op_why(
+                &format!("indirect kind {kind}"),
+                kind == DISPATCH,
+                false,
+                Some("arguments outside title buffers"),
+            );
             return false;
         };
         let counter = match count {
@@ -1031,6 +1124,13 @@ impl State {
                 Some(s) => Some((s, at)),
                 None => {
                     why("count outside title buffers");
+                    #[cfg(feature = "diagnostics")]
+                    self.frame_op_why(
+                        &format!("indirect kind {kind}"),
+                        kind == DISPATCH,
+                        false,
+                        Some("count outside title buffers"),
+                    );
                     return false;
                 }
             },
@@ -1110,6 +1210,13 @@ impl State {
             .flatten()
         else {
             why("no host signature");
+            #[cfg(feature = "diagnostics")]
+            self.frame_op_why(
+                &format!("indirect kind {kind}"),
+                kind == DISPATCH,
+                false,
+                Some("no host signature"),
+            );
             return false;
         };
         args.refresh(list, arguments, len);
@@ -1119,6 +1226,13 @@ impl State {
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
+            #[cfg(feature = "diagnostics")]
+            self.frame_op_why(
+                &format!("indirect kind {kind}"),
+                kind == DISPATCH,
+                false,
+                Some("not bounded (no clamp, or arguments not 4-byte aligned)"),
+            );
             return false;
         }
         self.host_pipeline = 0;
@@ -1135,6 +1249,8 @@ impl State {
             },
             _ => false,
         };
+        #[cfg(feature = "diagnostics")]
+        self.frame_op("indirect", kind == DISPATCH, ran);
         if !ran {
             crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
@@ -1316,7 +1432,11 @@ fn describe(view: Option<&View>) -> String {
         None => "no view".into(),
         Some(v @ View::Shader(r, _)) => texture(*r as This)
             .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
-        Some(View::Unordered(r, ..)) => format!("uav {:?}", texture(*r as This)),
+        // A buffer has no host texture: its title range, as for a shader view.
+        Some(v @ View::Unordered(r, ..)) => texture(*r as This).map_or_else(
+            || format!("uav buffer {:?}", crate::descriptor::host::buffer_range(v)),
+            |t| format!("uav {t}"),
+        ),
         Some(View::Placed(u, r, d)) => format!(
             "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}",
             r[0],
@@ -1344,6 +1464,52 @@ const RECTANGLES: u32 = 17;
 const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
+
+/// The host vertices `vertices` rectangle-list vertices become (six per
+/// rectangle), if the count fits in 32 bits.
+fn expanded_vertices(vertices: u32) -> Option<u32> {
+    (vertices / 3).checked_mul(6)
+}
+
+/// The byte offset of vertex `first` in a buffer of `size` bytes holding
+/// `stride`-byte vertices, if vertices `first..first + count` all lie in
+/// it. Computed wide: `first + count` and the byte offsets overflow 32
+/// bits with the values a title may pass.
+fn rect_source(first: u32, count: u32, stride: u32, size: u32) -> Option<u64> {
+    let stride = u64::from(stride);
+    let end = (u64::from(first) + u64::from(count)).checked_mul(stride)?;
+    (stride != 0 && end <= u64::from(size)).then(|| u64::from(first) * stride)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{expanded_vertices, rect_source};
+
+    #[test]
+    fn rectangle_vertices_inside_their_buffer() {
+        assert_eq!(rect_source(0, 3, 16, 48), Some(0));
+        assert_eq!(rect_source(3, 3, 16, 96), Some(48));
+        assert_eq!(rect_source(3, 3, 16, 95), None);
+        assert_eq!(rect_source(0, 3, 0, 48), None);
+    }
+
+    /// `first + count` past 32 bits wrapped to a small count before, which
+    /// passed the bounds check and read far outside the buffer.
+    #[test]
+    fn rectangle_bounds_do_not_wrap() {
+        assert_eq!(rect_source(u32::MAX, 3, 16, u32::MAX), None);
+        assert_eq!(rect_source(u32::MAX - 1, 3, 1, u32::MAX), None);
+        assert_eq!(rect_source(u32::MAX, u32::MAX, u32::MAX, u32::MAX), None);
+    }
+
+    #[test]
+    fn expanded_counts_fit_32_bits() {
+        assert_eq!(expanded_vertices(3), Some(6));
+        assert_eq!(expanded_vertices(7), Some(12));
+        assert_eq!(expanded_vertices(u32::MAX / 6 * 3), Some(u32::MAX / 6 * 6));
+        assert_eq!(expanded_vertices(u32::MAX), None);
+    }
+}
 
 /// Fixed-function state, straight onto the host list.
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
@@ -1524,7 +1690,7 @@ mod depth_tests {
 }
 
 #[cfg(all(test, feature = "diagnostics"))]
-mod tests {
+mod diagnostics_tests {
     use super::*;
 
     #[test]

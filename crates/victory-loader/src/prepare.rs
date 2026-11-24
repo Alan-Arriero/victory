@@ -285,6 +285,10 @@ fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
 mod tests {
     use super::*;
 
+    // The tests on the test binary itself need it to be a PE32+ image, which
+    // it is only when built for Windows; `tests/synthetic_prepare.rs` covers
+    // the same ground on any host.
+    #[cfg(windows)]
     #[test]
     fn patches_own_test_binary() {
         let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
@@ -312,6 +316,7 @@ mod tests {
         assert_eq!(prepared.bytes.len(), original.len());
     }
 
+    #[cfg(windows)]
     #[test]
     fn keeps_iat_slots_when_import_size_excludes_the_terminator() {
         let mut original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
@@ -477,6 +482,7 @@ mod tests {
         assert_eq!(relocation_entries(&bytes, 0, usize::MAX).len(), 1);
     }
 
+    #[cfg(windows)]
     #[test]
     fn file_name_is_stable_per_build() {
         let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();

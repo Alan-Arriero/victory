@@ -172,11 +172,27 @@ For structured failure reports, see [Dependency diagnostics](docs/dependency-dia
 
 ## Debugging
 
+If the title presents one or two black frames and exits with `0x80000003`,
+check the archive files before investigating rendering. The loader's import
+report only counts bindings, so it can report zero missing imports with a
+damaged archive. Check the SHA-256 of the files your run actually uses against
+a known-good copy of the **same build**. For example, in PowerShell:
+
+```powershell
+Get-FileHash -Algorithm SHA256 -LiteralPath 'C:\path\to\title\anim.rpf'
+```
+
+If a hash differs, restore that file from your verified backup and rerun with
+the same build of VIctory and the same options. A breakpoint can have other
+causes. Include the archive verification outcome in your test report.
+
 A release build has no debugging aids. Build them in with
 
 ```powershell
 cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
 ```
+
+The on/off switches below (`...=1`) are off when unset or set to `0`.
 
 | Variable | Effect |
 |----------|--------|
@@ -192,7 +208,9 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
+| `VICTORY_LOG=victory_gpu::draw=debug` | with frames listed for capture: one line per draw and dispatch of those frames with its targets (named as in the `VICTORY_DUMP_TARGETS` files) and, if it was dropped, why |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
+| `VICTORY_SKIP_WAVE64=mesh,compute` | omit draws and dispatches whose pipeline has a program of a listed stage written for 64-lane waves (on hosts with 32-lane waves, such as NVIDIA's, these can hang the GPU) |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_ADAPTER=<name>` | select a D3D12 adapter by case-insensitive substring (default: high-performance GPU) |

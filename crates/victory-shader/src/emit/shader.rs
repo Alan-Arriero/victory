@@ -275,13 +275,26 @@ impl Shader {
         )
     }
 
-    /// A descriptor heap handle, annotated with `props`.
+    /// A descriptor heap handle, annotated with `props`. Indices at or past
+    /// [`super::VIEW_HEAP_LIMIT`] / [`super::SAMPLER_HEAP_LIMIT`] (garbage or
+    /// negative values from dropped passes) are clamped to slot 0, so
+    /// `ResourceDescriptorHeap` / `SamplerDescriptorHeap` reads never go far
+    /// past any heap. The bound is the largest heap, not the one bound: an
+    /// index just past a smaller heap's end still reads past it.
     pub fn heap_handle(&mut self, block: usize, index: V, sampler: bool, props: (u32, u32)) -> V {
         self.flags |= if sampler {
             flags::SAMPLER_HEAP
         } else {
             flags::RESOURCE_HEAP
         };
+        let limit = self.m.i32(if sampler {
+            super::SAMPLER_HEAP_LIMIT
+        } else {
+            super::VIEW_HEAP_LIMIT
+        });
+        let zero = self.m.i32(0);
+        let in_bounds = self.m.cmp(block, super::bitcode::pred::IULT, index, limit);
+        let index = self.m.select(block, in_bounds, index, zero);
         let (s, n) = (self.m.bool(sampler), self.m.bool(false));
         let h = self.op(
             block,
@@ -298,6 +311,8 @@ impl Shader {
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        container::separate_interpolation(&mut self.inputs);
+        container::separate_interpolation(&mut self.outputs);
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -569,10 +584,10 @@ impl Shader {
             features |= 0x8000;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
-            features |= 0x200_0000;
+            features |= super::SFI0_RESOURCE_HEAP;
         }
         if self.flags & flags::SAMPLER_HEAP != 0 {
-            features |= 0x400_0000;
+            features |= super::SFI0_SAMPLER_HEAP;
         }
         if self.flags & flags::ATOMIC_TYPED64 != 0 {
             features |= 0x40_0000;

@@ -577,25 +577,37 @@ mod tests {
     /// A bottom-of-pipe write at a fence a held queue waits for does not
     /// run that queue's work inside the write: the writer (`Host::execute`)
     /// still holds its submission lock, which the work takes again. The old
-    /// code ran it there (a deadlock on the real lock).
+    /// code ran it there (a deadlock on the real lock). The background
+    /// watcher may see the value first and run the work on its own thread,
+    /// which only waits for the lock, so only the writer's thread is checked.
     #[test]
     fn bottom_of_pipe_writes_leave_woken_work_to_the_writer() {
         use crate::timeline::{Op, Timeline};
+        use std::sync::atomic::{AtomicBool, AtomicU32};
         let f = new_fence(0);
         let submission = Arc::new(Mutex::new(()));
-        let ran = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let writer = std::thread::current().id();
+        let inside = Arc::new(AtomicBool::new(false));
+        let ran = Arc::new(AtomicU32::new(0));
         let queue = Arc::new(Timeline::default());
         queue.submit(Op::Wait(Held::new(f), 1));
-        let (lock, seen) = (submission.clone(), ran.clone());
+        let (lock, seen_inside, seen) = (submission.clone(), inside.clone(), ran.clone());
         queue.submit(Op::Run(Box::new(move || {
-            let free = lock.try_lock().is_ok();
-            seen.store(if free { 1 } else { 2 }, Ordering::SeqCst);
+            if std::thread::current().id() == writer && lock.try_lock().is_err() {
+                seen_inside.store(true, Ordering::SeqCst);
+            }
+            seen.fetch_add(1, Ordering::SeqCst);
         })));
         let held = submission.lock().unwrap();
         let woken = crate::queue::Written::Value(1).write(address(f) as *mut u8, 8);
-        assert_eq!(ran.load(Ordering::SeqCst), 0, "ran inside the write");
+        assert!(!inside.load(Ordering::SeqCst), "ran inside the write");
         drop(held);
         woken.run();
+        let started = Instant::now();
+        while ran.load(Ordering::SeqCst) == 0 && started.elapsed() < Duration::from_secs(2) {
+            std::thread::yield_now();
+        }
+        assert!(!inside.load(Ordering::SeqCst), "ran inside the write");
         assert_eq!(ran.load(Ordering::SeqCst), 1);
         release_fence(f);
     }

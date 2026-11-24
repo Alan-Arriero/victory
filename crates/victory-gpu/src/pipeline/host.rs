@@ -340,8 +340,10 @@ impl HostPipeline {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
+        let mut heaps = false;
         for &(shader, visibility) in &stages {
             let t = &shader.translated()?.host;
+            heaps |= t.indexes_heaps();
             let mut stage = Stage {
                 shader: shader.clone(),
                 user_data: None,
@@ -410,7 +412,7 @@ impl HostPipeline {
             bound.push(stage);
         }
         let (root, root_blob) =
-            match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+            match root_signature(&host.device, &params, &samplers, compute.is_some(), heaps) {
                 Ok(root) => root,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host root signature refused");
@@ -541,7 +543,26 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                tracing::warn!(
+                    error = %e,
+                    ?shaders,
+                    vs_bytes = code_bytes(&code(0)).len(),
+                    ps_bytes = code_bytes(&code(1)).len(),
+                    num_rt = g.targets.NumRenderTargets,
+                    rtv0 = g.targets.RTFormats[0].0,
+                    dsv = g.depth_format.0,
+                    samples = g.samples.Count,
+                    inputs = g.inputs.len(),
+                    cull = g.rasterizer.CullMode.0,
+                    fill = g.rasterizer.FillMode.0,
+                    depth_enable = g.depth.DepthEnable.0,
+                    blend_enable = g.blend.RenderTarget[0].BlendEnable.0,
+                    blend_op = g.blend.RenderTarget[0].BlendOp.0,
+                    src_blend = g.blend.RenderTarget[0].SrcBlend.0,
+                    dst_blend = g.blend.RenderTarget[0].DestBlend.0,
+                    topo = g.topology.0,
+                    "host pipeline refused"
+                );
                 host.log_messages();
                 return None;
             }
@@ -659,16 +680,28 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
         .to_vec()
 }
 
+/// The root signature over `params` and `samplers`. It lets shaders index
+/// the descriptor heaps directly only when one of them does (`heaps`):
+/// Windows 10's d3d12core refuses those two 1.1 flags ("Unsupported
+/// bit-flag set"), and a pipeline without such shaders works there; one
+/// with them is refused, as it cannot run on that host.
 fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
     compute: bool,
+    heaps: bool,
 ) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
     let input = if compute {
         D3D12_ROOT_SIGNATURE_FLAG_NONE
     } else {
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+    };
+    let heap_indexing = if heaps {
+        D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+            | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED
+    } else {
+        D3D12_ROOT_SIGNATURE_FLAG_NONE
     };
     let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
         Version: windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1_1,
@@ -678,9 +711,7 @@ fn root_signature(
                 pParameters: params.as_ptr(),
                 NumStaticSamplers: samplers.len() as u32,
                 pStaticSamplers: samplers.as_ptr(),
-                Flags: input
-                    | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                    | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                Flags: input | heap_indexing,
             },
         },
     };
@@ -695,7 +726,7 @@ fn root_signature(
                     error.GetBufferPointer().cast::<u8>(),
                     error.GetBufferSize(),
                 );
-                tracing::warn!("root signature: {}", String::from_utf8_lossy(text));
+                tracing::warn!(heaps, "root signature: {}", String::from_utf8_lossy(text));
             }
             return Err(e);
         }
@@ -772,7 +803,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
         let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
-        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let (root, root_blob) = root_signature(&host.device, &[], &[], false, false).unwrap();
         let mut g = GraphicsState::default();
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;

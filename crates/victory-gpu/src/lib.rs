@@ -15,6 +15,10 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+// Off Windows there is no host GPU: only the portable parts are built (for
+// their tests), and the paths that feed the host go unused.
+#![cfg_attr(not(windows), allow(dead_code, unused_variables, unused_mut))]
+
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
@@ -49,6 +53,7 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+mod switch;
 #[cfg(windows)]
 mod texture;
 mod timeline;
