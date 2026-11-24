@@ -169,15 +169,27 @@ struct Guards {
     protected: BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
     clean: BTreeSet<usize>,
-    /// Blocks with announced kernel writes still to land, and how many:
-    /// left open until they have, however many refreshes come first.
-    announced: BTreeMap<usize, u32>,
+    /// Announced kernel writes still to land, as block ranges `[first, end)`
+    /// (one entry per announcement): their blocks are left open until they
+    /// have, however many refreshes come first. Kept as ranges, not per
+    /// block, so a title-supplied length (saturated by `fread`'s size times
+    /// count) costs nothing however large.
+    announced: Vec<(usize, usize)>,
+}
+
+impl Guards {
+    /// Whether an announced kernel write still to land covers `block`.
+    fn announced(&self, block: usize) -> bool {
+        self.announced
+            .iter()
+            .any(|&(first, end)| (first..end).contains(&block))
+    }
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
-    announced: BTreeMap::new(),
+    announced: Vec::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -203,7 +215,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
-            } else if !g.announced.contains_key(&block) {
+            } else if !g.announced(block) {
                 run.get_or_insert(block);
                 continue;
             }
@@ -328,23 +340,16 @@ pub fn kernel_will_write(at: usize, len: usize) {
     let end = at.saturating_add(len);
     let mut g = guards();
     open(&mut g, at, end);
-    for block in at / BLOCK..end.div_ceil(BLOCK) {
-        *g.announced.entry(block).or_default() += 1;
-    }
+    g.announced.push((at / BLOCK, end.div_ceil(BLOCK)));
 }
 
 /// The kernel write [`kernel_will_write`] announced for `[at, at + len)`
 /// has landed (or failed); its blocks can be guarded again.
 pub fn kernel_wrote(at: usize, len: usize) {
-    let end = at.saturating_add(len);
+    let range = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut g = guards();
-    for block in at / BLOCK..end.div_ceil(BLOCK) {
-        if let Some(n) = g.announced.get_mut(&block) {
-            *n -= 1;
-            if *n == 0 {
-                g.announced.remove(&block);
-            }
-        }
+    if let Some(i) = g.announced.iter().position(|&r| r == range) {
+        g.announced.swap_remove(i);
     }
 }
 
@@ -641,6 +646,21 @@ mod tests {
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// `fread`'s size times count saturates to `usize::MAX`: announcing and
+    /// landing that kernel read is one range, not a step per block of the
+    /// whole address space, and landing it leaves nothing announced.
+    #[test]
+    fn a_saturated_kernel_read_is_announced_in_one_step() {
+        // Kernel half of the address space: no user allocation of another
+        // test running at the same time can fall in the announced range.
+        let at = 0xFFFF_8000_0000_0000;
+        let before = guards().announced.len();
+        kernel_will_write(at, usize::MAX);
+        assert!(guards().announced(at / BLOCK + 12345));
+        kernel_wrote(at, usize::MAX);
+        assert_eq!(guards().announced.len(), before);
     }
 
     /// A kernel read announced with `kernel_will_write` survives a refresh
