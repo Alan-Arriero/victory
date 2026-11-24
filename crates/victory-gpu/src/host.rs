@@ -574,6 +574,14 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// Actual D3D12 access state per host buffer for this recording.
     shadow_states: Mutex<std::collections::HashMap<usize, (ID3D12Resource, D3D12_RESOURCE_STATES)>>,
+    /// Incremented whenever `states` inserts a new texture or transitions a
+    /// texture to a different state; reset to 0 when the list is reset.
+    state_gen: std::sync::atomic::AtomicU64,
+    /// Title resource pointers whose tracked state changed on this list since
+    /// reset (append-only; cleared on reset). Lets `draw::State::bindless_textures`
+    /// re-sync only the textures touched since the previous draw instead of
+    /// walking every resident bindless texture on RT switches or copies.
+    dirty_resources: Mutex<Vec<usize>>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// Memory handed out for the list's recording, kept until it is finished
@@ -944,6 +952,8 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 shadow_states: Mutex::default(),
+                state_gen: std::sync::atomic::AtomicU64::new(0),
+                dirty_resources: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 kept_uploads: Mutex::default(),
                 kept_dynamic: Mutex::default(),
@@ -1623,6 +1633,11 @@ impl HostList {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.state_gen.store(0, Ordering::Relaxed);
+        self.dirty_resources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.pipelines
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1649,6 +1664,19 @@ impl HostList {
         self.release_epoch();
     }
 
+    /// The host state currently tracked for `resource` on this list, falling
+    /// back to the resource's last submitted/initial host state if this list
+    /// has not transitioned it yet.
+    pub(crate) fn tracked_state(&self, resource: crate::object::This) -> Option<u32> {
+        let copy = crate::resource::host_copy(resource)?;
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(_, last, _)) = states.get(&(std::sync::Arc::as_ptr(&copy) as usize)) {
+            Some(last)
+        } else {
+            Some(copy.state.load(Ordering::Relaxed))
+        }
+    }
+
     /// Moves a title texture's host copy to `wanted` (a host state) in this
     /// list: the host texture and the state it leaves, if that is a change.
     /// The list's first use of a texture records nothing: its prelude brings
@@ -1662,17 +1690,31 @@ impl HostList {
         let copy = crate::resource::host_copy(resource)?;
         self.mark_work();
         let wanted = legal_state(texture, wanted);
-        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
-                None
+        let (changed, result) = {
+            let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert((wanted, wanted, copy));
+                    (true, None)
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                    if before != wanted {
+                        (true, Some((texture, before)))
+                    } else {
+                        (false, None)
+                    }
+                }
             }
-            std::collections::hash_map::Entry::Occupied(mut o) => {
-                let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some((texture, before))
-            }
+        };
+        if changed {
+            self.dirty_resources
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(resource as usize);
+            self.state_gen.fetch_add(1, Ordering::Relaxed);
         }
+        result
     }
 
     /// The current state established by this list. A texture the list has
@@ -1686,6 +1728,32 @@ impl HostList {
             .unwrap_or_else(|e| e.into_inner())
             .get(&(std::sync::Arc::as_ptr(copy) as usize))
             .map(|&(_, last, _)| last)
+    }
+
+    /// Monotonic generation incremented whenever a texture is first tracked
+    /// or changes state in this list.
+    pub(crate) fn state_gen(&self) -> u64 {
+        self.state_gen.load(Ordering::Relaxed)
+    }
+
+    /// Current cursor length of [`HostList::dirty_resources`].
+    pub(crate) fn dirty_len(&self) -> usize {
+        self.dirty_resources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    /// Returns `(new_cursor, resources)` of title texture pointers whose
+    /// tracked state changed at or after `cursor`.
+    pub(crate) fn dirty_since(&self, cursor: usize) -> (usize, Vec<usize>) {
+        let dirty = self
+            .dirty_resources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let len = dirty.len();
+        let slice = dirty.get(cursor..).unwrap_or(&[]);
+        (len, slice.to_vec())
     }
 
     /// At submission: the list that moves each texture this list uses from
@@ -3659,6 +3727,68 @@ mod tests {
         list.close();
         host.execute(&[&list]);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn state_gen_bumps_only_on_new_or_changed_texture_states() {
+        let Some(host) = host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        assert_eq!(list.state_gen(), 0);
+        let null = std::ptr::null();
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let iid = ID3D12Resource::IID;
+        let mut tex = null;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                (&raw const heap).cast(),
+                0,
+                (&raw const desc).cast(),
+                0,
+                null.cast(),
+                (&raw const iid).cast(),
+                &mut tex,
+            ),
+            crate::object::S_OK
+        );
+
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        const COPY_SOURCE: u32 = 0x800;
+        assert!(list.transition(tex, SHADER_RESOURCE).is_none());
+        assert_eq!(list.state_gen(), 1);
+        // Same state does not bump state_gen.
+        assert!(list.transition(tex, SHADER_RESOURCE).is_none());
+        assert_eq!(list.state_gen(), 1);
+        // Changing state bumps state_gen and returns the prior state.
+        assert!(list.transition(tex, COPY_SOURCE).is_some());
+        assert_eq!(list.state_gen(), 2);
+
+        list.close();
+        list.reset();
+        assert_eq!(list.state_gen(), 0);
+        list.close();
+
+        let release =
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(tex, 0x10);
+        assert_eq!(release(tex), 0);
     }
 }
 

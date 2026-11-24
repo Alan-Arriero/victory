@@ -140,6 +140,24 @@ struct FreshTableEntry {
     dead_slots: Vec<u32>,
 }
 
+/// Fast-path and incremental-sync cache for [`State::bindless_textures`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BindlessCache {
+    heap: usize,
+    tex_gen: u64,
+    state_gen: u64,
+    targets_hash: u64,
+    uses_heap_srv: bool,
+    uses_heap_uav: bool,
+    /// Cursor into `HostList::dirty_resources` after the last bindless sync.
+    dirty_cursor: usize,
+    /// Active graphics RTs / depth target skipped on the last bindless sync so
+    /// they are re-checked once unbound even without another intervening copy.
+    skipped_targets: Vec<usize>,
+    /// Whether the cached bindless pass also sampled a read-only depth target.
+    depth_sampled: bool,
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -185,6 +203,11 @@ pub(crate) struct State {
     table_failed: bool,
     /// One slot per view and access kind in each heap, including null views.
     root_view_slots: std::collections::HashMap<(usize, RawAccess, Option<RawBufferRange>), u32>,
+    /// Fast-path and incremental-sync cache for [`State::bindless_textures`].
+    bindless_cache: Option<BindlessCache>,
+    /// Number of full-heap bindless walks performed on this list (for tests).
+    #[cfg(test)]
+    bindless_full_walks: u64,
 }
 
 impl Drop for State {
@@ -339,6 +362,7 @@ impl State {
     /// mid-list wait split, moving dynamic descriptor slots onto `prev_list`
     /// so they stay alive until its submission finishes.
     pub(crate) fn reapply_host(&mut self, new_list: &HostList, prev_list: &HostList) {
+        self.bindless_cache = None;
         prev_list.keep_dynamic(self.take_dynamic());
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
@@ -726,6 +750,7 @@ impl State {
                     .map(|s| s.shader.hash.as_str())
             })
             .flatten();
+        self.bindless_textures(list, p, compute);
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
@@ -950,6 +975,174 @@ impl State {
             }
         }
         true
+    }
+
+    /// Transitions (and uploads title-written) live bindless textures in the
+    /// bound CBV/SRV/UAV heap when any stage indexes `ResourceHeap`.
+    fn bindless_textures(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+        let mut uses_heap_srv = false;
+        let mut uses_heap_uav = false;
+        for stage in &p.stages {
+            for u in &stage.translated().used {
+                if u.root == RootType::ResourceHeap {
+                    match u.kind {
+                        ResourceType::Srv => uses_heap_srv = true,
+                        ResourceType::Uav => uses_heap_uav = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if (!uses_heap_srv && !uses_heap_uav) || self.heaps[0] == 0 {
+            return;
+        }
+        let Some(host) = crate::descriptor::heap(self.heaps[0] as This).host() else {
+            return;
+        };
+        let targets_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            compute.hash(&mut h);
+            if !compute {
+                self.targets.hash(&mut h);
+                if let Some(d) = self.depth {
+                    d.resource.hash(&mut h);
+                    d.state.hash(&mut h);
+                }
+            }
+            h.finish()
+        };
+        let cur_tex_gen = host.tex_gen();
+        let cur_state_gen = list.state_gen();
+        if let Some(cache) = &self.bindless_cache
+            && cache.heap == self.heaps[0]
+            && cache.tex_gen == cur_tex_gen
+            && cache.state_gen == cur_state_gen
+            && cache.targets_hash == targets_hash
+            && cache.uses_heap_srv == uses_heap_srv
+            && cache.uses_heap_uav == uses_heap_uav
+        {
+            self.depth_sampled |= cache.depth_sampled;
+            return;
+        }
+        let active_depth = (!compute).then_some(self.depth).flatten();
+        // When the view heap, descriptor generation, and bindless SRV/UAV mode
+        // are unchanged, only textures transitioned on `list` since the last
+        // sync, targets skipped on the previous draw, or the active depth
+        // target can need transitions — O(|dirty|) instead of walking every
+        // resident bindless texture.
+        let incremental = self
+            .bindless_cache
+            .as_ref()
+            .filter(|cache| {
+                cache.heap == self.heaps[0]
+                    && cache.tex_gen == cur_tex_gen
+                    && cache.uses_heap_srv == uses_heap_srv
+                    && cache.uses_heap_uav == uses_heap_uav
+            })
+            .and_then(|cache| {
+                let (_, mut candidates) = list.dirty_since(cache.dirty_cursor);
+                candidates.extend_from_slice(&cache.skipped_targets);
+                if let Some(d) = active_depth {
+                    candidates.push(d.resource);
+                }
+                let (got_gen, srvs, uavs) =
+                    host.pin_live_subset(&candidates, uses_heap_srv, uses_heap_uav);
+                (got_gen == cache.tex_gen).then_some((got_gen, srvs, uavs))
+            });
+        let (tex_gen, live_srvs, live_uavs) = match incremental {
+            Some(subset) => subset,
+            None => {
+                #[cfg(test)]
+                {
+                    self.bindless_full_walks += 1;
+                }
+                host.live_textures(uses_heap_srv, uses_heap_uav)
+            }
+        };
+        let is_active_rt = |r: usize| !compute && self.targets.contains(&r);
+        // When a pipeline accesses both bindless SRVs and bindless UAVs, a
+        // texture with both descriptor types resident in the heap is ambiguous:
+        // preserve its SRV state if the title already transitioned it for
+        // shader reading instead of clobbering it into UNORDERED_ACCESS.
+        let srv_set: Option<std::collections::HashSet<usize>> =
+            (uses_heap_srv && uses_heap_uav && live_srvs.len() > 64)
+                .then(|| live_srvs.iter().map(|h| h.get() as usize).collect());
+        let in_srvs = |r: usize| {
+            uses_heap_srv
+                && match &srv_set {
+                    Some(set) => set.contains(&r),
+                    None => live_srvs.iter().any(|h| h.get() as usize == r),
+                }
+        };
+        let mut uav_transitioned: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        if uses_heap_uav {
+            const UNORDERED_ACCESS: u32 = 0x8;
+            for held in &live_uavs {
+                let r = held.get() as usize;
+                if is_active_rt(r) || active_depth.is_some_and(|d| d.resource == r) {
+                    continue;
+                }
+                if in_srvs(r)
+                    && list
+                        .tracked_state(held.get())
+                        .is_some_and(|s| s & SHADER_RESOURCE != 0)
+                {
+                    continue;
+                }
+                #[cfg(feature = "diagnostics")]
+                crate::capture::note_target(held.get());
+                crate::list::ensure_state(list, held.get(), UNORDERED_ACCESS);
+                if uses_heap_srv {
+                    uav_transitioned.insert(r);
+                }
+            }
+        }
+        let mut depth_sampled = false;
+        if uses_heap_srv {
+            for held in &live_srvs {
+                let r = held.get() as usize;
+                if is_active_rt(r) || uav_transitioned.contains(&r) {
+                    continue;
+                }
+                if let Some(d) = active_depth
+                    && d.resource == r
+                {
+                    if d.state == DEPTH_READ {
+                        depth_sampled = true;
+                        crate::list::ensure_state(list, held.get(), DEPTH_READ | SHADER_RESOURCE);
+                    }
+                    continue;
+                }
+                if let Some(t) = crate::resource::host_resource(held.get()) {
+                    if crate::texture::title_written(t) {
+                        crate::texture::upload(list, held.get(), t);
+                    }
+                    crate::list::ensure_state(list, held.get(), SHADER_RESOURCE);
+                }
+            }
+        }
+        let mut skipped_targets = if compute {
+            Vec::new()
+        } else {
+            self.targets.clone()
+        };
+        if let Some(d) = active_depth {
+            skipped_targets.push(d.resource);
+        }
+        self.depth_sampled |= depth_sampled;
+        self.bindless_cache = Some(BindlessCache {
+            heap: self.heaps[0],
+            tex_gen,
+            state_gen: list.state_gen(),
+            targets_hash,
+            uses_heap_srv,
+            uses_heap_uav,
+            dirty_cursor: list.dirty_len(),
+            skipped_targets,
+            depth_sampled,
+        });
     }
 
     /// Runs a dispatch on the host.
@@ -3644,6 +3837,522 @@ mod table_tests {
         list.close();
         host.execute(&[&list]);
         assert_eq!(cb_dst, cb_src);
+    }
+}
+
+
+#[cfg(test)]
+mod bindless_tests {
+    use super::*;
+    use crate::pipeline::Shader;
+    use crate::pipeline::host::{HostPipeline, Stage};
+    use victory_shader::HwStage;
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+    };
+    use windows::core::s;
+
+    struct OwnedObject(This);
+
+    impl Drop for OwnedObject {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                let release = crate::object::slot::<extern "system" fn(This) -> u32>(self.0, 0x10);
+                release(self.0);
+            }
+        }
+    }
+
+    fn make_texture(format: DXGI_FORMAT, flags: D3D12_RESOURCE_FLAGS) -> OwnedObject {
+        let null = std::ptr::null();
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: flags,
+            ..Default::default()
+        };
+        let iid = ID3D12Resource::IID;
+        let mut out = null;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                (&raw const heap).cast(),
+                0,
+                (&raw const desc).cast(),
+                0,
+                null.cast(),
+                (&raw const iid).cast(),
+                &mut out,
+            ),
+            crate::object::S_OK
+        );
+        OwnedObject(out)
+    }
+
+    fn make_view_heap(count: u32) -> OwnedObject {
+        #[repr(C)]
+        struct ViewHeap {
+            desc: D3D12_DESCRIPTOR_HEAP_DESC,
+            placement: [u64; 2],
+        }
+        let desc = ViewHeap {
+            desc: D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: count,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            },
+            placement: [0; 2],
+        };
+        let iid = ID3D12DescriptorHeap::IID;
+        let mut out = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                (&raw const desc).cast(),
+                (&raw const iid).cast(),
+                &mut out,
+            ),
+            crate::object::S_OK
+        );
+        OwnedObject(out)
+    }
+
+    fn compile_hlsl(
+        source: &str,
+        entry: windows::core::PCSTR,
+        target: windows::core::PCSTR,
+    ) -> ID3DBlob {
+        let mut code = None;
+        // SAFETY: source and entry/target strings are live; code is our output.
+        unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                s!("bindless-test"),
+                None,
+                None,
+                entry,
+                target,
+                0,
+                0,
+                &mut code,
+                None,
+            )
+            .expect("compile test shader");
+        }
+        code.expect("shader blob")
+    }
+
+    fn make_test_pipelines(device: &ID3D12Device) -> (HostPipeline, HostPipeline, HostPipeline) {
+        let cs_src = r#"
+            [RootSignature("RootFlags(0)")]
+            [numthreads(1, 1, 1)]
+            void main() {}
+        "#;
+        let gfx_src = r#"
+            [RootSignature("RootFlags(0)")]
+            float4 vs(uint id : SV_VertexID) : SV_Position { return 0; }
+            float4 ps() : SV_Target0 { return 1; }
+        "#;
+        let cs = compile_hlsl(cs_src, s!("main"), s!("cs_5_1"));
+        let vs = compile_hlsl(gfx_src, s!("vs"), s!("vs_5_1"));
+        let ps = compile_hlsl(gfx_src, s!("ps"), s!("ps_5_1"));
+
+        // SAFETY: compiled blobs contain embedded root signatures and valid DXBC.
+        let (cs_root, cs_pso, gfx_root, gfx_pso) = unsafe {
+            let bytes = |b: &ID3DBlob| {
+                std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
+            };
+            let bc = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: b.GetBufferPointer(),
+                BytecodeLength: b.GetBufferSize(),
+            };
+            let cs_root: ID3D12RootSignature =
+                device.CreateRootSignature(0, bytes(&cs)).expect("cs root");
+            let cs_pso: ID3D12PipelineState = device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&cs_root),
+                    CS: bc(&cs),
+                    ..Default::default()
+                })
+                .expect("cs pso");
+            let gfx_root: ID3D12RootSignature =
+                device.CreateRootSignature(0, bytes(&vs)).expect("gfx root");
+            let mut gfx_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&gfx_root),
+                VS: bc(&vs),
+                PS: bc(&ps),
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            gfx_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            let gfx_pso: ID3D12PipelineState = device
+                .CreateGraphicsPipelineState(&gfx_desc)
+                .expect("gfx pso");
+            (cs_root, cs_pso, gfx_root, gfx_pso)
+        };
+
+        let used_srv = UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::ResourceHeap,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        };
+        let used_uav = UsedResource {
+            kind: ResourceType::Uav,
+            ..used_srv
+        };
+
+        let gfx_srv_uav = HostPipeline {
+            compute: false,
+            mesh: false,
+            rects: false,
+            pso: gfx_pso.clone(),
+            root: gfx_root.clone(),
+            stages: vec![Stage {
+                shader: Shader::for_test("pixel", HwStage::Ps, vec![used_srv, used_uav]),
+                user_data: None,
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+            }],
+            slots: 0,
+            inputs: Vec::new(),
+            name: "gfx_srv_uav".into(),
+        };
+        let gfx_srv_only = HostPipeline {
+            compute: false,
+            mesh: false,
+            rects: false,
+            pso: gfx_pso,
+            root: gfx_root,
+            stages: vec![Stage {
+                shader: Shader::for_test("pixel", HwStage::Ps, vec![used_srv]),
+                user_data: None,
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+            }],
+            slots: 0,
+            inputs: Vec::new(),
+            name: "gfx_srv_only".into(),
+        };
+        let compute_srv = HostPipeline {
+            compute: true,
+            mesh: false,
+            rects: false,
+            pso: cs_pso,
+            root: cs_root,
+            stages: vec![Stage {
+                shader: Shader::for_test("compute", HwStage::Cs, vec![used_srv]),
+                user_data: None,
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+            }],
+            slots: 0,
+            inputs: Vec::new(),
+            name: "compute_srv".into(),
+        };
+        (gfx_srv_uav, gfx_srv_only, compute_srv)
+    }
+
+    #[test]
+    fn bindless_textures_transitions_uploads_skips_targets_and_caches() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let _ = host.log_messages();
+        let (gfx_srv_uav, gfx_srv_only, compute_srv) = make_test_pipelines(&host.device);
+
+        let rt = make_texture(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        );
+        let depth = make_texture(
+            DXGI_FORMAT_D32_FLOAT,
+            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+        );
+        let uav_tex = make_texture(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        );
+        // Title-written texture (flags = 0) with non-zero bytes in title memory.
+        let tw_tex = make_texture(DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
+        let (tw_mem, tw_desc) = crate::resource::texture_memory(tw_tex.0).unwrap();
+        let tw_size = crate::resource::texture_layout(&tw_desc).unwrap().size as usize;
+        // SAFETY: title memory for `tw_tex` holds at least `tw_size` writable bytes.
+        unsafe { std::slice::from_raw_parts_mut(tw_mem.cast_mut(), tw_size).fill(0x5a) };
+        let srv_tex = make_texture(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        );
+
+        let heap = make_view_heap(16);
+        let start = crate::descriptor::heap(heap.0).start;
+        let slot_at = |i: u64| start + i * 32;
+        let null = std::ptr::null();
+        crate::descriptor::create_srv(null, rt.0, null.cast(), slot_at(0));
+        crate::descriptor::create_srv(null, depth.0, null.cast(), slot_at(1));
+        // `uav_tex` is bound as BOTH SRV and UAV in the heap to test UAV precedence.
+        crate::descriptor::create_srv(null, uav_tex.0, null.cast(), slot_at(2));
+        crate::descriptor::create_uav(null, uav_tex.0, null, null.cast(), slot_at(3));
+        crate::descriptor::create_srv(null, tw_tex.0, null.cast(), slot_at(4));
+        crate::descriptor::create_srv(null, srv_tex.0, null.cast(), slot_at(5));
+        crate::descriptor::create_uav(null, depth.0, null, null.cast(), slot_at(6));
+
+        let list = host.new_list().expect("host list");
+        let mut rtv_slot = [0u64; 16];
+        let mut dsv_slot = [0u64; 16];
+        crate::descriptor::create_rtv(null, rt.0, null.cast(), rtv_slot.as_mut_ptr() as u64);
+        let dsv_write_desc = [
+            DXGI_FORMAT_D32_FLOAT.0 as u32,
+            D3D12_DSV_DIMENSION_TEXTURE2D.0 as u32,
+            D3D12_DSV_FLAG_NONE.0 as u32,
+            0,
+            0,
+            0,
+        ];
+        crate::descriptor::create_dsv(null, depth.0, &dsv_write_desc, dsv_slot.as_mut_ptr() as u64);
+
+        const UNORDERED_ACCESS: u32 = 0x8;
+        const COPY_DEST: u32 = 0x400;
+        const COPY_SOURCE: u32 = 0x800;
+
+        // Put active RT in COPY_SOURCE and active depth in DEPTH_WRITE before bind.
+        crate::list::ensure_state(&list, rt.0, COPY_SOURCE);
+        crate::list::ensure_state(&list, depth.0, DEPTH_WRITE);
+
+        let mut state = State::default();
+        state.set_heaps(&[heap.0]);
+        state.set_targets(&list, &[rtv_slot.as_ptr() as u64], dsv_slot.as_ptr() as u64);
+
+        // 1. Graphics bind with ResourceHeap SRV + UAV and DEPTH_WRITE.
+        assert!(state.bind(&list, &gfx_srv_uav, false));
+        assert!(
+            !state.depth_sampled,
+            "DEPTH_WRITE must not mark depth_sampled"
+        );
+        assert!(
+            list.transition(rt.0, COPY_SOURCE).is_none(),
+            "active RT must be skipped"
+        );
+        assert!(
+            list.transition(depth.0, DEPTH_WRITE).is_none(),
+            "active DEPTH_WRITE target must be skipped"
+        );
+        assert!(
+            list.transition(uav_tex.0, UNORDERED_ACCESS).is_none(),
+            "UAV must take precedence over SRV when uses_heap_uav is true"
+        );
+        assert!(
+            !list.first_use(tw_tex.0 as usize),
+            "title_written SRV must be uploaded"
+        );
+        assert!(
+            list.transition(tw_tex.0, SHADER_RESOURCE).is_none(),
+            "title_written SRV must end in SHADER_RESOURCE"
+        );
+        assert!(list.transition(srv_tex.0, SHADER_RESOURCE).is_none());
+
+        // 2. Consecutive identical bind hits bindless_cache without state changes.
+        assert_eq!(state.bindless_full_walks, 1);
+        let cached = state.bindless_cache.clone().expect("cache populated");
+        let gen_before = list.state_gen();
+        assert!(state.bind(&list, &gfx_srv_uav, false));
+        assert_eq!(list.state_gen(), gen_before);
+        assert_eq!(state.bindless_cache, Some(cached.clone()));
+        assert_eq!(state.bindless_full_walks, 1);
+
+        // 3. Intervening copy/clear bumps state_gen and uses the incremental
+        // dirty-resource fast path (no full-heap walk).
+        crate::list::ensure_state(&list, srv_tex.0, COPY_DEST);
+        assert!(list.state_gen() > gen_before);
+        assert!(state.bind(&list, &gfx_srv_uav, false));
+        assert_eq!(
+            state.bindless_full_walks, 1,
+            "intervening state change with unchanged heap must use incremental dirty sync"
+        );
+        assert!(
+            list.transition(srv_tex.0, SHADER_RESOURCE).is_none(),
+            "incremental sync must re-transition dirtied srv_tex back to SHADER_RESOURCE"
+        );
+        assert_ne!(state.bindless_cache, Some(cached));
+
+        // 4. Graphics bind with DEPTH_READ sets depth_sampled and keeps it on cache hit.
+        let dsv_read_desc = [
+            DXGI_FORMAT_D32_FLOAT.0 as u32,
+            D3D12_DSV_DIMENSION_TEXTURE2D.0 as u32,
+            D3D12_DSV_FLAG_READ_ONLY_DEPTH.0 as u32,
+            0,
+            0,
+            0,
+        ];
+        crate::descriptor::create_dsv(null, depth.0, &dsv_read_desc, dsv_slot.as_mut_ptr() as u64);
+        state.set_targets(&list, &[rtv_slot.as_ptr() as u64], dsv_slot.as_ptr() as u64);
+        assert!(state.bind(&list, &gfx_srv_only, false));
+        assert!(
+            state.depth_sampled,
+            "DEPTH_READ in live_srvs sets depth_sampled"
+        );
+        assert!(
+            list.transition(depth.0, DEPTH_READ | SHADER_RESOURCE)
+                .is_none()
+        );
+        assert!(
+            list.transition(uav_tex.0, SHADER_RESOURCE).is_none(),
+            "when uses_heap_uav is false, uav_tex transitions to SHADER_RESOURCE"
+        );
+        // Second identical bind hits cache and MUST preserve `depth_sampled = true`.
+        let gen_read = list.state_gen();
+        assert!(state.bind(&list, &gfx_srv_only, false));
+        assert_eq!(list.state_gen(), gen_read);
+        assert!(
+            state.depth_sampled,
+            "cache hit must preserve depth_sampled for DEPTH_READ"
+        );
+
+        // 5. Compute dispatch ignores graphics RTs/depth and transitions previously
+        // skipped `rt` to SRV incrementally without another full-heap walk.
+        let walks_before_compute = state.bindless_full_walks;
+        assert!(state.bind(&list, &compute_srv, true));
+        assert_eq!(state.bindless_full_walks, walks_before_compute);
+        assert!(!state.depth_sampled);
+        assert!(
+            list.transition(rt.0, SHADER_RESOURCE).is_none(),
+            "compute dispatch must transition graphics RT to SHADER_RESOURCE"
+        );
+
+        // 6. State::reset clears bindless_cache.
+        state.reset(null);
+        assert!(state.bindless_cache.is_none());
+
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    fn bindless_textures_uses_hashset_when_over_64_uavs_are_live() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let (gfx_srv_uav, _, _) = make_test_pipelines(&host.device);
+        const UAVS: u32 = 70;
+        let heap = make_view_heap(UAVS + 8);
+        let start = crate::descriptor::heap(heap.0).start;
+        let slot_at = |i: u32| start + u64::from(i) * 32;
+        let null = std::ptr::null();
+
+        let mut uav_textures = Vec::with_capacity(UAVS as usize);
+        for i in 0..UAVS {
+            let tex = make_texture(
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            );
+            crate::descriptor::create_uav(null, tex.0, null, null.cast(), slot_at(i));
+            uav_textures.push(tex);
+        }
+        // Overlap uav_textures[0] as an SRV too, plus a separate SRV-only texture.
+        crate::descriptor::create_srv(null, uav_textures[0].0, null.cast(), slot_at(UAVS));
+        let srv_only = make_texture(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        );
+        crate::descriptor::create_srv(null, srv_only.0, null.cast(), slot_at(UAVS + 1));
+
+        let list = host.new_list().expect("host list");
+        let mut state = State::default();
+        state.set_heaps(&[heap.0]);
+        assert!(state.bind(&list, &gfx_srv_uav, false));
+
+        const UNORDERED_ACCESS: u32 = 0x8;
+        for tex in &uav_textures {
+            assert!(list.transition(tex.0, UNORDERED_ACCESS).is_none());
+        }
+        assert!(list.transition(srv_only.0, SHADER_RESOURCE).is_none());
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    fn bindless_dual_view_texture_preserves_srv_state_when_already_readable() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let (gfx_srv_uav, _, _) = make_test_pipelines(&host.device);
+        let heap = make_view_heap(16);
+        let start = crate::descriptor::heap(heap.0).start;
+        let slot_at = |i: u32| start + u64::from(i) * 32;
+        let null = std::ptr::null();
+
+        let tex_a = make_texture(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        );
+        let tex_b = make_texture(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        );
+        // Both textures have SRV + UAV views resident in the bindless heap.
+        crate::descriptor::create_srv(null, tex_a.0, null.cast(), slot_at(0));
+        crate::descriptor::create_uav(null, tex_a.0, null, null.cast(), slot_at(1));
+        crate::descriptor::create_srv(null, tex_b.0, null.cast(), slot_at(2));
+        crate::descriptor::create_uav(null, tex_b.0, null, null.cast(), slot_at(3));
+
+        const UNORDERED_ACCESS: u32 = 0x8;
+        let list = host.new_list().expect("host list");
+        // Title transitions A for SRV sampling and B for UAV writing.
+        crate::list::ensure_state(&list, tex_a.0, SHADER_RESOURCE);
+        crate::list::ensure_state(&list, tex_b.0, UNORDERED_ACCESS);
+
+        let mut state = State::default();
+        state.set_heaps(&[heap.0]);
+        assert!(state.bind(&list, &gfx_srv_uav, false));
+
+        // A must remain in SHADER_RESOURCE (not clobbered to UNORDERED_ACCESS),
+        // while B remains in UNORDERED_ACCESS.
+        assert_eq!(list.tracked_state(tex_a.0), Some(SHADER_RESOURCE));
+        assert_eq!(list.tracked_state(tex_b.0), Some(UNORDERED_ACCESS));
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(host.log_messages(), None);
     }
 }
 

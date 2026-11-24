@@ -5,7 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -40,6 +40,72 @@ enum SlotRefresh {
     },
 }
 
+/// Tracks which live host textures each view-heap slot currently references,
+/// keeping `O(active)` live sets of SRV and UAV resources for bindless heaps.
+/// Every slot entry is keyed by `(resource, is_uav)` in `res_slots` so
+/// `forget_resource` clears only the exact slots that held the released
+/// resource (ABA-safe if the resource pointer is later reused).
+#[derive(Default)]
+struct TexTracker {
+    generation: u64,
+    slot_res: Vec<Option<(usize, bool)>>,
+    live_srvs: HashMap<usize, u32>,
+    live_uavs: HashMap<usize, u32>,
+    res_slots: HashMap<(usize, bool), HashSet<u32>>,
+}
+
+impl TexTracker {
+    fn new(sampler: bool, count: u32) -> Self {
+        Self {
+            generation: 0,
+            slot_res: if sampler {
+                Vec::new()
+            } else {
+                vec![None; count as usize]
+            },
+            live_srvs: HashMap::new(),
+            live_uavs: HashMap::new(),
+            res_slots: HashMap::new(),
+        }
+    }
+
+    fn add_entry(&mut self, slot: u32, res: usize, is_uav: bool) {
+        let counts = if is_uav {
+            &mut self.live_uavs
+        } else {
+            &mut self.live_srvs
+        };
+        *counts.entry(res).or_insert(0) += 1;
+        self.res_slots
+            .entry((res, is_uav))
+            .or_default()
+            .insert(slot);
+    }
+
+    fn remove_entry(&mut self, slot: u32, res: usize, is_uav: bool) {
+        let counts = if is_uav {
+            &mut self.live_uavs
+        } else {
+            &mut self.live_srvs
+        };
+        if let std::collections::hash_map::Entry::Occupied(mut e) = counts.entry(res) {
+            if *e.get() <= 1 {
+                e.remove();
+            } else {
+                *e.get_mut() -= 1;
+            }
+        }
+        if let std::collections::hash_map::Entry::Occupied(mut e) =
+            self.res_slots.entry((res, is_uav))
+        {
+            e.get_mut().remove(&slot);
+            if e.get().is_empty() {
+                e.remove();
+            }
+        }
+    }
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -63,6 +129,8 @@ pub(crate) struct HostHeap {
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
+    /// Leaf-only tracker of live SRV/UAV textures across title slots.
+    tex_tracker: Mutex<TexTracker>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -253,6 +321,7 @@ impl HostHeap {
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             refreshes: Mutex::new(HashMap::new()),
             next: Mutex::new((0, vec![false; extra as usize])),
+            tex_tracker: Mutex::new(TexTracker::new(sampler, count)),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -681,6 +750,7 @@ impl HostHeap {
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
                 self.make_null(index);
+                self.track_slot(index, None);
             }
             return None;
         };
@@ -692,12 +762,204 @@ impl HostHeap {
             } else {
                 make(&view, self.cpu(index))
             };
-            if kept.is_none() && !self.sampler {
+            let made_ok = kept.is_some();
+            let bound = matches!(kept, Some(Kept::Resource(_) | Kept::Unaligned(_)));
+            if !made_ok && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.unwrap_or(Kept::Empty));
+            let new_entry = if bound {
+                match &view {
+                    View::Shader(r, _)
+                        if crate::resource::host_resource(*r as crate::object::This).is_some() =>
+                    {
+                        Some((*r, false))
+                    }
+                    View::Unordered(r, _, _)
+                        if crate::resource::host_resource(*r as crate::object::This).is_some() =>
+                    {
+                        Some((*r, true))
+                    }
+                    View::Placed(false, ..) => {
+                        if let Some(View::Shader(r, _)) = placed_texture(&view)
+                            && crate::resource::host_resource(r as crate::object::This).is_some()
+                        {
+                            Some((r, false))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            self.track_slot(index, new_entry);
+            // Close the race with `descriptor::forget` running between the initial
+            // `view_at` lookup and `track_slot` before this heap's publication.
+            if new_entry.is_some() && view_at(i, generation).is_none() {
+                made[index as usize] = 0;
+                self.make_null(index);
+                self.track_slot(index, None);
+                return None;
+            }
         }
         Some(view)
+    }
+
+    /// Updates the leaf-only live texture tracker for slot `index`.
+    fn track_slot(&self, index: u32, new_entry: Option<(usize, bool)>) {
+        if self.sampler {
+            return;
+        }
+        let mut tracker = self.tex_tracker.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(slot) = tracker.slot_res.get_mut(index as usize) else {
+            return;
+        };
+        let old_entry = *slot;
+        if old_entry == new_entry {
+            return;
+        }
+        *slot = new_entry;
+        if let Some((res, is_uav)) = old_entry {
+            tracker.remove_entry(index, res, is_uav);
+        }
+        if let Some((res, is_uav)) = new_entry {
+            tracker.add_entry(index, res, is_uav);
+        }
+        tracker.generation += 1;
+    }
+
+    /// Removes all tracked references to `resource` when the title releases it,
+    /// clearing only the exact slots that currently held `resource`.
+    pub(crate) fn forget_resource(&self, resource: usize) {
+        if self.sampler {
+            return;
+        }
+        let mut tracker = self.tex_tracker.lock().unwrap_or_else(|e| e.into_inner());
+        let mut changed = false;
+        for is_uav in [false, true] {
+            if let Some(slots) = tracker.res_slots.remove(&(resource, is_uav)) {
+                for slot in slots {
+                    if let Some(entry) = tracker.slot_res.get_mut(slot as usize)
+                        && *entry == Some((resource, is_uav))
+                    {
+                        *entry = None;
+                    }
+                }
+                let counts = if is_uav {
+                    &mut tracker.live_uavs
+                } else {
+                    &mut tracker.live_srvs
+                };
+                counts.remove(&resource);
+                changed = true;
+            }
+        }
+        if changed {
+            tracker.generation += 1;
+        }
+    }
+
+    /// Current generation of tracked live textures in this heap.
+    pub(crate) fn tex_gen(&self) -> u64 {
+        self.tex_tracker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation
+    }
+
+    /// Snapshot of `(tex_gen, live_srvs, live_uavs)` in `O(active)` time,
+    /// pinning each live title `Resource` with [`crate::object::Held`] while
+    /// `tex_tracker` is locked so concurrent releases cannot free it mid-pass.
+    pub(crate) fn live_textures(
+        &self,
+        srvs: bool,
+        uavs: bool,
+    ) -> (u64, Vec<crate::object::Held>, Vec<crate::object::Held>) {
+        let tracker = self.tex_tracker.lock().unwrap_or_else(|e| e.into_inner());
+        let pin = |r: &usize| {
+            // SAFETY: while `tex_tracker` is held, any tracked `Resource` has
+            // not finished `Resource::drop` (which calls `forget_resource`
+            // before deallocating), so its `refs` atomic is still allocated.
+            unsafe { crate::object::Held::try_new(*r as crate::object::This) }
+        };
+        let srv_list = if srvs {
+            tracker.live_srvs.keys().filter_map(pin).collect()
+        } else {
+            Vec::new()
+        };
+        let uav_list = if uavs {
+            tracker.live_uavs.keys().filter_map(pin).collect()
+        } else {
+            Vec::new()
+        };
+        (tracker.generation, srv_list, uav_list)
+    }
+
+    /// Pins the subset of `candidates` currently live as SRVs and/or UAVs in
+    /// this heap, returning `(tex_gen, live_srvs, live_uavs)`. Used by the
+    /// incremental dirty-resource fast path so RT switches and copies cost
+    /// `O(|candidates|)` instead of walking every resident bindless texture.
+    pub(crate) fn pin_live_subset(
+        &self,
+        candidates: &[usize],
+        srvs: bool,
+        uavs: bool,
+    ) -> (u64, Vec<crate::object::Held>, Vec<crate::object::Held>) {
+        let tracker = self.tex_tracker.lock().unwrap_or_else(|e| e.into_inner());
+        let mut srv_list = Vec::new();
+        let mut uav_list = Vec::new();
+        let mut seen = HashSet::with_capacity(candidates.len());
+        for &r in candidates {
+            if !seen.insert(r) {
+                continue;
+            }
+            let is_srv = srvs && tracker.live_srvs.contains_key(&r);
+            let is_uav = uavs && tracker.live_uavs.contains_key(&r);
+            if !is_srv && !is_uav {
+                continue;
+            }
+            // SAFETY: while `tex_tracker` is held, any tracked `Resource` has
+            // not finished `Resource::drop` (which calls `forget_resource`
+            // before deallocating), so its `refs` atomic is still allocated.
+            let Some(held) = (unsafe { crate::object::Held::try_new(r as crate::object::This) })
+            else {
+                continue;
+            };
+            if is_srv && is_uav {
+                if let Some(second) =
+                    // SAFETY: `held` already pins the resource alive here.
+                    unsafe { crate::object::Held::try_new(r as crate::object::This) }
+                {
+                    uav_list.push(second);
+                }
+                srv_list.push(held);
+            } else if is_srv {
+                srv_list.push(held);
+            } else {
+                uav_list.push(held);
+            }
+        }
+        (tracker.generation, srv_list, uav_list)
+    }
+
+    /// Raw tracked addresses for synthetic unit tests that exercise
+    /// `TexTracker` ABA safety without real COM objects.
+    #[cfg(test)]
+    fn live_texture_addrs(&self, srvs: bool, uavs: bool) -> (u64, Vec<usize>, Vec<usize>) {
+        let tracker = self.tex_tracker.lock().unwrap_or_else(|e| e.into_inner());
+        let srv_list = if srvs {
+            tracker.live_srvs.keys().copied().collect()
+        } else {
+            Vec::new()
+        };
+        let uav_list = if uavs {
+            tracker.live_uavs.keys().copied().collect()
+        } else {
+            Vec::new()
+        };
+        (tracker.generation, srv_list, uav_list)
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -1098,6 +1360,246 @@ fn casts_typed() -> bool {
     })
 }
 
+/// Whether `format` is a typeless DXGI format (the first of a multi-format
+/// family).
+fn is_typeless(format: u32) -> bool {
+    use crate::resource::family;
+    family(format) == format && family(format + 1) == format
+}
+
+/// Whether the active host device supports typed UAV access (`UAV_TYPED_LOAD`
+/// or `UAV_TYPED_STORE`, plus `TYPED_UNORDERED_ACCESS_VIEW`) for optional
+/// typed-UAV formats such as `B8G8R8A8_UNORM` / `B8G8R8X8_UNORM`.
+fn supports_typed_uav(format: DXGI_FORMAT) -> bool {
+    static CACHE: std::sync::LazyLock<Mutex<HashMap<i32, bool>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    if let Some(&supported) = CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&format.0)
+    {
+        return supported;
+    }
+    let supported = host().is_some_and(|h| {
+        let mut data = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: format,
+            ..Default::default()
+        };
+        // SAFETY: query writes its own `D3D12_FEATURE_DATA_FORMAT_SUPPORT` struct.
+        let ok = unsafe {
+            h.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut data).cast(),
+                    size_of_val(&data) as u32,
+                )
+                .is_ok()
+        };
+        ok && (data.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0)
+            && (data.Support2.0
+                & (D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD.0
+                    | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0)
+                != 0)
+    });
+    CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(format.0, supported);
+    supported
+}
+
+/// Default concrete format for a typeless texture when a shader or unordered
+/// access view leaves the description absent or `DXGI_FORMAT_UNKNOWN`. Depth
+/// multi-plane, block-compressed, and 96-bit `R32G32B32` formats only allow
+/// shader views (`None` for UAVs); optional BGRA typed UAVs require device
+/// format support.
+fn default_concrete_format(typeless: u32, unordered: bool) -> Option<u32> {
+    let concrete = match DXGI_FORMAT(typeless as i32) {
+        // Depth-stencil multi-plane (SRV only, plane 0)
+        DXGI_FORMAT_R24G8_TYPELESS => (!unordered).then_some(DXGI_FORMAT_R24_UNORM_X8_TYPELESS)?,
+        DXGI_FORMAT_R32G8X24_TYPELESS => {
+            (!unordered).then_some(DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS)?
+        }
+        // Block-compressed (SRV only)
+        DXGI_FORMAT_BC1_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC1_UNORM)?,
+        DXGI_FORMAT_BC2_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC2_UNORM)?,
+        DXGI_FORMAT_BC3_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC3_UNORM)?,
+        DXGI_FORMAT_BC4_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC4_UNORM)?,
+        DXGI_FORMAT_BC5_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC5_UNORM)?,
+        DXGI_FORMAT_BC6H_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC6H_UF16)?,
+        DXGI_FORMAT_BC7_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC7_UNORM)?,
+        // 96-bit RGB has no typed UAV in D3D12 (SRV only)
+        DXGI_FORMAT_R32G32B32_TYPELESS => (!unordered).then_some(DXGI_FORMAT_R32G32B32_FLOAT)?,
+        // Color (SRV and UAV)
+        DXGI_FORMAT_R32G32B32A32_TYPELESS => DXGI_FORMAT_R32G32B32A32_FLOAT,
+        DXGI_FORMAT_R16G16B16A16_TYPELESS => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        DXGI_FORMAT_R32G32_TYPELESS => DXGI_FORMAT_R32G32_FLOAT,
+        DXGI_FORMAT_R10G10B10A2_TYPELESS => DXGI_FORMAT_R10G10B10A2_UNORM,
+        DXGI_FORMAT_R8G8B8A8_TYPELESS => DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_R16G16_TYPELESS => DXGI_FORMAT_R16G16_FLOAT,
+        DXGI_FORMAT_R32_TYPELESS => DXGI_FORMAT_R32_FLOAT,
+        DXGI_FORMAT_R8G8_TYPELESS => DXGI_FORMAT_R8G8_UNORM,
+        DXGI_FORMAT_R16_TYPELESS => DXGI_FORMAT_R16_FLOAT,
+        DXGI_FORMAT_R8_TYPELESS => DXGI_FORMAT_R8_UNORM,
+        // BGRA typed UAVs are optional driver support.
+        DXGI_FORMAT_B8G8R8A8_TYPELESS => {
+            if unordered && !supports_typed_uav(DXGI_FORMAT_B8G8R8A8_UNORM) {
+                return None;
+            }
+            DXGI_FORMAT_B8G8R8A8_UNORM
+        }
+        DXGI_FORMAT_B8G8R8X8_TYPELESS => {
+            if unordered && !supports_typed_uav(DXGI_FORMAT_B8G8R8X8_UNORM) {
+                return None;
+            }
+            DXGI_FORMAT_B8G8R8X8_UNORM
+        }
+        _ => return None,
+    };
+    Some(concrete.0 as u32)
+}
+
+/// Resolves the concrete view format for a typeless host texture: preserves the
+/// title's format for sRGB+UAV SRVs (via `view_format`, excluding depth formats
+/// other than mapping `D16_UNORM` to `R16_UNORM`), otherwise uses
+/// [`default_concrete_format`].
+fn concrete_format_for(
+    resource: crate::object::This,
+    own: u32,
+    unordered: bool,
+) -> Option<DXGI_FORMAT> {
+    if !unordered && let Some(fmt) = crate::resource::view_format(resource) {
+        if fmt == DXGI_FORMAT_D16_UNORM.0 as u32 {
+            return Some(DXGI_FORMAT_R16_UNORM);
+        }
+        if !crate::resource::DEPTH_FORMATS
+            .iter()
+            .any(|&(d, _)| d == fmt)
+        {
+            return Some(DXGI_FORMAT(fmt as i32));
+        }
+    }
+    default_concrete_format(own, unordered).map(|f| DXGI_FORMAT(f as i32))
+}
+
+/// Synthesizes a full SRV description matching `rd` with concrete `format` when
+/// the host texture is typeless and the title passed a null description.
+fn default_srv_desc(
+    rd: &D3D12_RESOURCE_DESC,
+    format: DXGI_FORMAT,
+) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: format,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    match rd.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            if rd.DepthOrArraySize > 1 {
+                desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+                desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_SRV {
+                    MipLevels: u32::MAX,
+                    ArraySize: u32::from(rd.DepthOrArraySize),
+                    ..Default::default()
+                };
+            } else {
+                desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+                desc.Anonymous.Texture1D = D3D12_TEX1D_SRV {
+                    MipLevels: u32::MAX,
+                    ..Default::default()
+                };
+            }
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+            if rd.SampleDesc.Count > 1 {
+                if rd.DepthOrArraySize > 1 {
+                    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+                    desc.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_SRV {
+                        ArraySize: u32::from(rd.DepthOrArraySize),
+                        ..Default::default()
+                    };
+                } else {
+                    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+                    desc.Anonymous.Texture2DMS = D3D12_TEX2DMS_SRV::default();
+                }
+            } else if rd.DepthOrArraySize > 1 {
+                desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+                    MipLevels: u32::MAX,
+                    ArraySize: u32::from(rd.DepthOrArraySize),
+                    ..Default::default()
+                };
+            } else {
+                desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                    MipLevels: u32::MAX,
+                    ..Default::default()
+                };
+            }
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            desc.Anonymous.Texture3D = D3D12_TEX3D_SRV {
+                MipLevels: u32::MAX,
+                ..Default::default()
+            };
+        }
+        _ => return None,
+    }
+    Some(desc)
+}
+
+/// Synthesizes a full UAV description matching `rd` with concrete `format` when
+/// the host texture is typeless and the title passed a null description.
+/// Returns `None` for multisampled textures (invalid for UAVs in D3D12).
+fn default_uav_desc(
+    rd: &D3D12_RESOURCE_DESC,
+    format: DXGI_FORMAT,
+) -> Option<D3D12_UNORDERED_ACCESS_VIEW_DESC> {
+    let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: format,
+        ..Default::default()
+    };
+    match rd.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            if rd.DepthOrArraySize > 1 {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+                desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV {
+                    ArraySize: u32::from(rd.DepthOrArraySize),
+                    ..Default::default()
+                };
+            } else {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
+                desc.Anonymous.Texture1D = D3D12_TEX1D_UAV::default();
+            }
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+            if rd.SampleDesc.Count > 1 {
+                return None;
+            }
+            if rd.DepthOrArraySize > 1 {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+                desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                    ArraySize: u32::from(rd.DepthOrArraySize),
+                    ..Default::default()
+                };
+            } else {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                desc.Anonymous.Texture2D = D3D12_TEX2D_UAV::default();
+            }
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+            desc.Anonymous.Texture3D = D3D12_TEX3D_UAV {
+                WSize: u32::MAX,
+                ..Default::default()
+            };
+        }
+        _ => return None,
+    }
+    Some(desc)
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -1128,7 +1630,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         return false;
     }
     // Every family has more than one format, its typeless one first.
-    let typeless = family(own) == own && family(own + 1) == own;
+    let typeless = is_typeless(own);
     if let Some(format) = format.as_deref_mut()
         && unordered
         && let Some(&(_, linear)) = crate::resource::SRGB
@@ -1194,7 +1696,22 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
             if let Some(texture) = crate::resource::host_resource(resource) {
+                // SAFETY: a live resource.
+                let rd = unsafe { texture.GetDesc() };
+                let own = rd.Format.0 as u32;
                 let mut desc = desc.as_ref().map(srv_desc);
+                if is_typeless(own) {
+                    match desc.as_mut() {
+                        Some(dsc) if dsc.Format == DXGI_FORMAT_UNKNOWN => {
+                            dsc.Format = concrete_format_for(resource, own, false)?;
+                        }
+                        Some(_) => {}
+                        None => {
+                            let fmt = concrete_format_for(resource, own, false)?;
+                            desc = Some(default_srv_desc(&rd, fmt)?);
+                        }
+                    }
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
@@ -1225,7 +1742,22 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     _ => None,
                 };
             };
+            // SAFETY: a live resource.
+            let rd = unsafe { texture.GetDesc() };
+            let own = rd.Format.0 as u32;
             let mut desc = desc.as_ref().map(uav_desc);
+            if is_typeless(own) {
+                match desc.as_mut() {
+                    Some(dsc) if dsc.Format == DXGI_FORMAT_UNKNOWN => {
+                        dsc.Format = concrete_format_for(resource, own, true)?;
+                    }
+                    Some(_) => {}
+                    None => {
+                        let fmt = concrete_format_for(resource, own, true)?;
+                        desc = Some(default_uav_desc(&rd, fmt)?);
+                    }
+                }
+            }
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
@@ -1680,6 +2212,700 @@ mod tests {
             assert_eq!(got, &updated);
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    struct OwnedObject(crate::object::This);
+
+    impl Drop for OwnedObject {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(
+                    self.0, 0x10,
+                );
+                release(self.0);
+            }
+        }
+    }
+
+    fn make_texture(
+        dimension: D3D12_RESOURCE_DIMENSION,
+        width: u64,
+        height: u32,
+        depth_or_array: u16,
+        format: DXGI_FORMAT,
+        sample_count: u32,
+        flags: D3D12_RESOURCE_FLAGS,
+    ) -> OwnedObject {
+        use windows::core::Interface;
+        let null = std::ptr::null();
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: dimension,
+            Width: width,
+            Height: height,
+            DepthOrArraySize: depth_or_array,
+            MipLevels: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: sample_count,
+                Quality: 0,
+            },
+            Flags: flags,
+            ..Default::default()
+        };
+        let iid = ID3D12Resource::IID;
+        let mut out = null;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                (&raw const heap).cast(),
+                0,
+                (&raw const desc).cast(),
+                0,
+                null.cast(),
+                (&raw const iid).cast(),
+                &mut out,
+            ),
+            crate::object::S_OK
+        );
+        OwnedObject(out)
+    }
+
+    fn make_view_heap(count: u32) -> OwnedObject {
+        use windows::core::Interface;
+        #[repr(C)]
+        struct ViewHeap {
+            desc: D3D12_DESCRIPTOR_HEAP_DESC,
+            placement: [u64; 2],
+        }
+        let desc = ViewHeap {
+            desc: D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: count,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            },
+            placement: [0; 2],
+        };
+        let iid = ID3D12DescriptorHeap::IID;
+        let mut out = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                (&raw const desc).cast(),
+                (&raw const iid).cast(),
+                &mut out,
+            ),
+            crate::object::S_OK
+        );
+        OwnedObject(out)
+    }
+
+    #[test]
+    fn default_concrete_formats_cover_typeless_families() {
+        let srv = |f: DXGI_FORMAT| default_concrete_format(f.0 as u32, false);
+        let uav = |f: DXGI_FORMAT| default_concrete_format(f.0 as u32, true);
+        // Multi-plane depth-stencil: SRV only.
+        assert_eq!(
+            srv(DXGI_FORMAT_R24G8_TYPELESS),
+            Some(DXGI_FORMAT_R24_UNORM_X8_TYPELESS.0 as u32)
+        );
+        assert_eq!(uav(DXGI_FORMAT_R24G8_TYPELESS), None);
+        assert_eq!(
+            srv(DXGI_FORMAT_R32G8X24_TYPELESS),
+            Some(DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS.0 as u32)
+        );
+        assert_eq!(uav(DXGI_FORMAT_R32G8X24_TYPELESS), None);
+        // Block-compressed: SRV only.
+        for (typeless, concrete) in [
+            (DXGI_FORMAT_BC1_TYPELESS, DXGI_FORMAT_BC1_UNORM),
+            (DXGI_FORMAT_BC2_TYPELESS, DXGI_FORMAT_BC2_UNORM),
+            (DXGI_FORMAT_BC3_TYPELESS, DXGI_FORMAT_BC3_UNORM),
+            (DXGI_FORMAT_BC4_TYPELESS, DXGI_FORMAT_BC4_UNORM),
+            (DXGI_FORMAT_BC5_TYPELESS, DXGI_FORMAT_BC5_UNORM),
+            (DXGI_FORMAT_BC6H_TYPELESS, DXGI_FORMAT_BC6H_UF16),
+            (DXGI_FORMAT_BC7_TYPELESS, DXGI_FORMAT_BC7_UNORM),
+        ] {
+            assert_eq!(srv(typeless), Some(concrete.0 as u32));
+            assert_eq!(uav(typeless), None);
+        }
+        // 96-bit RGB: SRV only (D3D12 has no typed UAV for R32G32B32_FLOAT).
+        assert_eq!(
+            srv(DXGI_FORMAT_R32G32B32_TYPELESS),
+            Some(DXGI_FORMAT_R32G32B32_FLOAT.0 as u32)
+        );
+        assert_eq!(uav(DXGI_FORMAT_R32G32B32_TYPELESS), None);
+        // Color typeless: both SRV and UAV.
+        for (typeless, concrete) in [
+            (
+                DXGI_FORMAT_R32G32B32A32_TYPELESS,
+                DXGI_FORMAT_R32G32B32A32_FLOAT,
+            ),
+            (
+                DXGI_FORMAT_R16G16B16A16_TYPELESS,
+                DXGI_FORMAT_R16G16B16A16_FLOAT,
+            ),
+            (DXGI_FORMAT_R32G32_TYPELESS, DXGI_FORMAT_R32G32_FLOAT),
+            (
+                DXGI_FORMAT_R10G10B10A2_TYPELESS,
+                DXGI_FORMAT_R10G10B10A2_UNORM,
+            ),
+            (DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM),
+            (DXGI_FORMAT_R16G16_TYPELESS, DXGI_FORMAT_R16G16_FLOAT),
+            (DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R8G8_TYPELESS, DXGI_FORMAT_R8G8_UNORM),
+            (DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_FLOAT),
+            (DXGI_FORMAT_R8_TYPELESS, DXGI_FORMAT_R8_UNORM),
+        ] {
+            assert_eq!(srv(typeless), Some(concrete.0 as u32));
+            assert_eq!(uav(typeless), Some(concrete.0 as u32));
+        }
+        // BGRA typeless: always valid as SRV, optional driver support as UAV.
+        for (typeless, concrete) in [
+            (DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT_B8G8R8A8_UNORM),
+            (DXGI_FORMAT_B8G8R8X8_TYPELESS, DXGI_FORMAT_B8G8R8X8_UNORM),
+        ] {
+            assert_eq!(srv(typeless), Some(concrete.0 as u32));
+            assert_eq!(
+                uav(typeless),
+                supports_typed_uav(concrete).then_some(concrete.0 as u32)
+            );
+        }
+        assert_eq!(srv(DXGI_FORMAT_R8G8B8A8_UNORM), None);
+    }
+
+    #[test]
+    fn default_view_descs_match_resource_dimensions() {
+        let base = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 8,
+            Height: 8,
+            DepthOrArraySize: 1,
+            MipLevels: 3,
+            Format: DXGI_FORMAT_R8G8B8A8_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+        let d1 = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE1D,
+            Height: 1,
+            ..base
+        };
+        assert_eq!(
+            default_srv_desc(&d1, fmt).unwrap().ViewDimension,
+            D3D12_SRV_DIMENSION_TEXTURE1D
+        );
+        assert_eq!(
+            default_uav_desc(&d1, fmt).unwrap().ViewDimension,
+            D3D12_UAV_DIMENSION_TEXTURE1D
+        );
+
+        let d1a = D3D12_RESOURCE_DESC {
+            DepthOrArraySize: 3,
+            ..d1
+        };
+        let srv = default_srv_desc(&d1a, fmt).unwrap();
+        assert_eq!(srv.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE1DARRAY);
+        // SAFETY: Texture1DArray matches ViewDimension.
+        assert_eq!(unsafe { srv.Anonymous.Texture1DArray.ArraySize }, 3);
+        let uav = default_uav_desc(&d1a, fmt).unwrap();
+        assert_eq!(uav.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE1DARRAY);
+        // SAFETY: Texture1DArray matches ViewDimension.
+        assert_eq!(unsafe { uav.Anonymous.Texture1DArray.ArraySize }, 3);
+
+        assert_eq!(
+            default_srv_desc(&base, fmt).unwrap().ViewDimension,
+            D3D12_SRV_DIMENSION_TEXTURE2D
+        );
+        assert_eq!(
+            default_uav_desc(&base, fmt).unwrap().ViewDimension,
+            D3D12_UAV_DIMENSION_TEXTURE2D
+        );
+
+        let d2a = D3D12_RESOURCE_DESC {
+            DepthOrArraySize: 4,
+            ..base
+        };
+        let srv = default_srv_desc(&d2a, fmt).unwrap();
+        assert_eq!(srv.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2DARRAY);
+        // SAFETY: Texture2DArray matches ViewDimension.
+        assert_eq!(unsafe { srv.Anonymous.Texture2DArray.ArraySize }, 4);
+        let uav = default_uav_desc(&d2a, fmt).unwrap();
+        assert_eq!(uav.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE2DARRAY);
+        // SAFETY: Texture2DArray matches ViewDimension.
+        assert_eq!(unsafe { uav.Anonymous.Texture2DArray.ArraySize }, 4);
+
+        let d2ms = D3D12_RESOURCE_DESC {
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 4,
+                Quality: 0,
+            },
+            ..base
+        };
+        assert_eq!(
+            default_srv_desc(&d2ms, fmt).unwrap().ViewDimension,
+            D3D12_SRV_DIMENSION_TEXTURE2DMS
+        );
+        assert!(default_uav_desc(&d2ms, fmt).is_none());
+
+        let d2msa = D3D12_RESOURCE_DESC {
+            DepthOrArraySize: 2,
+            ..d2ms
+        };
+        let srv = default_srv_desc(&d2msa, fmt).unwrap();
+        assert_eq!(srv.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY);
+        // SAFETY: Texture2DMSArray matches ViewDimension.
+        assert_eq!(unsafe { srv.Anonymous.Texture2DMSArray.ArraySize }, 2);
+        assert!(default_uav_desc(&d2msa, fmt).is_none());
+
+        let d3 = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+            DepthOrArraySize: 5,
+            ..base
+        };
+        let srv = default_srv_desc(&d3, fmt).unwrap();
+        assert_eq!(srv.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE3D);
+        // SAFETY: Texture3D matches ViewDimension.
+        assert_eq!(unsafe { srv.Anonymous.Texture3D.MipLevels }, u32::MAX);
+        let uav = default_uav_desc(&d3, fmt).unwrap();
+        assert_eq!(uav.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE3D);
+        // SAFETY: Texture3D matches ViewDimension.
+        assert_eq!(unsafe { uav.Anonymous.Texture3D.WSize }, u32::MAX);
+    }
+
+    #[test]
+    fn typeless_default_srvs_and_uavs_create_cleanly_on_device() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let _ = host.log_messages();
+        let Some(heap) = HostHeap::new(false, 32) else {
+            return;
+        };
+        let mut slot = 0u32;
+        let mut next_slot = || {
+            let s = slot;
+            slot += 1;
+            heap.cpu(s)
+        };
+
+        let rgba_typeless = make_texture(
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            4,
+            4,
+            1,
+            DXGI_FORMAT_R8G8B8A8_TYPELESS,
+            1,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        );
+        let r32_typeless = make_texture(
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            4,
+            4,
+            1,
+            DXGI_FORMAT_R32_TYPELESS,
+            1,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        );
+        let bgra_typeless = make_texture(
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            4,
+            4,
+            1,
+            DXGI_FORMAT_B8G8R8A8_TYPELESS,
+            1,
+            D3D12_RESOURCE_FLAG_NONE,
+        );
+        let r24g8_typeless = make_texture(
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            4,
+            4,
+            1,
+            DXGI_FORMAT_R24G8_TYPELESS,
+            1,
+            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+        );
+        let bc7_typeless = make_texture(
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            4,
+            4,
+            1,
+            DXGI_FORMAT_BC7_TYPELESS,
+            1,
+            D3D12_RESOURCE_FLAG_NONE,
+        );
+        let msaa_typeless = make_texture(
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            4,
+            4,
+            1,
+            DXGI_FORMAT_R8G8B8A8_TYPELESS,
+            4,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        );
+        let srgb_uav = make_texture(
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            4,
+            4,
+            1,
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            1,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        );
+        let d24s8 = make_texture(
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            4,
+            4,
+            1,
+            DXGI_FORMAT_D24_UNORM_S8_UINT,
+            1,
+            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+        );
+        let d16 = make_texture(
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            4,
+            4,
+            1,
+            DXGI_FORMAT_D16_UNORM,
+            1,
+            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+        );
+        let tex3d = make_texture(
+            D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+            4,
+            4,
+            2,
+            DXGI_FORMAT_R8G8B8A8_TYPELESS,
+            1,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        );
+        let tex1d_arr = make_texture(
+            D3D12_RESOURCE_DIMENSION_TEXTURE1D,
+            4,
+            1,
+            2,
+            DXGI_FORMAT_R8G8B8A8_TYPELESS,
+            1,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        );
+
+        let srv_unknown_2d = [
+            DXGI_FORMAT_UNKNOWN.0 as u32,
+            D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32,
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let uav_unknown_2d = [
+            DXGI_FORMAT_UNKNOWN.0 as u32,
+            D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+
+        // SRVs (both desc = None and Format = UNKNOWN) succeed.
+        for obj in [
+            &rgba_typeless,
+            &r32_typeless,
+            &bgra_typeless,
+            &r24g8_typeless,
+            &bc7_typeless,
+            &srgb_uav,
+            &d24s8,
+            &d16,
+        ] {
+            let v_none = View::Shader(obj.0 as usize, None);
+            assert!(
+                matches!(make(&v_none, next_slot()), Some(Kept::Resource(_))),
+                "default SRV failed"
+            );
+            let v_unknown = View::Shader(obj.0 as usize, Some(srv_unknown_2d));
+            assert!(
+                matches!(make(&v_unknown, next_slot()), Some(Kept::Resource(_))),
+                "UNKNOWN SRV failed"
+            );
+        }
+        assert!(matches!(
+            make(&View::Shader(msaa_typeless.0 as usize, None), next_slot()),
+            Some(Kept::Resource(_))
+        ));
+        assert!(matches!(
+            make(&View::Shader(tex3d.0 as usize, None), next_slot()),
+            Some(Kept::Resource(_))
+        ));
+        assert!(matches!(
+            make(&View::Shader(tex1d_arr.0 as usize, None), next_slot()),
+            Some(Kept::Resource(_))
+        ));
+
+        // sRGB+UAV keeps sRGB in default SRVs.
+        assert_eq!(
+            concrete_format_for(srgb_uav.0, DXGI_FORMAT_R8G8B8A8_TYPELESS.0 as u32, false),
+            Some(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+        );
+        assert_eq!(
+            concrete_format_for(srgb_uav.0, DXGI_FORMAT_R8G8B8A8_TYPELESS.0 as u32, true),
+            Some(DXGI_FORMAT_R8G8B8A8_UNORM)
+        );
+
+        // Valid color UAVs succeed (desc = None and Format = UNKNOWN).
+        for obj in [&rgba_typeless, &r32_typeless, &srgb_uav] {
+            let v_none = View::Unordered(obj.0 as usize, 0, None);
+            assert!(
+                matches!(make(&v_none, next_slot()), Some(Kept::Resource(_))),
+                "default UAV failed"
+            );
+            let v_unknown = View::Unordered(obj.0 as usize, 0, Some(uav_unknown_2d));
+            assert!(
+                matches!(make(&v_unknown, next_slot()), Some(Kept::Resource(_))),
+                "UNKNOWN UAV failed"
+            );
+        }
+        assert!(matches!(
+            make(&View::Unordered(tex3d.0 as usize, 0, None), next_slot()),
+            Some(Kept::Resource(_))
+        ));
+        assert!(matches!(
+            make(&View::Unordered(tex1d_arr.0 as usize, 0, None), next_slot()),
+            Some(Kept::Resource(_))
+        ));
+
+        // Depth, BC, and MSAA UAVs return None and leave null descriptors cleanly.
+        for obj in [&r24g8_typeless, &bc7_typeless, &msaa_typeless] {
+            for desc in [None, Some(uav_unknown_2d)] {
+                let view = View::Unordered(obj.0 as usize, 0, desc);
+                let cpu = next_slot();
+                assert!(make(&view, cpu).is_none());
+                null_for(&view, cpu);
+            }
+        }
+
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(host.log_messages(), None, "unexpected D3D12 debug error");
+    }
+
+    #[test]
+    fn bindless_tracker_handles_over_4096_srvs_overwrites_and_forgets() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let _ = host.log_messages();
+        const COUNT: u32 = 5000;
+        let heap_obj = make_view_heap(COUNT + 16);
+        let heap_ref = crate::descriptor::heap(heap_obj.0);
+        let start = heap_ref.start;
+        let slot_handle = |i: u32| start + u64::from(i) * 32;
+
+        let mut textures = Vec::with_capacity(COUNT as usize);
+        for i in 0..COUNT {
+            let tex = make_texture(
+                D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                1,
+                1,
+                1,
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                1,
+                D3D12_RESOURCE_FLAG_NONE,
+            );
+            crate::descriptor::create_srv(
+                std::ptr::null(),
+                tex.0,
+                std::ptr::null(),
+                slot_handle(i),
+            );
+            textures.push(tex);
+        }
+
+        let host_heap = heap_ref.host().expect("host heap created");
+        let snapshot = |srvs: bool, uavs: bool| {
+            let (g, s, u) = host_heap.live_textures(srvs, uavs);
+            (
+                g,
+                s.iter().map(|h| h.get() as usize).collect::<Vec<_>>(),
+                u.iter().map(|h| h.get() as usize).collect::<Vec<_>>(),
+            )
+        };
+        let (gen0, srvs, uavs) = snapshot(true, true);
+        assert_eq!(srvs.len(), COUNT as usize, "all 5000 SRVs tracked");
+        assert!(uavs.is_empty());
+
+        // Overwrite slot 10 with a CBV: texture 10 is removed cleanly.
+        crate::descriptor::create_cbv(std::ptr::null(), &[0x1000, 0, 256, 0], slot_handle(10));
+        let (gen1, srvs, _) = snapshot(true, false);
+        assert!(gen1 > gen0);
+        assert_eq!(srvs.len(), (COUNT - 1) as usize);
+        assert!(!srvs.contains(&(textures[10].0 as usize)));
+
+        // Duplicate texture 0 in slot COUNT: refcount becomes 2, overwriting one
+        // slot keeps texture 0 live until the other is overwritten or forgotten.
+        let tex0_addr = textures[0].0 as usize;
+        crate::descriptor::create_srv(
+            std::ptr::null(),
+            textures[0].0,
+            std::ptr::null(),
+            slot_handle(COUNT),
+        );
+        let (gen2, srvs, _) = snapshot(true, false);
+        assert!(gen2 > gen1);
+        assert_eq!(srvs.len(), (COUNT - 1) as usize);
+        crate::descriptor::create_cbv(std::ptr::null(), &[0x2000, 0, 256, 0], slot_handle(0));
+        let (gen3, srvs, _) = snapshot(true, false);
+        assert!(gen3 > gen2);
+        assert!(
+            srvs.contains(&tex0_addr),
+            "duplicate slot keeps refcount > 0"
+        );
+        drop(textures.swap_remove(0));
+        let (gen4, srvs, _) = snapshot(true, false);
+        assert!(gen4 > gen3);
+        assert_eq!(srvs.len(), (COUNT - 2) as usize);
+        assert!(!srvs.contains(&tex0_addr));
+
+        // Duplicate texture 1 across two slots and forget directly while refcount == 2.
+        let tex1_addr = textures[1].0 as usize;
+        crate::descriptor::create_srv(
+            std::ptr::null(),
+            textures[1].0,
+            std::ptr::null(),
+            slot_handle(COUNT + 2),
+        );
+        drop(textures.swap_remove(1));
+        let (_, srvs, _) = snapshot(true, false);
+        assert!(!srvs.contains(&tex1_addr));
+
+        // UAV tracking + SRV->UAV overwrite on one slot.
+        let uav_tex = make_texture(
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            4,
+            4,
+            1,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            1,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        );
+        let uav_addr = uav_tex.0 as usize;
+        crate::descriptor::create_srv(
+            std::ptr::null(),
+            uav_tex.0,
+            std::ptr::null(),
+            slot_handle(COUNT + 1),
+        );
+        assert!(snapshot(true, false).1.contains(&uav_addr));
+        crate::descriptor::create_uav(
+            std::ptr::null(),
+            uav_tex.0,
+            std::ptr::null(),
+            std::ptr::null(),
+            slot_handle(COUNT + 1),
+        );
+        let (_, srvs, uavs) = snapshot(true, true);
+        assert!(!srvs.contains(&uav_addr));
+        assert!(uavs.contains(&uav_addr));
+
+        // Holding a live_textures snapshot pins the resource across title release.
+        let (_, _, pinned_uavs) = host_heap.live_textures(false, true);
+        drop(uav_tex);
+        assert!(
+            crate::resource::host_resource(uav_addr as crate::object::This).is_some(),
+            "pinned snapshot must keep released resource alive until dropped"
+        );
+        drop(pinned_uavs);
+        assert!(!snapshot(false, true).2.contains(&uav_addr));
+        drop(textures);
+        let (_, srvs, uavs) = snapshot(true, true);
+        assert!(srvs.is_empty());
+        assert!(uavs.is_empty());
+
+        // `copy_simple` into a shader-visible heap mirrors and tracks the texture.
+        let copy_tex = make_texture(
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            4,
+            4,
+            1,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            1,
+            D3D12_RESOURCE_FLAG_NONE,
+        );
+        let copy_addr = copy_tex.0 as usize;
+        let mut cpu_slots = [0u64; 2 * 4];
+        let src_srv = cpu_slots.as_mut_ptr() as u64;
+        let src_empty = src_srv + 32;
+        crate::descriptor::create_srv(std::ptr::null(), copy_tex.0, std::ptr::null(), src_srv);
+        crate::descriptor::copy_simple(std::ptr::null(), 1, slot_handle(5), src_srv, 0);
+        assert_eq!(snapshot(true, false).1, vec![copy_addr]);
+        crate::descriptor::copy_simple(std::ptr::null(), 1, slot_handle(5), src_empty, 0);
+        assert!(snapshot(true, false).1.is_empty());
+
+        assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    fn bindless_tracker_forget_is_aba_safe_when_pointer_reused() {
+        let Some(heap) = HostHeap::new(false, 16) else {
+            return; // no host GPU
+        };
+        let reused_addr = 0x1234_5678usize;
+        // Resource A mirrored at slot 5, then released without rewriting slot 5.
+        heap.track_slot(5, Some((reused_addr, false)));
+        assert_eq!(heap.live_texture_addrs(true, false).1, vec![reused_addr]);
+        heap.forget_resource(reused_addr);
+        assert!(heap.live_texture_addrs(true, false).1.is_empty());
+        // New resource B allocated at the same pointer and mirrored into slot 7.
+        heap.track_slot(7, Some((reused_addr, false)));
+        // Later, stale slot 5 is overwritten with null/another view: slot 7 stays live!
+        heap.track_slot(5, None);
+        assert_eq!(heap.live_texture_addrs(true, false).1, vec![reused_addr]);
+        // And UAV slots share the same ABA guarantee.
+        heap.track_slot(2, Some((reused_addr, true)));
+        heap.forget_resource(reused_addr);
+        heap.track_slot(9, Some((reused_addr, true)));
+        heap.track_slot(2, None);
+        assert_eq!(heap.live_texture_addrs(false, true).2, vec![reused_addr]);
+    }
+
+    #[test]
+    fn descriptor_forget_clears_host_tracker_without_by_resource_entry() {
+        let Some(_host) = host() else {
+            return; // no host GPU
+        };
+        let heap = make_view_heap(16);
+        let host_heap = crate::descriptor::heap(heap.0)
+            .host()
+            .expect("host view heap");
+        // Simulate a `View::Placed` texture tracked in `HostHeap::tex_tracker`
+        // that never had an entry in `descriptor::VIEWS.by_resource`.
+        let placed_addr = 0xfeed_face_0000usize;
+        host_heap.track_slot(3, Some((placed_addr, false)));
+        assert_eq!(
+            host_heap.live_texture_addrs(true, false).1,
+            vec![placed_addr]
+        );
+        crate::descriptor::forget(placed_addr);
+        assert!(
+            host_heap.live_texture_addrs(true, false).1.is_empty(),
+            "descriptor::forget must evict host tracker entries even when by_resource is absent"
+        );
     }
 }
 

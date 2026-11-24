@@ -409,21 +409,50 @@ fn record(handle: u64, view: View) {
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(entries) = views.by_resource.remove(&resource) else {
-        return;
-    };
-    for i in entries {
-        let (view, generation) = views.list[i as usize].clone();
-        // Entries freed through a view's other resource may hold another
-        // view by now.
-        if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
+    if let Some(entries) = views.by_resource.remove(&resource) {
+        for i in entries {
+            let (view, generation) = views.list[i as usize].clone();
+            // Entries freed through a view's other resource may hold another
+            // view by now.
+            if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
+                continue;
+            }
+            views.index.remove(&view);
+            views.list[i as usize].1 = generation.wrapping_add(1).max(1);
+            // The view's other resource (a counter) keeps a stale entry, which
+            // `forget` of that resource skips.
+            views.free.push(i);
+        }
+    }
+    drop(views);
+    // Always clear host bindless trackers even when `by_resource` had no entry
+    // (for example, `View::Placed` textures resolved via `placed_texture`).
+    #[cfg(windows)]
+    forget_host_resources(resource);
+}
+
+/// Drops all live bindless-tracker references to `resource` from every
+/// initialized shader-visible view heap, synchronizing with any in-progress
+/// `Heap::host()` publication so a freed resource cannot be published live.
+#[cfg(windows)]
+fn forget_host_resources(resource: usize) {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if heap.samplers() {
             continue;
         }
-        views.index.remove(&view);
-        views.list[i as usize].1 = generation.wrapping_add(1).max(1);
-        // The view's other resource (a counter) keeps a stale entry, which
-        // `forget` of that resource skips.
-        views.free.push(i);
+        if let Some(Some(host)) = heap.host.get() {
+            host.forget_resource(resource);
+        } else {
+            // Wait for any concurrent `Heap::host()` initialization holding
+            // `heap.pending` to finish publishing before checking again.
+            let _pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(Some(host)) = heap.host.get() {
+                host.forget_resource(resource);
+            }
+        }
     }
 }
 
@@ -740,7 +769,9 @@ mod tests {
         unsafe { (cpu as *mut u8).add(999 * 32 + 31).write(1) };
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
-        assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
+        let mut bad_h = null;
+        assert_eq!(create(bad, none, &mut bad_h), E_INVALIDARG);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
     }
 
     #[test]
@@ -822,9 +853,15 @@ mod tests {
         );
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x50)(h), address);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
         // A size that does not match the count is not a placement.
-        assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
-        assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+        let mut h2 = std::ptr::null();
+        assert_eq!(create(desc, Placement { address, size: 7 }, &mut h2), S_OK);
+        assert_ne!(
+            slot::<extern "system" fn(This) -> u64>(h2, 0x48)(h2),
+            address
+        );
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h2, 0x10)(h2), 0);
     }
 
     #[test]

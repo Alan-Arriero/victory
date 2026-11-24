@@ -75,6 +75,26 @@ impl Held {
         Held(this)
     }
 
+    /// Retains `this` only if its reference count is still non-zero; returns
+    /// `None` if another thread has already started dropping the object.
+    ///
+    /// # Safety
+    /// The caller must guarantee that `this`'s allocation cannot be freed while
+    /// this call runs (for example, by holding a lock that `Drop` must acquire
+    /// before deallocating `this`).
+    pub(crate) unsafe fn try_new(this: This) -> Option<Held> {
+        if this.is_null() {
+            return None;
+        }
+        // SAFETY: caller guarantees `this` is still allocated while this runs.
+        let refs = &unsafe { &*this }.refs;
+        refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n > 0).then_some(n + 1)
+        })
+        .ok()?;
+        Some(Held(this))
+    }
+
     pub(crate) fn get(&self) -> This {
         self.0
     }

@@ -110,6 +110,35 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        stage: &'static str,
+        hw_stage: victory_shader::HwStage,
+        used: Vec<victory_shader::UsedResource>,
+    ) -> Arc<Self> {
+        let translated = OnceLock::new();
+        let _ = translated.set(Some(Translated {
+            host: victory_shader::emit::HostShader {
+                stage: hw_stage,
+                dxil: Vec::new(),
+                user_data: Vec::new(),
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+            },
+            used,
+        }));
+        Arc::new(Self {
+            stage,
+            hash: String::new(),
+            container: Vec::new(),
+            translated,
+            #[cfg(feature = "diagnostics")]
+            wave64: OnceLock::new(),
+        })
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
