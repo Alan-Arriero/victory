@@ -1036,8 +1036,16 @@ impl<'a> Lower<'a> {
         for &(reg, v) in &self.x.p.inputs {
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
-                Reg::S(_) => match io_inputs.get(&v) {
+                Reg::S(n) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
+                    // Above the SGPRs the hardware initializes, a register
+                    // holds what the last wave left, so no program depends
+                    // on it: a read the paths only seem to allow (a branch
+                    // past the write, taken only with one past the read)
+                    // reads zero, as VGPRs do.
+                    None if n <= 105 && self.x.io.initialized_sgprs.is_some_and(|k| n >= k) => {
+                        Val::I32(self.s.m.i32(0))
+                    }
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -2797,6 +2805,29 @@ impl<'a> Lower<'a> {
                 _ => Ok(l.s.m.i32(0)),
             }
         };
+        if let Some(op) = name.strip_prefix("s_bitcmp") {
+            // SCC is whether bit src1 (mod 32, or mod 64 for the 64-bit form)
+            // of src0 is clear (bitcmp0) or set (bitcmp1).
+            let (bit, k31) = (src32(self, 1)?, self.s.m.i32(31));
+            let idx = self.s.m.bin(c, Bin::And, bit, k31);
+            let word = if op.ends_with("_b64") {
+                let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                let k32 = self.s.m.i32(32);
+                let upper = self.s.m.bin(c, Bin::And, bit, k32);
+                let z = self.s.m.i32(0);
+                let upper = self.s.m.cmp(c, pred::NE, upper, z);
+                self.s.m.select(c, upper, b, a)
+            } else {
+                src32(self, 0)?
+            };
+            let shifted = self.s.m.bin(c, Bin::LShr, word, idx);
+            let one = self.s.m.i32(1);
+            let tested = self.s.m.bin(c, Bin::And, shifted, one);
+            let want = self.s.m.i32(u32::from(op.starts_with('1')));
+            let r = self.s.m.cmp(c, pred::EQ, tested, want);
+            self.set(scc, Val::Bit(r));
+            return Ok(());
+        }
         if let Some(op) = name.strip_prefix("s_cmp_").filter(|o| o.ends_with("_u64")) {
             // eq and lg only: both dwords.
             let mut r = None;
@@ -6239,7 +6270,7 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let (op, sample) = match name {
-            "image_sample" | "image_sample_cl" => (60, true),
+            "image_sample" | "image_sample_cl" | "image_sample_o" => (60, true),
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" | "image_sample_b_cl" => (61, true),
             "image_sample_c_lz" => (65, true),
@@ -6391,6 +6422,24 @@ impl<'a> Lower<'a> {
             } else {
                 fu
             };
+            if op == 60 && offset_word {
+                // DXIL takes immediate offsets in -8..=7; the console's are
+                // 6-bit and may be computed.
+                let w = addr_u32(self, 0)?;
+                let w = self
+                    .s
+                    .m
+                    .int_value(w)
+                    .ok_or("a sample offset that is not constant")? as u32;
+                for (k, o) in os.iter_mut().enumerate().take(offsets) {
+                    let x = (w >> (8 * k) & 0x3F) as i32;
+                    let x = if x >= 32 { x - 64 } else { x };
+                    if !(-8..=7).contains(&x) {
+                        return Err("a sample offset past -8..7");
+                    }
+                    *o = self.s.m.i32(x as u32);
+                }
+            }
             match op {
                 60 | 61 if !self.s.pixel => {
                     // Outside pixel shaders the console still takes the level
@@ -7440,6 +7489,20 @@ impl<'a> Lower<'a> {
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
+        // A phi that only another read phi consumes is live too. Without this, a value with no DXIL form that
+        // reaches a read through two joins is taken for dead at the first join and replaced by zero below, and the
+        // lowering accepts what it refuses when the same value is read directly.
+        let mut work: Vec<Value> = self.read_phis.iter().copied().collect();
+        while let Some(v) = work.pop() {
+            let Some(&(b, i)) = self.phi_at.get(&v) else {
+                continue;
+            };
+            for &arg in &p.blocks[b].phis[i].args {
+                if self.phi_at.contains_key(&arg) && self.read_phis.insert(arg) {
+                    work.push(arg);
+                }
+            }
+        }
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
@@ -7718,8 +7781,9 @@ mod tests {
         assert_eq!(fence_only(&words), Vec::<usize>::new());
     }
 
-    /// Lowers a compute program of constants and returns the lowered result.
-    fn lower_words(words: &[u32]) -> Result<super::Lowered, crate::ShaderError> {
+    /// Lowers a synthetic compute program with these input registers and
+    /// returns the lowered result.
+    fn lower_words(words: &[u32], rsrc2: u32) -> Result<super::Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -7728,7 +7792,7 @@ mod tests {
             layout: vec![],
             used: vec![],
             io: StageIo::Cs(ComputeIo {
-                rsrc2: 0,
+                rsrc2,
                 threads: [1, 1, 1],
             }),
             code,
@@ -7750,9 +7814,9 @@ mod tests {
         })
     }
 
-    /// Lowers a compute program of constants: whether it translates.
-    fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
-        lower_words(words).map(|_| ())
+    /// Whether a synthetic compute program translates with these input registers.
+    fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+        lower_words(words, rsrc2).map(|_| ())
     }
 
     #[test]
@@ -7766,7 +7830,7 @@ mod tests {
             src0 | (src1 << 9) | (src2 << 18),
             S_ENDPGM,
         ];
-        let lowered = lower_words(&words).unwrap();
+        let lowered = lower_words(&words, 0).unwrap();
         assert!(
             lowered.has_isnan_op,
             "v_med3_f32 must emit dx.op.isSpecialFloat.f32 (IsNaN)"
@@ -7782,11 +7846,11 @@ mod tests {
         // MUBUF opcode 0x071/0x072 with no data operand: the title asks the
         // host to invalidate its cached view of a buffer.
         assert!(
-            lowers(&[0xE1C4_0000, 0, S_ENDPGM]).is_ok(),
+            lowers(&[0xE1C4_0000, 0, S_ENDPGM], 0).is_ok(),
             "buffer_gl0_inv"
         );
         assert!(
-            lowers(&[0xE1C8_0000, 0, S_ENDPGM]).is_ok(),
+            lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(),
             "buffer_gl1_inv"
         );
     }
@@ -7937,7 +8001,7 @@ mod tests {
             S_ENDPGM,
         ];
         for words in [add, sub] {
-            lowers(&words).unwrap();
+            lowers(&words, 0).unwrap();
         }
     }
 
@@ -8022,6 +8086,35 @@ mod tests {
     }
 
     #[test]
+    fn scalar_bit_tests_lower() {
+        // Each tests one bit of a constant into SCC and branches on it (only
+        // code with an effect needs its operands).
+        let tail = [
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        let bit_tests: [&[u32]; 4] = [
+            &[0xBE81_0387, 0xBF0C_8301], // s_mov_b32 s1, 7; s_bitcmp0_b32 s1, 3
+            &[0xBE81_0387, 0xBF0D_8301], // s_mov_b32 s1, 7; s_bitcmp1_b32 s1, 3
+            &[
+                0xBE80_0387, // s_mov_b32 s0, 7
+                0xBE81_0380, // s_mov_b32 s1, 0
+                0xBF0E_8300, // s_bitcmp0_b64 s[0:1], 3
+            ],
+            &[
+                0xBE80_0387, // s_mov_b32 s0, 7
+                0xBE81_0380, // s_mov_b32 s1, 0
+                0xBF0F_8300, // s_bitcmp1_b64 s[0:1], 3
+            ],
+        ];
+        for head in bit_tests {
+            let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
+            lowers(&words, 0).unwrap();
+        }
+    }
+
+    #[test]
     fn lds_subdword_reads_and_writes_lower() {
         // Allocate 128 dwords (512 bytes) of LDS via COMPUTE_PGM_RSRC2[23:15] = 1.
         let ds = |op: u32, off: u32, addr: u32, data0: u32, dst: u32| -> [u32; 2] {
@@ -8085,6 +8178,35 @@ mod tests {
             mesh_stride: 0,
         })
         .unwrap();
+    }
+
+    #[test]
+    fn a_missing_value_stays_missing_through_two_live_joins() {
+        let mut words = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
+            0xBF85_0001, // skip the first overwrite
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xBF06_8101, // s_cmp_eq_u32 s1, 1 (s1 = group id Y)
+            0xBF85_0001, // skip the second overwrite
+            0xBE86_0381, // s_mov_b32 s6, 1
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // use the result to branch
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        let group_ids_xy = 3 << 7;
+        // Compare to a direct read so future timestamp support works in both cases.
+        let refusal = |code: &[u32]| match lowers(code, group_ids_xy) {
+            Ok(()) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        };
+        let direct = [&words[..2], &words[8..]].concat();
+        assert_eq!(refusal(&words), refusal(&direct));
+        words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
+        lowers(&words, group_ids_xy).expect("dead timestamp");
     }
 
     #[test]
