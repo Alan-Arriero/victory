@@ -145,14 +145,18 @@ fn host() -> String {
 }
 
 /// The CPU's brand string, e.g. `AMD Ryzen 7 5700X3D 8-Core Processor`.
+// Rust 1.88 marks `__cpuid` unsafe; newer toolchains make it safe.
+#[allow(unused_unsafe)]
 fn cpu_name() -> String {
     use std::arch::x86_64::__cpuid;
-    if __cpuid(0x8000_0000).eax < 0x8000_0004 {
+    // SAFETY: x86-64 guarantees the CPUID instruction.
+    if unsafe { __cpuid(0x8000_0000) }.eax < 0x8000_0004 {
         return "an unnamed CPU".into();
     }
     let bytes: Vec<u8> = (0x8000_0002..=0x8000_0004)
         .flat_map(|leaf| {
-            let r = __cpuid(leaf);
+            // SAFETY: x86-64 guarantees CPUID, and the maximum leaf was checked above.
+            let r = unsafe { __cpuid(leaf) };
             [r.eax, r.ebx, r.ecx, r.edx]
         })
         .flat_map(u32::to_le_bytes)
