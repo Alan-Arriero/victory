@@ -9,8 +9,8 @@
 use std::ffi::c_void;
 
 use crate::object::{
-    self, guid, guid_text, Iid, Object, Table, This, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL,
-    HRESULT, S_FALSE, S_OK,
+    self, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, HRESULT, Iid, Object, S_FALSE, S_OK, Table, This,
+    guid, guid_text,
 };
 use crate::{
     descriptor, dxgi, fence, frame, list, pipeline, query, queue, resource, root, signature,
@@ -419,8 +419,8 @@ static FUNCTIONS: Table<160> = {
     f[73] = list::create_list_x as *const (); // 0x248
     f[74] = resource::register_page_pool as *const (); // 0x250
     f[75] = resource::unregister_page_pool as *const (); // 0x258
-                                                         // CreateCommittedResourceX: its description is PC's plus DCC options,
-                                                         // which we have no use for (the AMD upscaler's, on Series S).
+    // CreateCommittedResourceX: its description is PC's plus DCC options,
+    // which we have no use for (the AMD upscaler's, on Series S).
     f[76] = resource::create_committed as *const (); // 0x260
     f[78] = frame::set_interval as *const (); // 0x270
     f[79] = frame::schedule as *const (); // 0x278

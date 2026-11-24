@@ -378,7 +378,10 @@ impl State {
             return false;
         };
         if p.compute || p.mesh != mesh {
-            once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+            once!(
+                mesh,
+                "a draw or mesh dispatch with another kind of pipeline"
+            );
             return false;
         }
         self.bind(list, p, false);
@@ -434,7 +437,12 @@ impl State {
 
     fn ensure_depth_state(&self, list: &HostList) {
         if let Some(depth) = self.depth {
-            let state = depth.state | if self.depth_sampled { SHADER_RESOURCE } else { 0 };
+            let state = depth.state
+                | if self.depth_sampled {
+                    SHADER_RESOURCE
+                } else {
+                    0
+                };
             crate::list::ensure_state(list, depth.resource as This, state);
         }
     }
@@ -1132,13 +1140,19 @@ impl State {
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+                Some(p) => why(&format!(
+                    "prepare failed (compute {}, mesh {})",
+                    p.compute, p.mesh
+                )),
             }
             return false;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+            self.op_text(
+                format!("indirect kind {kind} max {max} at {arguments:#x}"),
+                kind == DISPATCH,
+            )
         });
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
@@ -1226,7 +1240,12 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need. Returns whether the view
 /// also reads the draw's bound depth target.
-fn readable(list: &HostList, u: &UsedResource, view: &View, read_only_depth: Option<usize>) -> bool {
+fn readable(
+    list: &HostList,
+    u: &UsedResource,
+    view: &View,
+    read_only_depth: Option<usize>,
+) -> bool {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
@@ -1444,7 +1463,10 @@ fn describe(view: Option<&View>) -> String {
         crate::resource::host_resource(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
-            format!("{}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
+            format!(
+                "{}x{} f{} flags {:#x}",
+                d.Width, d.Height, d.Format.0, d.Flags.0
+            )
         })
     };
     match view {

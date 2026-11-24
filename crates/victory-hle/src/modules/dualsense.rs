@@ -184,9 +184,7 @@ fn open_pad() -> Option<Pad> {
         attributes.Size = std::mem::size_of::<HIDD_ATTRIBUTES>() as u32;
         // SAFETY: a live HID handle and room for the attributes.
         let known = unsafe { HidD_GetAttributes(handle, &mut attributes) };
-        if known
-            && is_playstation_pad(attributes.VendorID, attributes.ProductID)
-        {
+        if known && is_playstation_pad(attributes.VendorID, attributes.ProductID) {
             let mut preparsed: isize = 0;
             // SAFETY: a live HID handle and room for the pointer.
             if !unsafe { HidD_GetPreparsedData(handle, &mut preparsed) } {

@@ -511,7 +511,9 @@ fn apply_page_mappings(map: crate::resource::PageMapper, pool: u64, ops: &[PageO
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        ONCE.call_once(|| {
+            tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed")
+        });
     }
 }
 

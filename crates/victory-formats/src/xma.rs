@@ -152,12 +152,17 @@ fn next_frame(data: &[u8], start: usize, end: usize) -> Option<usize> {
     // A frame that ends in a packet where no frame begins (the tail of a frame
     // that crossed packets, then padding) is the last one before the next
     // packet that has frames.
-    let ends_in_packet_without_frames =
-        end / PACKET_BITS != index && !end.is_multiple_of(PACKET_BITS) && packet(data, end / PACKET_BITS)?.frames == 0;
-    if end.is_multiple_of(PACKET_BITS) || (last && end / PACKET_BITS == index) || ends_in_packet_without_frames {
+    let ends_in_packet_without_frames = end / PACKET_BITS != index
+        && !end.is_multiple_of(PACKET_BITS)
+        && packet(data, end / PACKET_BITS)?.frames == 0;
+    if end.is_multiple_of(PACKET_BITS)
+        || (last && end / PACKET_BITS == index)
+        || ends_in_packet_without_frames
+    {
         // The next frame begins in the next packet of this stream that has one;
         // a packet with none (a frame spans all of it) holds no start.
-        let mut next = (end - 1) / PACKET_BITS + 1 + packet(data, (end - 1) / PACKET_BITS)?.skip as usize;
+        let mut next =
+            (end - 1) / PACKET_BITS + 1 + packet(data, (end - 1) / PACKET_BITS)?.skip as usize;
         let mut header = packet(data, next)?;
         while header.frames == 0 {
             next += 1 + header.skip as usize;
@@ -245,9 +250,7 @@ impl Vlc {
         let i = if end == first + 1 {
             first
         } else {
-            first
-                + self.codes[first..end].partition_point(|c| c.0 <= v)
-                - 1
+            first + self.codes[first..end].partition_point(|c| c.0 <= v) - 1
         };
         let (_, len, symbol) = self.codes[i];
         bits.pos += len as usize;
@@ -274,10 +277,20 @@ fn codes() -> &'static Codes {
             scale: pairs(&SCALE, -60),
             scale_rl: pairs(&SCALE_RL, 0),
             coef: [
-                Vlc::new(COEF0_SYMS.iter().zip(COEF0_LENS).map(|(&s, l)| (s as i32, l))),
+                Vlc::new(
+                    COEF0_SYMS
+                        .iter()
+                        .zip(COEF0_LENS)
+                        .map(|(&s, l)| (s as i32, l)),
+                ),
                 pairs(&COEF1, 0),
             ],
-            vec4: Vlc::new(VEC4_SYMS.iter().zip(VEC4_LENS).map(|(&s, l)| (s as i32 - 1, l))),
+            vec4: Vlc::new(
+                VEC4_SYMS
+                    .iter()
+                    .zip(VEC4_LENS)
+                    .map(|(&s, l)| (s as i32 - 1, l)),
+            ),
             vec2: pairs(&VEC2, -1),
             vec1: pairs(&VEC1, 0),
         }
@@ -907,7 +920,11 @@ impl Decoder {
             ch.scale_factors = target;
             if ch.reuse_sf {
                 let from = ch.saved_scale_factors[ch.scale_factor_idx];
-                for (sf, &offset) in ch.saved_scale_factors[target].iter_mut().zip(&sf_offsets).take(self.num_bands) {
+                for (sf, &offset) in ch.saved_scale_factors[target]
+                    .iter_mut()
+                    .zip(&sf_offsets)
+                    .take(self.num_bands)
+                {
                     *sf = from[offset];
                 }
             }
@@ -1040,7 +1057,11 @@ impl Decoder {
                     }
                     quant += 31;
                 }
-                quant_step += if negative { -(quant + step) } else { quant + step };
+                quant_step += if negative {
+                    -(quant + step)
+                } else {
+                    quant + step
+                };
             }
             if self.channels_for_cur_subframe == 1 {
                 self.ch[self.channel_indexes[0]].quant_step = quant_step;
@@ -1083,13 +1104,21 @@ impl Decoder {
                 let sf = ch.saved_scale_factors[ch.scale_factors];
                 for band in 0..self.num_bands {
                     let end = sfb[band + 1].min(subframe_len);
-                    let exp = ch.quant_step - (ch.max_scale_factor - sf[band]) * ch.scale_factor_step;
+                    let exp =
+                        ch.quant_step - (ch.max_scale_factor - sf[band]) * ch.scale_factor_step;
                     let quant = 10f32.powf(exp as f32 / 20.0);
-                    for (t, &c) in tmp[sfb[band]..end].iter_mut().zip(&ch.coeffs[sfb[band]..end]) {
+                    for (t, &c) in tmp[sfb[band]..end]
+                        .iter_mut()
+                        .zip(&ch.coeffs[sfb[band]..end])
+                    {
                         *t = c * quant;
                     }
                 }
-                imdct_half(&tmp[..subframe_len], &mut ch.out[at..at + subframe_len], scale);
+                imdct_half(
+                    &tmp[..subframe_len],
+                    &mut ch.out[at..at + subframe_len],
+                    scale,
+                );
             }
         } else {
             for i in 0..self.channels_for_cur_subframe {
@@ -1106,7 +1135,10 @@ impl Decoder {
                 start += (winlen - subframe_len) / 2;
                 winlen = subframe_len;
             }
-            window_overlap(&mut ch.out[start..start + winlen], &windows()[log2(winlen) as usize - 7]);
+            window_overlap(
+                &mut ch.out[start..start + winlen],
+                &windows()[log2(winlen) as usize - 7],
+            );
             ch.prev_block_len = subframe_len;
         }
 
@@ -1173,7 +1205,6 @@ fn to_i16(v: f32) -> i16 {
 mod tests {
     use super::*;
 
-
     fn vlc_books() -> [&'static Vlc; 7] {
         let c = codes();
         [
@@ -1221,9 +1252,7 @@ mod tests {
 
             for value in probes {
                 for shift in 0..8usize {
-                    let data =
-                        (u64::from(value) << (32 - shift))
-                            .to_be_bytes();
+                    let data = (u64::from(value) << (32 - shift)).to_be_bytes();
 
                     let mut expected = Bits {
                         data: &data,
@@ -1255,10 +1284,7 @@ mod tests {
         use std::hint::black_box;
         use std::time::Instant;
 
-        fn measure<const OPT: bool>(
-            samples: &[(usize, [u8; 4])],
-            books: &[&Vlc; 7],
-        ) -> (f64, i64) {
+        fn measure<const OPT: bool>(samples: &[(usize, [u8; 4])], books: &[&Vlc; 7]) -> (f64, i64) {
             let start = Instant::now();
             let mut sum = 0i64;
 
@@ -1284,18 +1310,12 @@ mod tests {
                 }
             }
 
-            (
-                start.elapsed().as_secs_f64() * 1000.0,
-                black_box(sum),
-            )
+            (start.elapsed().as_secs_f64() * 1000.0, black_box(sum))
         }
 
         let books = vlc_books();
 
-        for (label, short_only) in [
-            ("all_codes", false),
-            ("short_codes", true),
-        ] {
+        for (label, short_only) in [("all_codes", false), ("short_codes", true)] {
             let mut corpus = Vec::new();
 
             for (index, book) in books.iter().enumerate() {
@@ -1412,7 +1432,12 @@ mod tests {
         let frame = read_frame(&data, second).unwrap();
         assert_eq!(frame.bits, bits);
         assert_eq!(frame.next, Some(3 * PACKET_BITS + HEADER_BITS));
-        assert_eq!(read_frame(&data, 3 * PACKET_BITS + HEADER_BITS).unwrap().next, None);
+        assert_eq!(
+            read_frame(&data, 3 * PACKET_BITS + HEADER_BITS)
+                .unwrap()
+                .next,
+            None
+        );
     }
 
     /// The direct sum `imdct_half` stands for (FFmpeg's naive inverse MDCT:
@@ -1425,7 +1450,9 @@ mod tests {
                 -(input
                     .iter()
                     .enumerate()
-                    .map(|(k, &x)| x as f64 * (std::f64::consts::PI / n as f64 * t * (k as f64 + 0.5)).cos())
+                    .map(|(k, &x)| {
+                        x as f64 * (std::f64::consts::PI / n as f64 * t * (k as f64 + 0.5)).cos()
+                    })
                     .sum::<f64>() as f32)
             })
             .collect()
@@ -1618,7 +1645,12 @@ mod tests {
             }
         }
         for i in n..5 * n {
-            assert!((out[i] - signal[i]).abs() < 1e-3, "{i}: {} vs {}", out[i], signal[i]);
+            assert!(
+                (out[i] - signal[i]).abs() < 1e-3,
+                "{i}: {} vs {}",
+                out[i],
+                signal[i]
+            );
         }
     }
 

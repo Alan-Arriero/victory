@@ -807,8 +807,7 @@ impl Resource {
                     .as_ref()
                     .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
                 let texture = host_texture(&self.desc, state, clear)?;
-                let state =
-                    crate::host::legal_state(&texture, crate::host::texture_state(state));
+                let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
                 Some(std::sync::Arc::new(HostTexture {
                     texture,
                     state: state.into(),
@@ -2168,23 +2167,68 @@ void main() {
         let (mut image, mut upload_buf, mut dst_aligned, mut dst_packed, mut dst_crop) =
             (null, null, null, null, null);
         assert_eq!(
-            create_committed(null, &PROPERTIES, 0, &tex_desc, 0, null.cast(), iid, &mut image),
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &tex_desc,
+                0,
+                null.cast(),
+                iid,
+                &mut image
+            ),
             S_OK
         );
         assert_eq!(
-            create_committed(null, &PROPERTIES, 0, &buffer(1024), 0, null.cast(), iid, &mut upload_buf),
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &buffer(1024),
+                0,
+                null.cast(),
+                iid,
+                &mut upload_buf
+            ),
             S_OK
         );
         assert_eq!(
-            create_committed(null, &PROPERTIES, 0, &buffer(2048), 0, null.cast(), iid, &mut dst_aligned),
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &buffer(2048),
+                0,
+                null.cast(),
+                iid,
+                &mut dst_aligned
+            ),
             S_OK
         );
         assert_eq!(
-            create_committed(null, &PROPERTIES, 0, &buffer(256), 0, null.cast(), iid, &mut dst_packed),
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &buffer(256),
+                0,
+                null.cast(),
+                iid,
+                &mut dst_packed
+            ),
             S_OK
         );
         assert_eq!(
-            create_committed(null, &PROPERTIES, 0, &buffer(1024), 0, null.cast(), iid, &mut dst_crop),
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &buffer(1024),
+                0,
+                null.cast(),
+                iid,
+                &mut dst_crop
+            ),
             S_OK
         );
 
@@ -2243,8 +2287,15 @@ void main() {
             kind: u32,
             footprint: PlacedFootprint,
         }
-        type Copy =
-            extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const [u32; 6]);
+        type Copy = extern "system" fn(
+            This,
+            *const Location,
+            u32,
+            u32,
+            u32,
+            *const Location,
+            *const [u32; 6],
+        );
         let copy = slot::<Copy>(list, 0x80);
 
         let full_rows = PlacedFootprint {
@@ -2258,7 +2309,10 @@ void main() {
         let tex_loc = Location {
             resource: image,
             kind: 0,
-            footprint: PlacedFootprint { offset: 0, ..full_rows },
+            footprint: PlacedFootprint {
+                offset: 0,
+                ..full_rows
+            },
         };
         let up_loc = Location {
             resource: upload_buf,
@@ -2314,7 +2368,16 @@ void main() {
         // (45..=47): skipped cleanly without breaking Close() or touching dst.
         let mut dst_d16s8 = null;
         assert_eq!(
-            create_committed(null, &PROPERTIES, 0, &buffer(1024), 0, null.cast(), iid, &mut dst_d16s8),
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &buffer(1024),
+                0,
+                null.cast(),
+                iid,
+                &mut dst_d16s8
+            ),
             S_OK
         );
         let d16s8_loc = Location {
@@ -2331,27 +2394,44 @@ void main() {
         };
         copy(list, &d16s8_loc, 0, 0, 0, &tex_loc, std::ptr::null());
 
-        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
 
         // Verify 256-aligned readback at offset 256 (leading 256 bytes untouched).
         let (al_ptr, _) = buffer_bytes(dst_aligned).unwrap();
         // SAFETY: dst_aligned holds 2048 bytes.
         let al = unsafe { std::slice::from_raw_parts(al_ptr, 2048) };
-        assert!(al[..256].iter().all(|&b| b == 0), "bytes before offset touched");
+        assert!(
+            al[..256].iter().all(|&b| b == 0),
+            "bytes before offset touched"
+        );
         for row in 0..4 {
             let at = 256 + row * 256;
-            assert_eq!(al[at..at + 16], up[row * 256..row * 256 + 16], "aligned row {row}");
+            assert_eq!(
+                al[at..at + 16],
+                up[row * 256..row * 256 + 16],
+                "aligned row {row}"
+            );
         }
 
         // Verify unaligned packed readback (row_pitch 16, offset 32).
         let (pk_ptr, _) = buffer_bytes(dst_packed).unwrap();
         // SAFETY: dst_packed holds 256 bytes.
         let pk = unsafe { std::slice::from_raw_parts(pk_ptr, 256) };
-        assert!(pk[..32].iter().all(|&b| b == 0), "bytes before packed offset touched");
+        assert!(
+            pk[..32].iter().all(|&b| b == 0),
+            "bytes before packed offset touched"
+        );
         for row in 0..4 {
             let at = 32 + row * 16;
-            assert_eq!(pk[at..at + 16], up[row * 256..row * 256 + 16], "packed row {row}");
+            assert_eq!(
+                pk[at..at + 16],
+                up[row * 256..row * 256 + 16],
+                "packed row {row}"
+            );
         }
 
         // Verify 2x2 sub-box crop from (1, 1)..(3, 3).
@@ -2361,14 +2441,21 @@ void main() {
         for row in 0..2 {
             let src_at = (row + 1) * 256 + 4; // x=1, y=row+1
             let dst_at = row * 256;
-            assert_eq!(cr[dst_at..dst_at + 8], up[src_at..src_at + 8], "crop row {row}");
+            assert_eq!(
+                cr[dst_at..dst_at + 8],
+                up[src_at..src_at + 8],
+                "crop row {row}"
+            );
         }
 
         // Verify skipped 118..=120 readback left its buffer untouched.
         let (d16_ptr, _) = buffer_bytes(dst_d16s8).unwrap();
         // SAFETY: dst_d16s8 holds 1024 bytes.
         let d16 = unsafe { std::slice::from_raw_parts(d16_ptr, 1024) };
-        assert!(d16.iter().all(|&b| b == 0), "mismatched format 118 buffer touched");
+        assert!(
+            d16.iter().all(|&b| b == 0),
+            "mismatched format 118 buffer touched"
+        );
     }
 
     #[test]

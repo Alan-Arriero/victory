@@ -78,17 +78,14 @@ pub enum Exit {
 impl Exit {
     fn successor_at(&self, index: usize) -> Option<usize> {
         match (*self, index) {
-            (Exit::Jump(b), 0)
-            | (Exit::Branch { taken: b, .. }, 0) => Some(b),
+            (Exit::Jump(b), 0) | (Exit::Branch { taken: b, .. }, 0) => Some(b),
             (Exit::Branch { not_taken, .. }, 1) => Some(not_taken),
             _ => None,
         }
     }
 
     fn successor_iter(&self) -> impl Iterator<Item = usize> {
-        self.successor_at(0)
-            .into_iter()
-            .chain(self.successor_at(1))
+        self.successor_at(0).into_iter().chain(self.successor_at(1))
     }
 
     pub fn successors(&self) -> Vec<usize> {
@@ -1260,7 +1257,6 @@ mod tests {
         post
     }
 
-
     #[test]
     fn cfg_successors_preserve_order() {
         for exit in [
@@ -1276,10 +1272,7 @@ mod tests {
                 not_taken: 4,
             },
         ] {
-            assert_eq!(
-                exit.successor_iter().collect::<Vec<_>>(),
-                exit.successors()
-            );
+            assert_eq!(exit.successor_iter().collect::<Vec<_>>(), exit.successors());
         }
     }
 
@@ -1343,10 +1336,7 @@ mod tests {
         use std::hint::black_box;
         use std::time::Instant;
 
-        fn measure(
-            blocks: &[Block],
-            run: impl Fn(&[Block]) -> Vec<usize>,
-        ) -> f64 {
+        fn measure(blocks: &[Block], run: impl Fn(&[Block]) -> Vec<usize>) -> f64 {
             let start = Instant::now();
 
             for _ in 0..128 {
@@ -1359,10 +1349,7 @@ mod tests {
         for count in [256, 2048, 8192] {
             let blocks = synthetic_cfg(count);
 
-            assert_eq!(
-                reference_postorder(&blocks),
-                reverse_postorder(&blocks)
-            );
+            assert_eq!(reference_postorder(&blocks), reverse_postorder(&blocks));
 
             black_box(measure(&blocks, reference_postorder));
             black_box(measure(&blocks, reverse_postorder));
