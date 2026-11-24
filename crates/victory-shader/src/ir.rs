@@ -20,7 +20,9 @@ use crate::ShaderError;
 use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
 
 /// One register dword. Scalar codes as in [`Operand::Scalar`]: 0-105 SGPRs,
-/// 106/107 VCC, 108-123 trap temporaries, 124 M0, 126/127 EXEC.
+/// 106/107 VCC, 108-123 trap temporaries, 124 M0, 126/127 EXEC. Codes from
+/// [`PARKED`] up are scalars the compiler parked in VGPR lanes (`unspill`):
+/// no machine instruction names them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Reg {
     S(u8),
@@ -31,6 +33,8 @@ pub enum Reg {
 pub const VCC: u8 = 106;
 pub const M0: u8 = 124;
 pub const EXEC: u8 = 126;
+/// The first scalar code past the machine's (0-127): see [`Reg`].
+pub const PARKED: u8 = 128;
 
 /// An SSA value: the content of one register dword (SCC: one bit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -254,6 +258,254 @@ fn spill_loads(
     Ok(out)
 }
 
+/// Scalar registers the compiler parked in lanes of a VGPR, as scalar moves.
+///
+/// When it runs out of SGPRs the console compiler saves one in a lane of a
+/// spare VGPR (`v_writelane_b32 vN, sX, K`) and takes it back later
+/// (`v_readlane_b32 sX, vN, K`). A VGPR whose every use in the program is one
+/// of those two forms with a constant lane is such a store: lane K of it is a
+/// scalar register by another name. Each (VGPR, lane) gets a register code
+/// from [`PARKED`] up, which no machine word can hold, and the save and the
+/// restore become `s_mov_b32` to and from it. Returns those moves (index in
+/// `list`, destination code, source code) in order, for `build_with` to put
+/// the codes into the decoded fields. They are then copies for every later
+/// stage: a parked descriptor is traced to its load, and nothing is left of a
+/// cross-lane operation, which a console wave run as two host waves could not
+/// do where not every lane runs.
+///
+/// A register pair parked in two neighbouring lanes of a wave64 program (a
+/// lane mask, a 64-bit address) moves as a pair (`s_mov_b64`) when every save
+/// and every restore of the two lanes come together, so a parked lane mask
+/// comes back as the mask it is; otherwise its halves come back as two
+/// scalars. The two halves of a save or a restore may be a few instructions
+/// apart (the compiler schedules other work between them).
+///
+/// Nothing changes when a lane is read that no instruction saves into (it
+/// would read what the hardware left in the VGPR), or when the codes run out.
+fn unspill(
+    list: &mut [Instruction],
+    leaders: &[usize],
+    wave64: bool,
+    lanes: u8,
+    vgprs: u16,
+) -> Vec<(usize, u8, u8)> {
+    /// `v_writelane_b32 vN, sX, K` / `v_readlane_b32 sX, vN, K`: (save, N, X, K).
+    /// The hardware takes the lane modulo the wave size.
+    fn parked(inst: &Instruction, fields: &Fields, wave: u32) -> Option<(bool, u8, u8, u32)> {
+        let Fields::Valu(v) = fields else { return None };
+        if v.abs != 0
+            || v.neg != 0
+            || v.opsel != 0
+            || v.clamp
+            || v.omod != 0
+            || v.sdwa.is_some()
+            || v.dpp.is_some()
+        {
+            return None;
+        }
+        let lane = |op: &Operand| match *op {
+            Operand::Const(c @ 128..=192) => Some((u32::from(c) - 128) % wave),
+            _ => None,
+        };
+        match (inst.name()?, v.dst?, v.src.as_slice()) {
+            (
+                "v_writelane_b32",
+                Operand::Vector { reg, dwords: 1 },
+                [Operand::Scalar { code, dwords: 1 }, k],
+            ) if *code < 105 => Some((true, reg, *code, lane(k)?)),
+            (
+                "v_readlane_b32",
+                Operand::Scalar { code, dwords: 1 },
+                [Operand::Vector { reg, dwords: 1 }, k],
+            ) if code < 105 => Some((false, *reg, code, lane(k)?)),
+            _ => None,
+        }
+    }
+    let wave = 32 * u32::from(lanes);
+    // VGPRs used by anything but parking, and per instruction its parking and
+    // the scalar codes it reads and writes.
+    let mut other = [false; 256];
+    let mut parks: Vec<Option<(bool, u8, u8, u32)>> = Vec::with_capacity(list.len());
+    let mut written: Vec<Vec<u8>> = Vec::with_capacity(list.len());
+    let mut read: Vec<Vec<u8>> = Vec::with_capacity(list.len());
+    for inst in list.iter() {
+        let Some(name) = inst.name() else {
+            return Vec::new();
+        };
+        let fields = inst.fields(wave64);
+        let park = parked(inst, &fields, wave);
+        let Ok(effects) = effects(inst, &fields, name, lanes, vgprs) else {
+            return Vec::new();
+        };
+        let (mut to, mut from) = (Vec::new(), Vec::new());
+        if let Some((reads, writes)) = effects {
+            to.extend(writes.iter().filter_map(|r| match *r {
+                Reg::S(c) => Some(c),
+                _ => None,
+            }));
+            from.extend(reads.iter().filter_map(|r| match *r {
+                Reg::S(c) => Some(c),
+                _ => None,
+            }));
+            // An M0-relative read (`v_movrels_b32`) names every VGPR from its
+            // base up; the compiler indexes a small array with it, never the
+            // lanes it parks scalars in, so it does not make those VGPRs
+            // ordinary ones. (Relative writes still do.)
+            let relative = name == "v_movrels_b32";
+            let vector_reads = reads.into_iter().filter(|_| !relative);
+            for reg in vector_reads.chain(writes) {
+                if let Reg::V(r) = reg
+                    && park.is_none_or(|p| p.1 != r)
+                {
+                    other[usize::from(r)] = true;
+                }
+            }
+        }
+        parks.push(park);
+        written.push(to);
+        read.push(from);
+    }
+    for park in &mut parks {
+        if park.is_some_and(|p| other[usize::from(p.1)]) {
+            *park = None;
+        }
+    }
+    let mut slots: Vec<(u8, u32)> = parks.iter().flatten().map(|p| (p.1, p.3)).collect();
+    slots.sort_unstable();
+    slots.dedup();
+    if slots.is_empty() {
+        return Vec::new();
+    }
+    // A lane read that nothing saves into holds what the hardware put there.
+    let saved = |slot: (u8, u32)| parks.iter().flatten().any(|p| p.0 && (p.1, p.3) == slot);
+    if !slots.iter().all(|&s| saved(s)) {
+        return Vec::new();
+    }
+    let leader = |i: usize| leaders.binary_search(&list[i].offset).is_ok();
+    // The instruction that completes the pair begun at `i`: the same kind of
+    // move of the next register and the next lane, later in the same block.
+    // A save is moved to the second half, so nothing between may write either
+    // register or touch the lanes. A restore is moved to the first, so nothing
+    // between may read or write the second register, write the first, or save
+    // into the lanes.
+    let partner = |i: usize| -> Option<usize> {
+        let (save, reg, code, lane) = parks[i]?;
+        let mut j = i + 1;
+        while j < list.len() && !leader(j) {
+            if parks[j] == Some((save, reg, code + 1, lane + 1)) {
+                return Some(j);
+            }
+            let lanes_touched = parks[j]
+                .is_some_and(|p| (save || p.0) && p.1 == reg && (p.3 == lane || p.3 == lane + 1));
+            if lanes_touched
+                || written[j].contains(&code)
+                || written[j].contains(&(code + 1))
+                || !save && read[j].contains(&(code + 1))
+            {
+                return None;
+            }
+            j += 1;
+        }
+        None
+    };
+    // Lane pairs (register, lower lane) whose every move comes as a pair. Only
+    // wave64 programs have them: a wave32 mask is one dword, and a pair move of
+    // it with its neighbour would hide it.
+    let mut pairs: Vec<(u8, u32)> = Vec::new();
+    for &(reg, lane) in &slots {
+        if !wave64
+            || pairs.iter().any(|&(r, l)| r == reg && l + 1 == lane)
+            || !slots.contains(&(reg, lane + 1))
+        {
+            continue;
+        }
+        let at = |l: u32| move |p: &(bool, u8, u8, u32)| (p.1, p.3) == (reg, l);
+        let lower: Vec<usize> = (0..list.len())
+            .filter(|&i| parks[i].as_ref().is_some_and(at(lane)))
+            .collect();
+        let upper = parks.iter().flatten().filter(|p| at(lane + 1)(p)).count();
+        let partners: Option<Vec<usize>> = lower.iter().map(|&i| partner(i)).collect();
+        if let Some(mut partners) = partners {
+            partners.sort_unstable();
+            partners.dedup();
+            if partners.len() == lower.len() && upper == lower.len() {
+                pairs.push((reg, lane));
+            }
+        }
+    }
+    // Codes for the parked scalars, from `PARKED` up to 254 (255 stays unused
+    // so that the code after a parked one always exists).
+    let mut next = usize::from(PARKED);
+    let mut codes: Vec<((u8, u32), u8)> = Vec::new();
+    for &(reg, lane) in &pairs {
+        if next + 1 > 254 {
+            return Vec::new();
+        }
+        codes.push(((reg, lane), next as u8));
+        codes.push(((reg, lane + 1), next as u8 + 1));
+        next += 2;
+    }
+    for &slot in &slots {
+        if codes.iter().any(|c| c.0 == slot) {
+            continue;
+        }
+        if next > 254 {
+            return Vec::new();
+        }
+        codes.push((slot, next as u8));
+        next += 1;
+    }
+    let code_of = |reg: u8, lane: u32| codes.iter().find(|c| c.0 == (reg, lane)).map(|c| c.1);
+    /// What becomes of a parking instruction: a move (pair, destination,
+    /// source), or `None` when the other half of its pair does the move.
+    type Edit = Option<(bool, u8, u8)>;
+    let mut edits: Vec<(usize, Edit)> = Vec::new();
+    for (i, park) in parks.iter().enumerate() {
+        let Some((save, reg, code, lane)) = *park else {
+            continue;
+        };
+        let Some(slot) = code_of(reg, lane) else {
+            return Vec::new();
+        };
+        let (dst, src) = if save { (slot, code) } else { (code, slot) };
+        if pairs.contains(&(reg, lane)) {
+            let Some(j) = partner(i) else {
+                return Vec::new();
+            };
+            // A save moves the pair where its second half is saved; a
+            // restore where its first half is restored.
+            let (at, gone) = if save { (j, i) } else { (i, j) };
+            edits.push((at, Some((true, dst, src))));
+            edits.push((gone, None));
+        } else if lane == 0 || !pairs.contains(&(reg, lane - 1)) {
+            edits.push((i, Some((false, dst, src))));
+        }
+        // else: the upper half of a pair, moved with the lower.
+    }
+    // `s_mov_b32` / `s_mov_b64 s0, s0` (SOP1, opcodes 3 and 4) and `s_nop 0`:
+    // the parked codes do not fit the word and are put into the fields.
+    let mut moves = Vec::new();
+    for (i, edit) in edits {
+        let word = match edit {
+            Some((wide, dst, src)) => {
+                moves.push((i, dst, src));
+                0xBE80_0000 | (3 + u32::from(wide)) << 8
+            }
+            None => 0xBF80_0000,
+        };
+        let mut bytes = word.to_le_bytes().to_vec();
+        bytes.extend(0xBF81_0000u32.to_le_bytes()); // s_endpgm
+        let Ok(mut one) = gfx10::decode(&bytes) else {
+            return Vec::new();
+        };
+        let mut one = one.remove(0);
+        one.offset = list[i].offset;
+        list[i] = one;
+    }
+    moves.sort_unstable();
+    moves
+}
+
 /// Decodes `code` and builds its SSA form; `vgprs` is the program's VGPR
 /// count. Fails on instructions the IR cannot express yet
 /// ([`ShaderError::Unsupported`]).
@@ -295,6 +547,7 @@ pub fn build_with(
     }
     leaders.sort_unstable();
     leaders.dedup();
+    let parked = unspill(&mut list, &leaders, wave64, lanes, vgprs);
     // When the first instruction is a loop header, give SSA a separate
     // entry edge to carry the initial register values into its phis.
     let preheader = usize::from(
@@ -334,13 +587,25 @@ pub fn build_with(
     let next_offsets: Vec<Option<usize>> = (0..list.len())
         .map(|i| list.get(i + 1).map(|n| n.offset))
         .collect();
-    for ((machine, flow), next) in list.into_iter().zip(flows).zip(next_offsets) {
+    for (n, ((machine, flow), next)) in list.into_iter().zip(flows).zip(next_offsets).enumerate() {
         let b = leaders.partition_point(|&l| l <= machine.offset) - 1 + preheader;
         let name = machine.name().ok_or(ShaderError::Unsupported {
             offset: machine.offset,
             what: "unknown opcode",
         })?;
-        let fields = machine.fields(wave64);
+        let mut fields = machine.fields(wave64);
+        // A move to or from a scalar parked in a VGPR lane (`unspill`): its
+        // codes are ones the machine word cannot hold.
+        if let Ok(k) = parked.binary_search_by_key(&n, |m| m.0)
+            && let Fields::Sop {
+                dst: Some(Operand::Scalar { code: to, .. }),
+                src,
+                ..
+            } = &mut fields
+            && let Some(Operand::Scalar { code: from, .. }) = src.first_mut()
+        {
+            (*to, *from) = (parked[k].1, parked[k].2);
+        }
         let fallthrough = || block_at(next.ok_or(isa(machine.offset, "falls off the code"))?);
         // A conditional SOPP branch to fallthrough has no register effects
         // and contributes one edge to the join. Calls also use Flow::Branch
@@ -496,22 +761,23 @@ pub(crate) fn thread_edges(
 /// Placeholder before renaming.
 const NONE: Value = Value(u32::MAX);
 /// SGPR codes 0-127, SCC, VGPRs 0-255.
-const REGS: usize = 128 + 1 + 256;
+/// Scalar codes 0-255 (from [`PARKED`] up: parked scalars), SCC, VGPRs 0-255.
+const REGS: usize = 256 + 1 + 256;
 type RegSet = [u64; REGS.div_ceil(64)];
 
 fn index(reg: Reg) -> usize {
     match reg {
         Reg::S(c) => usize::from(c),
-        Reg::Scc => 128,
-        Reg::V(r) => 129 + usize::from(r),
+        Reg::Scc => 256,
+        Reg::V(r) => 257 + usize::from(r),
     }
 }
 
 fn reg_at(i: usize) -> Reg {
     match i {
-        0..128 => Reg::S(i as u8),
-        128 => Reg::Scc,
-        _ => Reg::V((i - 129) as u8),
+        0..256 => Reg::S(i as u8),
+        256 => Reg::Scc,
+        _ => Reg::V((i - 257) as u8),
     }
 }
 
@@ -1255,10 +1521,13 @@ fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<Reg>) -> Result<(), ()> {
         Operand::Scalar { code, .. } if code == gfx10::NULL => {}
         Operand::Scalar { code, dwords } => {
             let end = u16::from(code) + u16::from(dwords);
-            if end > 128 {
+            // A machine operand ends within the machine's codes, a parked
+            // scalar (`unspill`) within those past them.
+            let limit = if code < PARKED { 128 } else { 256 };
+            if end > limit {
                 return Err(());
             }
-            out.extend((code..end as u8).map(Reg::S));
+            out.extend((u16::from(code)..end).map(|c| Reg::S(c as u8)));
         }
         Operand::Vector { reg, dwords } => {
             if u16::from(reg) + u16::from(dwords) > 256 {
@@ -1968,5 +2237,157 @@ mod tests {
         assert_eq!(header.insts[0].read(Reg::S(2)), Some(lp_s2));
         assert_eq!(exit.insts[0].read(Reg::S(1)), Some(next_s1));
         assert_eq!(exit.insts[0].read(Reg::S(2)), Some(lp_s2));
+    }
+
+    /// `v_writelane_b32 v{vgpr}, s{sgpr}, lane` (VOP3).
+    fn writelane(vgpr: u32, sgpr: u32, lane: u32) -> [u32; 2] {
+        [0xD761_0000 | vgpr, sgpr | (0x80 + lane) << 9]
+    }
+
+    /// `v_readlane_b32 s{sgpr}, v{vgpr}, lane` (VOP3).
+    fn readlane(sgpr: u32, vgpr: u32, lane: u32) -> [u32; 2] {
+        [0xD760_0000 | sgpr, (256 + vgpr) | (0x80 + lane) << 9]
+    }
+
+    /// `s_mov_b32 s{dst}, src` (`src`: a scalar or inline constant code).
+    fn s_mov(dst: u32, src: u32) -> u32 {
+        0xBE80_0300 | dst << 16 | src
+    }
+
+    fn insts(p: &Program) -> Vec<&Inst> {
+        p.blocks.iter().flat_map(|b| &b.insts).collect()
+    }
+
+    fn lane_ops(p: &Program) -> usize {
+        insts(p)
+            .iter()
+            .filter(|i| matches!(i.name(), "v_readlane_b32" | "v_writelane_b32"))
+            .count()
+    }
+
+    fn unparked(words: &[u32], wave64: bool) -> Program {
+        let p = build_words(words, wave64);
+        assert_eq!(lane_ops(&p), 0, "parking left in {:#?}", insts(&p));
+        p
+    }
+
+    /// The value `reg` holds after the instruction that writes it last.
+    fn last_write(p: &Program, reg: Reg) -> Value {
+        insts(p)
+            .iter()
+            .rev()
+            .find_map(|i| i.write(reg))
+            .expect("written")
+    }
+
+    /// A scalar saved in a VGPR lane and taken back into another register is
+    /// a copy of the value saved.
+    #[test]
+    fn parked_scalar_is_a_copy() {
+        let mut w = vec![s_mov(3, 0x85)]; // s3 = 5
+        w.extend(writelane(5, 3, 2));
+        w.push(s_mov(3, 0x87)); // s3 = 7
+        w.extend(readlane(4, 5, 2));
+        w.push(S_ENDPGM);
+        let p = unparked(&w, false);
+        let five = insts(&p)[0].write(Reg::S(3)).unwrap();
+        let save = insts(&p)
+            .into_iter()
+            .find(|i| i.write(Reg::S(PARKED)).is_some())
+            .unwrap();
+        assert_eq!(save.read(Reg::S(3)), Some(five));
+        let restore = insts(&p)
+            .into_iter()
+            .find(|i| i.write(Reg::S(4)).is_some())
+            .unwrap();
+        assert_eq!(restore.name(), "s_mov_b32");
+        assert_eq!(restore.read(Reg::S(PARKED)), save.write(Reg::S(PARKED)));
+    }
+
+    /// A wave64 register pair parked in neighbouring lanes comes back as a
+    /// pair, also when other work is scheduled between the two restores.
+    #[test]
+    fn parked_pair_restored_apart_is_a_pair() {
+        let mut w = vec![s_mov(6, 0x81), s_mov(7, 0x82)];
+        w.extend(writelane(5, 6, 0));
+        w.push(s_mov(10, 0x83)); // other work between the saves
+        w.extend(writelane(5, 7, 1));
+        w.extend([s_mov(6, 0x80), s_mov(7, 0x80)]);
+        w.extend(readlane(6, 5, 0));
+        w.push(s_mov(9, 0x83)); // other work between the restores
+        w.extend(readlane(7, 5, 1));
+        w.push(S_ENDPGM);
+        let p = unparked(&w, true);
+        let wide: Vec<_> = insts(&p)
+            .into_iter()
+            .filter(|i| i.name() == "s_mov_b64")
+            .collect();
+        assert_eq!(wide.len(), 2, "{wide:#?}");
+        let (save, restore) = (wide[0], wide[1]);
+        assert!(save.write(Reg::S(PARKED)).is_some() && save.write(Reg::S(PARKED + 1)).is_some());
+        for k in 0..2 {
+            assert_eq!(
+                restore.read(Reg::S(PARKED + k)),
+                save.write(Reg::S(PARKED + k))
+            );
+        }
+        // Both halves hold the values saved, 1 and 2.
+        assert_eq!(save.read(Reg::S(6)), insts(&p)[0].write(Reg::S(6)));
+        assert_eq!(save.read(Reg::S(7)), insts(&p)[1].write(Reg::S(7)));
+        assert_eq!(last_write(&p, Reg::S(6)), restore.write(Reg::S(6)).unwrap());
+        assert_eq!(last_write(&p, Reg::S(7)), restore.write(Reg::S(7)).unwrap());
+    }
+
+    /// A read of the second register between the two restores would see the
+    /// restored value too early: the halves come back one by one.
+    #[test]
+    fn parked_pair_with_a_read_between_restores_is_two_scalars() {
+        let mut w = vec![s_mov(6, 0x81), s_mov(7, 0x82)];
+        w.extend(writelane(5, 6, 0));
+        w.extend(writelane(5, 7, 1));
+        w.push(s_mov(7, 0x80));
+        w.extend(readlane(6, 5, 0));
+        w.push(s_mov(9, 7)); // s9 = s7: still 0 here
+        w.extend(readlane(7, 5, 1));
+        w.push(S_ENDPGM);
+        let p = unparked(&w, true);
+        assert!(!insts(&p).iter().any(|i| i.name() == "s_mov_b64"));
+        // s6 = 1, s7 = 2, two saves, s7 = 0, the restore of s6, then the copy.
+        let zero = insts(&p)[4];
+        assert_eq!(zero.name(), "s_mov_b32");
+        let copy = insts(&p)
+            .into_iter()
+            .find(|i| i.write(Reg::S(9)).is_some())
+            .unwrap();
+        assert_eq!(copy.read(Reg::S(7)), zero.write(Reg::S(7)));
+    }
+
+    /// An M0-relative read names the parking VGPR without using it.
+    #[test]
+    fn relative_read_keeps_parking() {
+        let mut w = vec![s_mov(3, 0x85)];
+        w.extend(writelane(5, 3, 2));
+        w.push(0x7E00_8704); // v_movrels_b32 v0, v4: v0 = v[4 + m0]
+        w.extend(readlane(4, 5, 2));
+        w.push(S_ENDPGM);
+        unparked(&w, false);
+    }
+
+    /// A VGPR with other uses, or a lane read that nothing saves into, is
+    /// left as it is.
+    #[test]
+    fn parking_needs_a_spare_vgpr_and_a_save() {
+        let mut w = vec![s_mov(3, 0x85)];
+        w.extend(writelane(5, 3, 2));
+        w.push(0x7E0C_0305); // v_mov_b32 v6, v5
+        w.extend(readlane(4, 5, 2));
+        w.push(S_ENDPGM);
+        assert_eq!(lane_ops(&build_words(&w, false)), 2);
+
+        let mut w = vec![s_mov(3, 0x85)];
+        w.extend(writelane(5, 3, 2));
+        w.extend(readlane(4, 5, 3));
+        w.push(S_ENDPGM);
+        assert_eq!(lane_ops(&build_words(&w, false)), 2);
     }
 }
