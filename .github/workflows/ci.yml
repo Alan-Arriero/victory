@@ -1,18 +1,18 @@
 name: CI
 
+# Not on description edits: those run `pr-description.yml` alone. A run of
+# this workflow on an edit would post its code checks again, skipped, which
+# GitHub counts as passed over an earlier failure on the same revision.
 on:
   pull_request:
-    types: [opened, edited, reopened, synchronize]
   push:
     branches: [main]
 
 permissions:
   contents: read
 
-# A description edit runs only `pr-description`, in a group of its own, so
-# it never cancels the code jobs of the same pull request.
 concurrency:
-  group: ci-${{ github.ref }}-${{ github.event.action == 'edited' && 'edited' || 'code' }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -21,7 +21,6 @@ env:
 jobs:
   fmt-policy:
     name: fmt-policy
-    if: github.event.action != 'edited'
     # rustfmt does not compile code, so a Linux runner can check the
     # Windows-only crates.
     runs-on: ubuntu-latest
@@ -39,34 +38,8 @@ jobs:
       - name: Asset policy
         run: cargo xtask policy
 
-  pr-description:
-    name: pr-description
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      # The body comes from the event file, not from an expression in the
-      # script, so text in the body cannot run as a command.
-      - name: Check the template sections
-        run: |
-          jq -r '.pull_request.body // ""' "$GITHUB_EVENT_PATH" \
-            | tr -d '\r' \
-            | perl -0pe 's/<!--.*?-->//gs' > body.md
-          fail=0
-          for section in What Tested; do
-            text=$(awk -v s="$section" '
-              $0 ~ "^## " s "[[:space:]]*$" { on = 1; next }
-              /^## / { on = 0 }
-              on' body.md | tr -d '[:space:]')
-            if [ -z "$text" ]; then
-              echo "::error::The PR description has no text under \"## $section\". Use the template in .github/pull_request_template.md."
-              fail=1
-            fi
-          done
-          exit $fail
-
   check:
     name: check
-    if: github.event.action != 'edited'
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -86,7 +59,6 @@ jobs:
   # Windows-only code reaching them.
   linux:
     name: linux
-    if: github.event.action != 'edited'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
