@@ -188,6 +188,7 @@ impl Timeline {
                     }
                 }
                 Op::WaitMemory(wait, deadline) => {
+                    let was_registered = deadline.is_some();
                     if !wait.satisfied() {
                         let deadline = deadline.unwrap_or_else(|| {
                             Instant::now() + crate::fence::memory_wait_timeout()
@@ -225,6 +226,9 @@ impl Timeline {
                                 "GPU memory wait timed out; continuing (fail-open)"
                             );
                         }
+                    }
+                    if was_registered {
+                        crate::fence::cancel_memory_wait(self);
                     }
                 }
                 Op::Run(work) => {
@@ -380,5 +384,42 @@ mod tests {
         // Freed (unmapped) address must also resolve cleanly without faulting.
         assert!(wait32.satisfied());
         assert!(wait64.satisfied());
+    }
+
+    #[test]
+    fn consuming_satisfied_memory_wait_unregisters_waiter_before_post_wait_work() {
+        let timeline = Arc::new(Timeline::default());
+        let cell = AtomicU32::new(0);
+        let wait = MemoryWait {
+            address: (&raw const cell) as u64,
+            reference: 1,
+            mask: u32::MAX,
+            width: 4,
+            comparison: 3,
+        };
+        timeline.submit(Op::WaitMemory(
+            wait,
+            Some(Instant::now() + Duration::from_secs(5)),
+        ));
+        assert!(crate::fence::has_memory_waiter(&timeline));
+
+        // Satisfy on the CPU and immediately submit post-wait work so
+        // `Timeline::submit` consumes the wait directly (without waiting for
+        // the background watcher scan).
+        cell.store(1, Ordering::Release);
+        let tl_check = timeline.clone();
+        let saw_registered = Arc::new(AtomicBool::new(true));
+        let saw_registered_work = saw_registered.clone();
+        timeline.submit(Op::Run(Box::new(move || {
+            saw_registered_work.store(
+                crate::fence::has_memory_waiter(&tl_check),
+                Ordering::Release,
+            );
+        })));
+        assert!(
+            !saw_registered.load(Ordering::Acquire),
+            "MEMORY_WAITERS entry must be unregistered before post-wait work runs"
+        );
+        assert!(!crate::fence::has_memory_waiter(&timeline));
     }
 }

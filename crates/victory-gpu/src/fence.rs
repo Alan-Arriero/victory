@@ -157,10 +157,11 @@ pub(crate) fn wait_memory(
     timeline: &Arc<Timeline>,
 ) -> bool {
     let mut waiters = MEMORY_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
+    let weak = Arc::downgrade(timeline);
     if wait.satisfied() || Instant::now() >= deadline {
+        waiters.retain(|(_, _, t)| !t.ptr_eq(&weak));
         return true;
     }
-    let weak = Arc::downgrade(timeline);
     if let Some(existing) = waiters.iter_mut().find(|(_, _, t)| t.ptr_eq(&weak)) {
         existing.0 = wait;
         existing.1 = deadline;
@@ -170,6 +171,28 @@ pub(crate) fn wait_memory(
     drop(waiters);
     watch_notify();
     false
+}
+
+/// Unregisters any pending GPU memory wait for `timeline`.
+///
+/// Called whenever `Timeline::run` consumes an `Op::WaitMemory` without
+/// re-queueing it (for example after `Timeline::submit` sees a CPU write or
+/// deadline expiry before the watcher scans), so `scan_memory_waiters` cannot
+/// later read a retired address after post-wait work reports completion.
+pub(crate) fn cancel_memory_wait(timeline: &Arc<Timeline>) {
+    let weak = Arc::downgrade(timeline);
+    let mut waiters = MEMORY_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
+    waiters.retain(|(_, _, t)| !t.ptr_eq(&weak));
+}
+
+#[cfg(test)]
+pub(crate) fn has_memory_waiter(timeline: &Arc<Timeline>) -> bool {
+    let weak = Arc::downgrade(timeline);
+    MEMORY_WAITERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|(_, _, t)| t.ptr_eq(&weak))
 }
 
 /// Checks pending GPU memory waits, waking any live timeline whose condition is
