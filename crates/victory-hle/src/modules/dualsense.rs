@@ -164,7 +164,7 @@ fn read_reports(pad: &Pad) {
 /// Opens the first PlayStation pad and keeps its HID description.
 fn open_pad() -> Option<Pad> {
     for path in device_paths() {
-        // SAFETY: a path from SetupAPI, opened for reading only.
+        // SAFETY: a NUL-terminated path from SetupAPI, opened for reading only.
         let handle = unsafe {
             CreateFileW(
                 path.as_ptr(),
@@ -264,10 +264,12 @@ fn device_paths() -> Vec<Vec<u16>> {
                 std::ptr::null_mut(),
             )
         };
-        if required == 0 {
+        let size = required as usize;
+        if size < std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() {
             continue;
         }
-        let mut buffer = vec![0u8; required as usize];
+        // Align the allocation for the fixed header as well as the UTF-16 tail.
+        let mut buffer = vec![0u32; size.div_ceil(std::mem::size_of::<u32>())];
         let detail = buffer
             .as_mut_ptr()
             .cast::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>();
@@ -286,20 +288,28 @@ fn device_paths() -> Vec<Vec<u16>> {
                 continue;
             }
         }
-        // The path starts after the u32 cbSize, as UTF-16.
-        // SAFETY: the API wrote the path at this offset in our buffer.
-        let path = unsafe { buffer.as_ptr().add(4).cast::<u16>() };
-        let mut len = 0usize;
-        // SAFETY: the API wrote a NUL-terminated path into the buffer.
-        while unsafe { *path.add(len) } != 0 {
-            len += 1;
+        let offset = std::mem::offset_of!(SP_DEVICE_INTERFACE_DETAIL_DATA_W, DevicePath);
+        // SAFETY: DevicePath is aligned for u16 and the slice is bounded by
+        // the byte count passed to SetupAPI, within the initialized buffer.
+        let path = unsafe {
+            std::slice::from_raw_parts(
+                buffer.as_ptr().cast::<u8>().add(offset).cast::<u16>(),
+                (size - offset) / std::mem::size_of::<u16>(),
+            )
+        };
+        if let Some(path) = terminated_path(path) {
+            paths.push(path.to_vec());
         }
-        // SAFETY: `path` is valid for `len` u16s in the live buffer.
-        paths.push(unsafe { std::slice::from_raw_parts(path, len) }.to_vec());
     }
     // SAFETY: the set is ours.
     unsafe { SetupDiDestroyDeviceInfoList(set) };
     paths
+}
+
+/// Keep the terminator required by CreateFileW with each returned path.
+fn terminated_path(path: &[u16]) -> Option<&[u16]> {
+    let end = path.iter().position(|&unit| unit == 0)?;
+    (end != 0).then_some(&path[..=end])
 }
 
 /// A declared usage's value in `report`, if the descriptor has it.
@@ -494,6 +504,13 @@ mod tests {
         assert!(!is_playstation_pad(SONY, 0x0ce7)); // another Sony device
     }
 
+    #[test]
+    fn device_path_keeps_the_terminator_and_rejects_malformed_data() {
+        assert_eq!(terminated_path(&[65, 66, 0, 67]), Some(&[65, 66, 0][..]));
+        assert_eq!(terminated_path(&[65, 66]), None);
+        assert_eq!(terminated_path(&[0]), None);
+    }
+
     /// Not part of the suite: prints what the HID scan sees on this machine.
     /// `cargo test -p victory-hle --lib dualsense -- --ignored --nocapture`
     #[test]
@@ -502,6 +519,7 @@ mod tests {
         let paths = device_paths();
         println!("hid interfaces: {}", paths.len());
         for path in &paths {
+            let path = path.strip_suffix(&[0]).unwrap_or(path);
             println!("  {}", String::from_utf16_lossy(path));
         }
         match open_pad() {
