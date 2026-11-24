@@ -16,6 +16,16 @@ use crate::{io, ir, resource, structure};
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
 /// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
 fn build(words: &[u32], buffers: bool) -> HostShader {
+    let (shader, lowered) = build_any(words, buffers);
+    // One access with each lane's own heap index, no wave operation.
+    assert_eq!(lowered.nonuniform_handles, 1);
+    assert!(!lowered.wave_ops);
+    shader
+}
+
+/// [`build`] without its checks: the shader (validated by `dxil.dll` when
+/// present) and what lowering reported.
+fn build_any(words: &[u32], buffers: bool) -> (HostShader, lower::Lowered) {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -71,17 +81,14 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         mesh_stride: 0,
     })
     .expect("lower");
-    // One access with each lane's own heap index, no wave operation.
-    assert_eq!(lowered.nonuniform_handles, 1);
-    assert!(!lowered.wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
-        dxil: lowered.dxil,
-        user_data: lowered.user_data,
-        samplers: lowered.samplers,
+        dxil: lowered.dxil.clone(),
+        user_data: lowered.user_data.clone(),
+        samplers: lowered.samplers.clone(),
         static_samplers: Vec::new(),
-        root_cbvs: lowered.root_cbvs,
-        root_srvs: lowered.root_srvs,
+        root_cbvs: lowered.root_cbvs.clone(),
+        root_srvs: lowered.root_srvs.clone(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -89,7 +96,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     } else {
         eprintln!("no dxil.dll; validation skipped");
     }
-    shader
+    (shader, lowered)
 }
 
 /// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
@@ -288,5 +295,99 @@ fn lanes_sample_their_arm_after_a_redundant_masked_write() {
     let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
     for (label, red) in results {
         assert_eq!(red, want, "{label}");
+    }
+}
+
+/// `image_gather4_l` at (0.375, 0.375) of a 4x4 texture whose red is
+/// 10 * y + x, level 2.0 (the view has one level: clamped to level 0). Lanes
+/// 0-7 store the four results at dwords 4 * lane...
+const GATHER4_L_WAVE32: &[u32] = &[
+    0xBE84_0300, // s_mov_b32 s4, s0
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xBE86_0301, // s_mov_b32 s6, s1
+    0xBE87_0380, // s_mov_b32 s7, 0
+    0xF40C_0302,
+    0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+    0xF408_0203,
+    0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+    0xF408_0A02,
+    0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+    0x3620_0087, // v_and_b32 v16, 7, v0
+    0x3420_2084, // v_lshlrev_b32 v16, 4, v16
+    0x7E04_02FF,
+    0x3EC0_0000, // v_mov_b32 v2, 0.375
+    0x7E06_02FF,
+    0x3EC0_0000, // v_mov_b32 v3, 0.375
+    0x7E08_02FF,
+    0x4000_0000, // v_mov_b32 v4, 2.0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF110_0108,
+    0x0043_0C02, // image_gather4_l v[12:15], v[2:4], s[12:19], s[8:11] dmask:0x1 dim:SQ_RSRC_IMG_2D
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE070_1000,
+    0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+    0xE070_1004,
+    0x800A_0D10, // buffer_store_dword v13, v16, s[40:43], 0 offen offset:4
+    0xE070_1008,
+    0x800A_0E10, // buffer_store_dword v14, v16, s[40:43], 0 offen offset:8
+    0xE070_100C,
+    0x800A_0F10, // buffer_store_dword v15, v16, s[40:43], 0 offen offset:12
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn gather4_with_a_level_returns_the_four_texels_of_that_level_in_gather_order() {
+    let (shader, _) = build_any(GATHER4_L_WAVE32, false);
+    let texels: Vec<[f32; 4]> = (0..16)
+        .map(|i| [(10 * (i / 4) + i % 4) as f32, 0.0, 0.0, 1.0])
+        .collect();
+    let views = [
+        View::Texture(4, 4, &texels),
+        View::Texture(4, 4, &texels),
+        View::RawUav(32),
+    ];
+    let results = run(&shader, &views);
+    assert!(!results.is_empty());
+    for (label, words) in results {
+        let got: Vec<f32> = words.into_iter().map(f32::from_bits).collect();
+        // u * 4 - 0.5 = 1: texels (1, 2), (2, 2), (2, 1), (1, 1).
+        let want: Vec<f32> = (0..32).map(|i| [21.0, 22.0, 12.0, 11.0][i % 4]).collect();
+        assert_eq!(got, want, "{label}");
+    }
+}
+
+#[test]
+fn gather4_with_a_level_far_outside_the_view_reads_the_nearest_edge() {
+    let texels: Vec<[f32; 4]> = (0..16)
+        .map(|i| [(10 * (i / 4) + i % 4) as f32, 0.0, 0.0, 1.0])
+        .collect();
+    // (u, v) and the texel (10 * y + x) all four of the footprint clamp to.
+    // u * 4 above i32 (or infinite) must give the last column, not wrap
+    // to the first when the footprint's second column is added; far below,
+    // the first; NaN, the first.
+    let cases = [
+        (1e9, -1e9, 3.0),
+        (-1e9, 1e9, 30.0),
+        (f32::INFINITY, f32::NEG_INFINITY, 3.0),
+        (f32::NAN, f32::INFINITY, 30.0),
+    ];
+    for (u, v, texel) in cases {
+        let mut words = GATHER4_L_WAVE32.to_vec();
+        // The literals of `v_mov_b32 v2, u` and `v_mov_b32 v3, v`.
+        assert_eq!((words[12], words[14]), (0x7E04_02FF, 0x7E06_02FF));
+        words[13] = f32::to_bits(u);
+        words[15] = f32::to_bits(v);
+        let (shader, _) = build_any(&words, false);
+        let views = [
+            View::Texture(4, 4, &texels),
+            View::Texture(4, 4, &texels),
+            View::RawUav(32),
+        ];
+        let results = run(&shader, &views);
+        assert!(!results.is_empty());
+        for (label, words) in results {
+            let got: Vec<f32> = words.into_iter().map(f32::from_bits).collect();
+            assert_eq!(got, vec![texel; 32], "{label}: ({u}, {v})");
+        }
     }
 }

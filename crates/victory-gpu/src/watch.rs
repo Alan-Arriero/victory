@@ -200,9 +200,9 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
-/// before the caller copies them. `None` if the memory is not a view.
+/// before the caller copies them. `None` if the range contains no mapped view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
-    if !mapped(start) {
+    if !has_mapped(start, end) {
         return None;
     }
     install();
@@ -227,6 +227,45 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
     }
     Some(written)
+}
+
+/// Whether `[start, end)` contains a mapped view and no committed non-view
+/// memory. Checks `start` first via [`mapped`] (fast path); when `start` is
+/// not a view (e.g. an unmapped placeholder/hole inside a view pool), walks
+/// `VirtualQuery` across `[start, end)` and rejects the range if any
+/// committed non-view region is present so private/image memory is never
+/// read-protected.
+fn has_mapped(start: usize, end: usize) -> bool {
+    if mapped(start) {
+        return true;
+    }
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    let mut at = start;
+    let mut found_mapped = false;
+    while at < end {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: queries virtual memory metadata without dereferencing `at`.
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0
+            || info.RegionSize == 0
+        {
+            break;
+        }
+        if info.Type == MEM_MAPPED {
+            found_mapped = true;
+        } else if info.State == MEM_COMMIT {
+            return false;
+        }
+        let Some(next) = (info.BaseAddress as usize).checked_add(info.RegionSize) else {
+            break;
+        };
+        if next <= at {
+            break;
+        }
+        at = next;
+    }
+    found_mapped
 }
 
 /// Whether the current allocation at `at` is a mapped view. Asking only for
@@ -644,6 +683,114 @@ mod tests {
             )
         };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    /// A range that begins on an unmapped reserved hole before a mapped view
+    /// is still guarded, whereas a range starting in committed private memory
+    /// before a mapped view is rejected so private pages are never
+    /// read-protected.
+    #[test]
+    fn guard_handles_unmapped_prefix_and_rejects_committed_private_prefix() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFileEx,
+            PAGE_NOACCESS, UnmapViewOfFile,
+        };
+        // SAFETY: create a 1-block pagefile section.
+        let section = unsafe {
+            CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+
+        // Deterministically place an unmapped reserved block immediately before
+        // a mapped view: reserve 2 blocks, release, then re-reserve block 0 and
+        // map the view at block 1.
+        let mut pair = None;
+        for _ in 0..16 {
+            // SAFETY: probe for a free 2-block-aligned address range.
+            let probe =
+                unsafe { VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE, PAGE_NOACCESS) }
+                    as usize;
+            assert_ne!(probe, 0);
+            // SAFETY: freeing the probe we just reserved.
+            assert_ne!(unsafe { VirtualFree(probe as *mut _, 0, MEM_RELEASE) }, 0);
+            // SAFETY: reserve block 0 as an unmapped placeholder.
+            let prefix =
+                unsafe { VirtualAlloc(probe as *const _, BLOCK, MEM_RESERVE, PAGE_NOACCESS) }
+                    as usize;
+            if prefix != probe {
+                if prefix != 0 {
+                    // SAFETY: freeing our reservation.
+                    unsafe { VirtualFree(prefix as *mut _, 0, MEM_RELEASE) };
+                }
+                continue;
+            }
+            // SAFETY: map the 1-block section immediately after the reserved prefix.
+            let view = unsafe {
+                MapViewOfFileEx(
+                    section,
+                    FILE_MAP_WRITE,
+                    0,
+                    0,
+                    BLOCK,
+                    (probe + BLOCK) as *const _,
+                )
+                .Value as usize
+            };
+            if view == probe + BLOCK {
+                pair = Some((prefix, view));
+                break;
+            }
+            if view != 0 {
+                // SAFETY: unmapping our view.
+                unsafe {
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: view as *mut _,
+                    });
+                }
+            }
+            // SAFETY: freeing our prefix reservation.
+            unsafe { VirtualFree(prefix as *mut _, 0, MEM_RELEASE) };
+        }
+        let (prefix, view) = pair.expect("reserve prefix block immediately before mapped view");
+
+        // 1. Unmapped reserved prefix + mapped view: must stay guarded.
+        assert!(!mapped(prefix));
+        assert!(
+            guard(prefix, view + BLOCK).is_some(),
+            "range spanning an unmapped reserved prefix into a mapped view must stay guarded"
+        );
+        // SAFETY: writing inside our mapped read-write view.
+        unsafe { (view as *mut u8).write(42) };
+        let written = guard(prefix, view + BLOCK).expect("still guarded");
+        assert!(written.contains(&(view / PAGE)));
+
+        // 2. Committed private prefix + mapped view: must NOT read-protect private memory.
+        // SAFETY: committing our reserved prefix block as private read-write memory.
+        let committed =
+            unsafe { VirtualAlloc(prefix as *const _, BLOCK, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!committed.is_null());
+        assert!(
+            guard(prefix, view + BLOCK).is_none(),
+            "range containing committed private memory must not be read-protected by guard"
+        );
+        // SAFETY: writing to the committed private block must still succeed without faulting.
+        unsafe { (prefix as *mut u8).write(99) };
+
+        // SAFETY: clean up our view and prefix reservation.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            });
+            VirtualFree(prefix as *mut _, 0, MEM_RELEASE);
+        }
+        title_memory_remapped(view, BLOCK);
     }
 
     /// A write or mapping that runs past the end of the address space (a
