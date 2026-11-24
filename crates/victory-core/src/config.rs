@@ -926,7 +926,10 @@ mod tests {
         let home = PathBuf::from(abs("home"));
         let h = Some(home.as_path());
         assert_eq!(expand_home("~".into(), h), home);
-        assert_eq!(expand_home("~/games/title".into(), h), home.join("games/title"));
+        assert_eq!(
+            expand_home("~/games/title".into(), h),
+            home.join("games/title")
+        );
         // Only a whole leading `~` component counts.
         assert_eq!(expand_home("~user/x".into(), h), PathBuf::from("~user/x"));
         assert_eq!(expand_home("a/~/b".into(), h), PathBuf::from("a/~/b"));
@@ -1081,7 +1084,8 @@ mod tests {
         let env = |k: &str| (k == "VICTORY_CONFIG").then(|| OsString::from("'victory.toml'"));
         let err = explicit_config(env, None).unwrap_err().to_string();
         assert!(err.contains("VICTORY_CONFIG"), "{err}");
-        let parsed: FileConfig = toml::from_str("[paths]\ngame_dir = '\"/games/title\"'\n").unwrap();
+        let parsed: FileConfig =
+            toml::from_str("[paths]\ngame_dir = '\"/games/title\"'\n").unwrap();
         let err = parsed
             .anchored_at(Path::new("/configs"), None)
             .unwrap_err()
