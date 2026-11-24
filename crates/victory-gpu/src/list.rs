@@ -924,13 +924,17 @@ unsafe fn valid_discard_region(
 
 #[cfg(any(windows, test))]
 fn discard_state_allowed(state: u32, flags: u32) -> bool {
-    let required_flag = match state {
-        0x4 => 0x1,  // RENDER_TARGET
-        0x10 => 0x2, // DEPTH_WRITE / ALLOW_DEPTH_STENCIL
-        0x8 => 0x4,  // UNORDERED_ACCESS
-        _ => return false,
-    };
-    flags & required_flag != 0
+    const RENDER_TARGET: u32 = 0x1;
+    const DEPTH_STENCIL: u32 = 0x2;
+    const UNORDERED: u32 = 0x4;
+    match state {
+        0x4 => flags & RENDER_TARGET != 0,  // RENDER_TARGET
+        0x10 => flags & DEPTH_STENCIL != 0, // DEPTH_WRITE
+        // A texture that can be a render target or depth stencil must be
+        // discarded in that state, even if it also allows unordered access.
+        0x8 => flags & UNORDERED != 0 && flags & (RENDER_TARGET | DEPTH_STENCIL) == 0,
+        _ => false,
+    }
 }
 
 extern "system" fn discard_resource(this: This, resource: This, region: *const DiscardRegion) {
@@ -1894,6 +1898,11 @@ mod tests {
         for state in [0, 0x400, 0x80] {
             assert!(!discard_state_allowed(state, 0x7));
         }
+        // A render target or depth stencil that also allows unordered access
+        // is not discarded in the UAV state.
+        assert!(!discard_state_allowed(0x8, 0x5));
+        assert!(!discard_state_allowed(0x8, 0x6));
+        assert!(discard_state_allowed(0x4, 0x5));
     }
 
     #[cfg(windows)]
