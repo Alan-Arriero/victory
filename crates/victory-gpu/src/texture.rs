@@ -49,13 +49,11 @@ pub(crate) struct Staging {
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not watched), or the write-watch asking it was detiled after,
-/// with room to read the memory into.
+/// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
-    read: Vec<u8>,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -201,9 +199,7 @@ impl Staging {
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            last.read.resize(size, 0);
-            crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&last.read);
+            with_tiled_copy(self.memory, size, |tiled| self.detile(tiled));
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
@@ -273,6 +269,20 @@ impl Staging {
             }
         }
     }
+}
+
+/// Reads a texture for the duration of its detile. Keep the initialized
+/// length so alternating large and small textures do not re-zero the tail.
+fn with_tiled_copy(memory: *const u8, size: usize, detile: impl FnOnce(&[u8])) {
+    SCRATCH.with_borrow_mut(|read| {
+        if size > read.len() {
+            read.reserve_exact(size - read.len());
+            read.resize(size, 0);
+        }
+        let tiled = &mut read[..size];
+        crate::host::copy_mapped(tiled.as_mut_ptr(), memory, size, false);
+        detile(tiled);
+    });
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -360,4 +370,63 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watched_texture_reads_reuse_space_and_expose_only_current_bytes() {
+        #[cfg(feature = "diagnostics")]
+        if crate::copystat::mode() == 2 {
+            return; // this mode skips all copies
+        }
+        let large = [0x67; 8192];
+        let small = [0x21; 128];
+        let next = [0x43; 8192];
+        let mut allocation = None;
+        for source in [&large[..], &small[..], &next[..]] {
+            with_tiled_copy(source.as_ptr(), source.len(), |tiled| {
+                assert_eq!(tiled, source);
+                if let Some(first) = allocation {
+                    assert_eq!(tiled.as_ptr(), first);
+                } else {
+                    allocation = Some(tiled.as_ptr());
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn unmapped_texture_pages_do_not_keep_previous_pixels() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+
+        #[cfg(feature = "diagnostics")]
+        if crate::copystat::mode() != 0 {
+            return; // diagnostic copy overrides do not handle unmapped pages
+        }
+        const PAGE: usize = 4096;
+        let previous = [0x65; 2 * PAGE];
+        with_tiled_copy(previous.as_ptr(), previous.len(), |tiled| {
+            assert_eq!(tiled, previous);
+        });
+        // SAFETY: reserve two pages at an address chosen by Windows.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        // SAFETY: commit the first page of that reservation.
+        let mapped = unsafe { VirtualAlloc(base, PAGE, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(mapped, base);
+        // SAFETY: the first page is writable.
+        unsafe { base.cast::<u8>().write_bytes(0x32, PAGE) };
+        with_tiled_copy(base.cast(), 2 * PAGE, |tiled| {
+            assert!(tiled[..PAGE].iter().all(|&b| b == 0x32));
+            assert!(tiled[PAGE..].iter().all(|&b| b == 0));
+        });
+        // SAFETY: this reservation is no longer used.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
 }
