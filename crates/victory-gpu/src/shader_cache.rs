@@ -36,10 +36,23 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
+/// Whether the active host adapter supports `WaveSize(32)` compute shaders.
+fn allow_wave32() -> bool {
+    #[cfg(windows)]
+    {
+        crate::host::host().is_none_or(|h| h.supports_wave32())
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
 /// What identifies this build: the BLAKE3 of our executable file and of
 /// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
-fn build() -> &'static [u8; 32] {
+/// diagnostics build can change at run time, and whether Wave32 lowering is
+/// enabled for the active host adapter).
+fn build(wave32: bool) -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
         let exe = std::env::current_exe().and_then(std::fs::read);
@@ -53,6 +66,7 @@ fn build() -> &'static [u8; 32] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                bytes.push(u8::from(wave32));
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -70,9 +84,12 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let wave32 = allow_wave32();
+    let translate = |c: &[u8]| {
+        victory_shader::emit::translate_with_wave32(c, wave32).map_err(|e| e.to_string())
+    };
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, build(wave32), container, translate),
         None => translate(container),
     }
 }

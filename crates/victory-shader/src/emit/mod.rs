@@ -219,8 +219,19 @@ pub struct UserData {
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container.
+/// shader container, lowering eligible <=32-thread Wave64 reductions to
+/// `WaveSize(32)`.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_with_wave32(container, true)
+}
+
+/// As [`translate`], controlling whether eligible <=32-thread Wave64 compute
+/// reductions may lower with `WaveSize(32)`. Pass `false` on adapters that
+/// only support 64-lane waves (`WaveLaneCountMin > 32`).
+pub fn translate_with_wave32(
+    container: &[u8],
+    allow_wave32: bool,
+) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -252,7 +263,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_with_wave32(&c, &native, &p, &st, &io, &res, allow_wave32)
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -264,7 +275,21 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
-    let original = emit_program(c, native, p, st, io, res);
+    emit_with_wave32(c, native, p, st, io, res, true)
+}
+
+/// As [`emit`], controlling whether eligible <=32-thread Wave64 compute
+/// reductions may lower with `WaveSize(32)`.
+pub fn emit_with_wave32(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    allow_wave32: bool,
+) -> Result<HostShader, ShaderError> {
+    let original = emit_program(c, native, p, st, io, res, allow_wave32);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -278,7 +303,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res)
+    emit_program(c, native, &p, &st, &io, &res, allow_wave32)
 }
 
 fn emit_program(
@@ -288,6 +313,7 @@ fn emit_program(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+    allow_wave32: bool,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -344,17 +370,20 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
-        native,
-        p,
-        st,
-        io,
-        res,
-        inputs,
-        outputs,
-        prims,
-        mesh_stride,
-    })?;
+    let l = lower::lower_with_wave32(
+        &lower::Parts {
+            native,
+            p,
+            st,
+            io,
+            res,
+            inputs,
+            outputs,
+            prims,
+            mesh_stride,
+        },
+        allow_wave32,
+    )?;
     Ok(HostShader {
         stage: native.stage,
         dxil: l.dxil,
