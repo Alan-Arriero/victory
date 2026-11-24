@@ -623,7 +623,8 @@ fn buffer_srv(
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let offset = shadow.offset(address);
-    if element == 0 || offset % element != 0 {
+    let host = host()?;
+    if element == 0 {
         once!(
             offset,
             element,
@@ -638,13 +639,42 @@ fn buffer_srv(
         once!("a buffer view of no elements is left null");
         return None;
     }
+    if offset % element != 0 {
+        // The title's placed buffer starts at an address that is not a
+        // multiple of `element` inside our larger host shadow buffer (e.g. a
+        // non-power-of-two structured element stride inside a ring buffer).
+        // Copy the viewed bytes into an aligned upload buffer starting at
+        // element 0 so D3D12 accepts the structured or typed SRV.
+        let view_offset = buffer.FirstElement.checked_mul(element)?;
+        let bytes = u64::from(buffer.NumElements).checked_mul(element)?;
+        const MAX_UNALIGNED_COPY: u64 = 1 << 20;
+        if bytes == 0 || bytes > MAX_UNALIGNED_COPY {
+            once!(
+                offset,
+                element,
+                "buffer view not on an element of its host copy"
+            );
+            return None;
+        }
+        let start = address.checked_add(view_offset)?;
+        let (upload, dst) = host.upload_buffer(bytes)?;
+        crate::host::copy_mapped(dst, start as *const u8, bytes as usize, false);
+        // SAFETY: `upload` was mapped by `upload_buffer` and will not be written again.
+        unsafe { upload.Unmap(0, None) };
+        buffer.FirstElement = 0;
+        // SAFETY: a live upload buffer and a slot of our heap.
+        unsafe {
+            host.device
+                .CreateShaderResourceView(&upload, Some(&desc), at)
+        };
+        return Some(Some(upload));
+    }
     buffer.FirstElement += offset / element;
     if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 && !raw_start_fits(buffer.FirstElement) {
         let first = buffer.FirstElement;
         once!(first, "raw buffer view not on 16 bytes of its host copy");
         return None;
     }
-    let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
@@ -1248,5 +1278,45 @@ mod tests {
         };
         assert_eq!(heap.count(), 16);
         assert_eq!(heap.dynamic(1), None);
+    }
+
+    /// A structured buffer SRV whose offset inside its shadow buffer is not a
+    /// multiple of its element stride is copied into an aligned upload buffer
+    /// instead of being dropped.
+    #[test]
+    fn unaligned_structured_buffer_srv_copies_into_aligned_upload_buffer() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let backing: Vec<u8> = (0..4096usize).map(|i| (i % 251) as u8).collect();
+        let base = backing.as_ptr() as u64;
+        crate::shadow::register(base as usize, base, backing.len() as u64);
+        // Offset 32 is not a multiple of stride 24 (32 % 24 == 8).
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: 0,
+                    NumElements: 1,
+                    StructureByteStride: 24,
+                    Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                },
+            },
+        };
+        let kept = buffer_srv(base + 32, 24, desc, heap.cpu(0));
+        crate::shadow::unregister(base as usize, base);
+        let upload = kept
+            .expect("unaligned structured SRV should succeed")
+            .expect("aligned upload buffer should be kept");
+        // SAFETY: live D3D12 resource and device queries.
+        unsafe {
+            assert_eq!(upload.GetDesc().Width, 24);
+            assert!(host.device.GetDeviceRemovedReason().is_ok());
+        }
     }
 }
