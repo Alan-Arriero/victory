@@ -359,7 +359,7 @@ impl State {
             stencil_ref(new_list, reference);
         }
         if !self.bound_rtvs.is_empty() || self.bound_dsv.is_some() {
-            self.apply_targets(new_list);
+            self.apply_targets(new_list, false);
         }
     }
 
@@ -493,17 +493,20 @@ impl State {
                 desc,
             });
         }
-        self.apply_targets(list);
+        self.apply_targets(list, true);
     }
 
     /// Binds the cached RTV/DSV snapshot onto `list` without re-reading the
     /// title's descriptor slots, keeping each bound host texture alive until
-    /// `list` resets or drops.
-    fn apply_targets(&self, list: &HostList) {
+    /// `list` resets or drops. When `mark_work` is false (reapplying state onto
+    /// a newly split trailing list after a mid-list wait), the list's COM
+    /// references are retained without pinning a retirement epoch until actual
+    /// GPU work is recorded.
+    fn apply_targets(&self, list: &HostList, mark_work: bool) {
         let Some(host) = crate::host::host() else {
             return;
         };
-        if !self.bound_rtvs.is_empty() || self.bound_dsv.is_some() {
+        if mark_work && (!self.bound_rtvs.is_empty() || self.bound_dsv.is_some()) {
             list.mark_work();
         }
         let rtvs: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = self
@@ -511,13 +514,21 @@ impl State {
             .iter()
             .map(|rtv| {
                 if let Some(tex) = &rtv.host {
-                    list.keep(tex);
+                    if mark_work {
+                        list.keep(tex);
+                    } else {
+                        list.keep_unmarked(tex);
+                    }
                 }
                 host.rtv(rtv.host.as_ref(), rtv.desc.as_ref())
             })
             .collect();
         let dsv = self.bound_dsv.as_ref().map(|dsv| {
-            list.keep(&dsv.host);
+            if mark_work {
+                list.keep(&dsv.host);
+            } else {
+                list.keep_unmarked(&dsv.host);
+            }
             host.dsv(&dsv.host, dsv.desc.as_ref())
         });
         // SAFETY: an open list; the views were just made from live host resources.
@@ -2572,6 +2583,12 @@ mod depth_tests {
         assert_eq!(state.bound_rtvs.len(), 1);
         assert_eq!(state.bound_rtvs[0].host.as_ref(), Some(&host_rt));
         assert_eq!(state.bound_dsv.as_ref().map(|d| &d.host), Some(&host_depth));
+        assert!(new_list.kept_contains(&host_rt));
+        assert!(new_list.kept_contains(&host_depth));
+        assert!(
+            !new_list.has_epoch(),
+            "reapply_host must not pin an epoch on an empty trailing list"
+        );
         assert_eq!(state.targets, vec![rt as usize]);
         assert_eq!(state.depth.map(|d| d.resource), Some(depth as usize));
 
@@ -2671,6 +2688,14 @@ mod depth_tests {
         let list = host.new_list().expect("host list");
         let mut state = State::default();
         state.set_targets(&list, &[rtv_handle], dsv_handle);
+        assert!(
+            list.kept_contains(crate::resource::host_resource(rtv_tex).expect("rtv host resource")),
+            "set_targets must retain the host RTV COM object directly on the list"
+        );
+        assert!(
+            list.kept_contains(crate::resource::host_resource(dsv_tex).expect("dsv host resource")),
+            "set_targets must retain the host DSV COM object directly on the list"
+        );
 
         // Release both title textures before executing the recorded list.
         assert_eq!(release(rtv_tex), 0);
@@ -2684,6 +2709,7 @@ mod depth_tests {
             "set_targets must keep host DSV texture alive while list is open"
         );
 
+        let _ = host.log_messages();
         let errors_before = host.d3d12_errors();
         list.close();
         host.execute(&[&list]);

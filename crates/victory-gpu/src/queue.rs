@@ -145,7 +145,7 @@ impl InFlight {
 impl Drop for InFlight {
     fn drop(&mut self) {
         if let Some(list) = self.0.take() {
-            list.end_submit();
+            list.cancel_submit();
         }
     }
 }
@@ -1372,6 +1372,61 @@ mod tests {
         // Release the queue without signalling `ready`; dropping the held
         // closure must release the InFlight guard and drop the retired object.
         assert_eq!(release(q), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        for object in [list, allocator, src, dst, ready] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancelled_queued_list_keeps_recording_epoch_while_title_still_owns_list() {
+        let _retire = crate::host::isolated_retire_scope();
+        type Sync = extern "system" fn(This, This, u64) -> HRESULT;
+        type Execute = extern "system" fn(This, u32, *const This);
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let (q, sig_slot) = test_queue();
+        let wait = slot::<Sync>(q, sig_slot + 8);
+        let execute = slot::<Execute>(q, 0x50);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let mut ready = null;
+        assert_eq!(
+            crate::fence::create(null, 0, 0, fence_iid, &mut ready),
+            S_OK
+        );
+
+        let (list, allocator, src, dst) = test_copy_list();
+
+        assert_eq!(wait(q, ready, 1), S_OK);
+        execute(q, 1, &list);
+
+        let (counter, drops) = crate::host::DropCounter::new();
+        crate::host::retire(counter);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        // Drop the queue without signalling `ready` while the title still owns
+        // the closed list: cancelling the unexecuted submission must not clear
+        // the list's recording epoch until the title resets or releases it.
+        assert_eq!(release(q), 0);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "cancelling an unrun submission must not clear the epoch while the list is still live"
+        );
+
+        assert_eq!(
+            slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50)(
+                list, allocator, null
+            ),
+            S_OK
+        );
         assert_eq!(drops.load(Ordering::SeqCst), 1);
 
         for object in [list, allocator, src, dst, ready] {

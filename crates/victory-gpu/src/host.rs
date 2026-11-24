@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{
-    DXGI_STATUS_OCCLUDED, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    DXGI_STATUS_OCCLUDED, HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -1018,15 +1018,32 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                match self.queue.Signal(&self.fence, *submitted) {
+                    Ok(()) => match self.fence.SetEventOnCompletion(*submitted, self.event) {
+                        Ok(()) => {
+                            let waited = WaitForSingleObject(self.event, INFINITE);
+                            if waited != WAIT_OBJECT_0 {
+                                tracing::warn!(
+                                    wait = waited.0,
+                                    "host fence event wait failed; polling fence"
+                                );
+                                self.poll_fence(*submitted);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "host fence event registration failed; polling fence"
+                            );
+                            self.poll_fence(*submitted);
+                        }
+                    },
+                    Err(e) => fail(format_args!(
+                        "host GPU fence signal failed after a submission of {} lists ({e}){}{}",
+                        runs.len(),
+                        self.removal_data(runs),
+                        last_notes(runs)
+                    )),
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -1122,6 +1139,31 @@ impl Host {
         drop(submitted);
         release_epoch_in(exec_state, exec_epoch);
         woken.run();
+    }
+
+    /// Fallback completion wait when registering or waiting on `self.event`
+    /// fails after `self.queue.Signal(&self.fence, target)` succeeded, so
+    /// copy-back, writes, and epoch retirement never run while the GPU may
+    /// still be executing.
+    fn poll_fence(&self, target: u64) {
+        let mut spins = 0u32;
+        loop {
+            // SAFETY: plain fence and device queries on our live host objects.
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            if completed >= target || completed == u64::MAX {
+                return;
+            }
+            // SAFETY: plain device-removed query.
+            if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                return;
+            }
+            if spins < 64 {
+                spins += 1;
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -1539,6 +1581,21 @@ impl HostList {
         }
     }
 
+    /// Releases a queued submission pin for a cancelled (unexecuted) submission
+    /// without clearing the list's recording epoch: if the title still owns
+    /// this closed list, its epoch stays pinned until it executes, resets, or
+    /// drops; if the cancelled submission held the last reference, dropping
+    /// the `HostList` immediately releases the epoch.
+    pub(crate) fn cancel_submit(&self) {
+        let _guard = self.epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_epoch(&self) -> bool {
+        self.epoch.load(Ordering::Acquire) != 0
+    }
+
     fn release_epoch(&self) {
         let released = {
             let _guard = self.epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -1859,17 +1916,17 @@ impl HostList {
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
         let host = host()?;
-        self.mark_work();
-        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            self.mark_work();
             self.deferred().uploads.push(buffer);
             return Some((gpu, data));
         }
+        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
             (s.current, s.used) = (s.current + 1, 0);
         }
@@ -1884,6 +1941,8 @@ impl HostList {
         let (_, data, gpu) = s.chunks[s.current];
         let at = s.used;
         s.used += len;
+        drop(s);
+        self.mark_work();
         Some((gpu + at, (data + at as usize) as *mut u8))
     }
 
@@ -1914,31 +1973,36 @@ impl HostList {
     /// The list's GPU-writable scratch buffer for expanded indirect
     /// rectangle vertices (`capacity` bytes), created on first use.
     pub(crate) fn rect_vertices(&self, capacity: u64) -> Option<ID3D12Resource> {
-        self.mark_work();
         let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
         if rect.vertices.is_none() {
             let buffer = host()?.default_buffer(capacity)?;
             name(&buffer, || format!("rect scratch {capacity:#x}"));
             rect.vertices = Some(buffer);
         }
-        rect.vertices.clone()
+        let buffer = rect.vertices.clone()?;
+        drop(rect);
+        self.mark_work();
+        Some(buffer)
     }
 
     /// A GPU-writable buffer of at least `bytes` for rewritten indirect
     /// draw arguments, kept alive until the list is reset.
     pub(crate) fn rect_args(&self, bytes: u64) -> Option<ID3D12Resource> {
-        self.mark_work();
         let want = bytes.max(RECT_ARGS_MIN).next_multiple_of(256);
         let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((buf, len)) = &rect.args
             && *len >= want
         {
-            return Some(buf.clone());
+            let buf = buf.clone();
+            drop(rect);
+            self.mark_work();
+            return Some(buf);
         }
         let buffer = host()?.default_buffer(want)?;
         name(&buffer, || format!("rect args {want:#x}"));
         let old = rect.args.replace((buffer.clone(), want));
         drop(rect);
+        self.mark_work();
         if let Some((old, _)) = old {
             self.keep(&old);
         }
@@ -1948,7 +2012,6 @@ impl HostList {
     /// The host GPU address of a 4-byte atomic counter for one indirect
     /// rectangle draw, zeroed at each submission before the list runs.
     pub(crate) fn rect_counter(&self) -> Option<u64> {
-        self.mark_work();
         let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
         if rect.counter_used == RECT_COUNTER_CHUNK {
             rect.counter_chunk += 1;
@@ -1967,6 +2030,7 @@ impl HostList {
         let slot = rect.counter_used;
         rect.counter_used += 1;
         drop(rect);
+        self.mark_work();
         if slot == 0 {
             let bytes = RECT_COUNTER_CHUNK as usize * 4;
             // SAFETY: the list's own mapped chunk, zeroed before it runs.
@@ -1983,6 +2047,28 @@ impl HostList {
             self.mark_work();
             self.deferred().kept.push(object);
         }
+    }
+
+    /// Keeps `object` alive until the list is reset without pinning a
+    /// retirement epoch (used when mirroring fixed-function target bindings
+    /// onto a newly split trailing list before any GPU work is recorded).
+    pub(crate) fn keep_unmarked(&self, object: &impl Interface) {
+        if let Ok(object) = object.cast::<windows::core::IUnknown>() {
+            self.deferred().kept.push(object);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kept_contains(&self, object: &impl Interface) -> bool {
+        object.cast::<windows::core::IUnknown>().is_ok_and(|u| {
+            let raw = u.as_raw();
+            self.deferred().kept.iter().any(|k| k.as_raw() == raw)
+        })
+    }
+
+    #[cfg(test)]
+    fn defer_unmarked(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().copies.push(Step::Run(Box::new(work)));
     }
 
     /// Whether this is the first time since the reset that the list asks
@@ -3560,18 +3646,17 @@ mod tests {
         let list = host.new_list().expect("host list");
         let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let drops_during = drops.clone();
-        // Inside `run_deferred`, retire an object and verify it is kept alive
-        // by both `list`'s epoch and `exec_epoch`.
-        list.defer(move || {
+        // Use an unmarked deferred step without `begin_submit()` so `list`
+        // itself pins no epoch; only `Host::execute`'s `exec_epoch` keeps the
+        // object alive until execution finishes.
+        list.defer_unmarked(move || {
             let counter = DropCounter(drops_during.clone());
             retire(counter);
             assert_eq!(drops_during.load(Ordering::SeqCst), 0);
         });
-        list.begin_submit();
+        assert!(!list.has_epoch());
         list.close();
         host.execute(&[&list]);
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-        list.end_submit();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }
