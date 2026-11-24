@@ -1,5 +1,8 @@
 name: CI
 
+# Not on description edits: those run `pr-description.yml` alone. A run of
+# this workflow on an edit would post its code checks again, skipped, which
+# GitHub counts as passed over an earlier failure on the same revision.
 on:
   pull_request:
   push:
@@ -16,7 +19,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  fmt-policy:
+    name: fmt-policy
+    # rustfmt does not compile code, so a Linux runner can check the
+    # Windows-only crates.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      # Installs the toolchain that rust-toolchain.toml gives, with its
+      # components, so CI uses the same rustfmt as local builds.
+      - name: Install the toolchain
+        run: rustup toolchain install
+      - name: Check the formatting
+        run: cargo fmt --all -- --check
+      - name: Asset policy
+        run: cargo xtask policy
+
   check:
+    name: check
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -32,3 +55,21 @@ jobs:
       # Keep the workspace test run deterministic across Windows GPU/driver configurations.
       - name: Tests
         run: cargo test --workspace --locked -- --test-threads=1
+
+  # The portable crates build and test on Linux too; this catches
+  # Windows-only code reaching them.
+  linux:
+    name: linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      # The version and components pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked

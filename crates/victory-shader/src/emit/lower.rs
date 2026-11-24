@@ -3824,8 +3824,8 @@ impl<'a> Lower<'a> {
         let total: u32 = bits.iter().sum();
         let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let load = |l: &mut Self, at: V, n: u32| -> Vec<V> {
-            // `ResRet.f32` holds four values, then the status.
-            debug_assert!((1..=4).contains(&n), "a raw buffer load of {n} dwords");
+            // A ResRet holds four data words; the fifth value is the status.
+            debug_assert!((1..=4).contains(&n), "a raw load of {n} words");
             let mask = l.s.m.i8((1u8 << n) - 1);
             let r = l.s.op(
                 c,
@@ -3859,24 +3859,28 @@ impl<'a> Lower<'a> {
                 // taken from the two dword-aligned words around it. Reading
                 // at the byte address itself would promise the host an
                 // alignment the console does not have, and a host that
-                // believes it can hand back zeros (`notes/vtx.md`: a
-                // position fetched at an odd byte offset collapsing every
-                // vertex to the origin).
+                // believes it can hand back zeros (a position fetched at
+                // an odd byte offset collapsed every vertex to the
+                // origin).
                 #[cfg(test)]
                 {
                     self.s.unaligned_typed_loads += 1;
                 }
                 let n = (total / 32) as usize;
                 let shift = (at % 4) as u32 * 8;
+                let aligned = self.s.m.i32((at & !3) as u32);
                 let sh = self.s.m.i32(shift);
                 let up = self.s.m.i32(32 - shift);
-                // The n + 1 aligned words, at most four per load (a 128-bit
-                // format needs five).
+                // n + 1 aligned words, at most four to a load.
                 let base = (at & !3) as u32;
                 let mut raw = Vec::with_capacity(n + 1);
                 for first in (0..=n).step_by(4) {
                     let count = (n + 1 - first).min(4) as u32;
-                    let from = self.s.m.i32(base + 4 * first as u32);
+                    let from = if first == 0 {
+                        aligned
+                    } else {
+                        self.s.m.i32(base + 4 * first as u32)
+                    };
                     raw.extend(load(self, from, count));
                 }
                 (0..n)
@@ -8908,12 +8912,12 @@ mod tests {
     }
 
     #[test]
-    fn a_128_bit_typed_fetch_inside_a_dword_splits_its_five_words() {
-        // `tbuffer_load_format_xyzw` of 32_32_32_32_FLOAT at byte offset 33
-        // needs five aligned words, more than one raw load returns.
-        let (bits, _) = buffer_format(77).unwrap();
-        assert_eq!(bits.iter().sum::<u32>(), 128, "format 77 is 32_32_32_32");
-        let odd = buffer(0x003, true, 77, 33, false, false, 0, 4, 8);
+    fn a_four_dword_typed_fetch_inside_a_dword_loads_at_most_four_words_at_a_time() {
+        // `tbuffer_load_format_xyzw` of format 77 at byte offset 33 needs
+        // five aligned words; one raw load returns four and then the
+        // status, so the fifth is read by a second load (the load closure
+        // asserts no load asks for more than four).
+        let odd = buffer(0x003, true, 77, 33, false, false, 0, 3, 8);
         let (layout, used) = fetch_tables(0, 4);
         let l = lower_with(&fetch_program(odd, 4), layout, used).unwrap();
         assert_eq!(l.unaligned_typed_loads, 1);
