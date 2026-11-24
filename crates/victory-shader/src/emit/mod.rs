@@ -97,6 +97,16 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 
+/// Resource heap indices at or past this go to slot 0 in translated
+/// shaders (a negative or garbage index must not reach past the heap's
+/// end). It is far above any real heap, and the host never makes a view
+/// heap larger, so a valid index is never moved: 2^24.
+pub const VIEW_HEAP_LIMIT: u32 = 1 << 24;
+
+/// The same for sampler heap indices: the host's limit on every binding
+/// tier.
+pub const SAMPLER_HEAP_LIMIT: u32 = 2048;
+
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
