@@ -3080,6 +3080,14 @@ impl<'a> Lower<'a> {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 (self.s.m.select(c, cond, a, b), None)
             }
+            // The destination keeps its value where SCC is clear.
+            "s_cmov_b32" => {
+                let cond = self.scc_in(inst)?;
+                let new = src32(self, 0)?;
+                let d = dst.as_ref().ok_or("a missing operand")?;
+                let old = self.operand(inst, d)?;
+                (self.s.m.select(c, cond, new, old), None)
+            }
             "s_brev_b32" => {
                 let a = src32(self, 0)?;
                 let r = self
@@ -3254,6 +3262,7 @@ impl<'a> Lower<'a> {
                     "s_mov_b32"
                         | "s_movk_i32"
                         | "s_cselect_b32"
+                        | "s_cmov_b32"
                         | "s_brev_b32"
                         | "s_sext_i32_i8"
                         | "s_sext_i32_i16"
@@ -8406,6 +8415,23 @@ mod tests {
         for words in [add, sub] {
             lowers(&words, 0).unwrap();
         }
+    }
+
+    /// `s_cmov_b32`, which the scalar offset trace follows, lowers too: the
+    /// source where SCC is set, the destination's old value where it is
+    /// clear.
+    #[test]
+    fn a_conditional_scalar_move_lowers() {
+        let words = [
+            0xBE82_0380, // s_mov_b32 s2, 0
+            0xBF06_8002, // s_cmp_eq_u32 s2, 0
+            0xBE82_0581, // s_cmov_b32 s2, 1
+            0xBF07_8002, // s_cmp_lg_u32 s2, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        lowers(&words, 0).unwrap();
     }
 
     fn perm_features(selector: u32) -> u64 {
