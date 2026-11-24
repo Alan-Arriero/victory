@@ -19,8 +19,9 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; `spare` more follow them.
     count: u32,
-    /// Dynamic slots past the title's: [`DYNAMIC`] in a view heap,
-    /// [`SAMPLER_DYNAMIC`] in a capped sampler heap, none in another.
+    /// Dynamic slots past the title's: [`DYNAMIC`] in a view heap where
+    /// the host takes them, else [`MIN_DYNAMIC`]; [`SAMPLER_DYNAMIC`] in a
+    /// capped sampler heap, none in another.
     spare: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
@@ -75,7 +76,13 @@ const _: () = assert!(SAMPLERS <= victory_shader::emit::SAMPLER_HEAP_LIMIT);
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
-const DYNAMIC: u32 = 1 << 16;
+/// 2^16 ran out seconds into the world (every world run on an RX 9070 XT,
+/// each a device removal shortly after; #59).
+const DYNAMIC: u32 = 1 << 18;
+
+/// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
+/// (a capped heap, NVIDIA): the title's slots keep their room first.
+const MIN_DYNAMIC: u32 = 1 << 16;
 
 /// The host's limit for shader-visible sampler heaps, on every binding
 /// tier.
@@ -124,25 +131,49 @@ impl HostHeap {
                 SAMPLER_DYNAMIC,
             );
         }
-        let extra = if sampler { 0 } else { DYNAMIC };
-        let count = if !sampler && count.saturating_add(extra) > MAX_VIEWS {
+        if sampler {
+            return match make(count) {
+                Ok(heap) => Self::with(host, heap, kind, count, 0),
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    None
+                }
+            };
+        }
+        // The title slots that fit under the largest heap made beside
+        // `extra` dynamic ones.
+        let fitting = |extra: u32| count.min(MAX_VIEWS - extra);
+        if fitting(MIN_DYNAMIC) < count {
             // shortcut: as below, descriptors past the limit are left out.
             tracing::warn!(count, "host view heap capped at {MAX_VIEWS}");
-            MAX_VIEWS - extra
+        }
+        // The larger dynamic range only where the host takes it on top of
+        // every title slot; else the smaller one, and the cap after that.
+        let large = if fitting(DYNAMIC) == count {
+            make(count + DYNAMIC).ok()
         } else {
-            count
+            None
         };
-        let (heap, count) = match make(count + extra) {
-            Ok(heap) => (heap, count),
-            Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
-                // shortcut: descriptors past the host's limit are left out;
-                // a title that reaches them needs remapping.
-                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                return None;
+        let (heap, count, extra) = if let Some(heap) = large {
+            (heap, count, DYNAMIC)
+        } else {
+            let count = fitting(MIN_DYNAMIC);
+            match make(count + MIN_DYNAMIC) {
+                Ok(heap) => (heap, count, MIN_DYNAMIC),
+                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
+                    // shortcut: descriptors past the host's limit are left
+                    // out; a title that reaches them needs remapping.
+                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
+                    (
+                        make(PORTABLE_VIEWS).ok()?,
+                        PORTABLE_VIEWS - MIN_DYNAMIC,
+                        MIN_DYNAMIC,
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
             }
         };
         Self::with(host, heap, kind, count, extra)
@@ -907,9 +938,13 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
-    let buffer = match view {
-        View::Unordered(r, _, desc) => is_buffer(r) || desc.is_some_and(|d| d[1] == 1),
-        View::Placed(true, resource, _) => resource[0] == 1,
+    // Unordered views: whether a buffer, and the title's view dimension.
+    let (buffer, dimension) = match view {
+        View::Unordered(r, _, desc) => (
+            is_buffer(r) || desc.is_some_and(|d| d[1] == 1),
+            desc.map(|d| d[1]),
+        ),
+        View::Placed(true, resource, desc) => (resource[0] == 1, Some(desc[1])),
         // Shader views of buffers read nothing through a null buffer view:
         // a null 2D view where the shader expects a buffer is a mismatch
         // the hardware does not survive in general (GPU-based validation
@@ -931,14 +966,14 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         }
         _ => return null_view(at),
     };
-    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-        Format: DXGI_FORMAT_R32_UINT,
-        ViewDimension: if buffer {
-            D3D12_UAV_DIMENSION_BUFFER
-        } else {
-            D3D12_UAV_DIMENSION_TEXTURE2D
-        },
-        ..Default::default()
+    let desc = if buffer {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            ..Default::default()
+        }
+    } else {
+        null_uav_desc(dimension)
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
@@ -949,6 +984,46 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             at,
         )
     };
+}
+
+/// A null texture UAV of the title's view dimension (1D, 1D or 2D arrays,
+/// 3D), 2D if it names none: a 2D null view where the shader writes a 3D
+/// texture is a mismatch GPU-based validation reports (the compute shader
+/// that copies the world's wind field, 2026-11-24).
+fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_UINT,
+        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+        ..Default::default()
+    };
+    match dimension.map(|d| D3D12_UAV_DIMENSION(d as i32)) {
+        Some(D3D12_UAV_DIMENSION_TEXTURE1D) => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
+        }
+        Some(D3D12_UAV_DIMENSION_TEXTURE1DARRAY) => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+            desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV {
+                ArraySize: 1,
+                ..Default::default()
+            };
+        }
+        Some(D3D12_UAV_DIMENSION_TEXTURE2DARRAY) => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+            desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                ArraySize: 1,
+                ..Default::default()
+            };
+        }
+        Some(D3D12_UAV_DIMENSION_TEXTURE3D) => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+            desc.Anonymous.Texture3D = D3D12_TEX3D_UAV {
+                WSize: u32::MAX,
+                ..Default::default()
+            };
+        }
+        _ => {}
+    }
+    desc
 }
 
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
@@ -1047,20 +1122,55 @@ mod tests {
         );
     }
 
+    /// A null texture UAV keeps the title's dimension (3D for the world's
+    /// wind field), and is 2D when the title names none.
+    #[test]
+    fn null_uavs_keep_the_titles_dimension() {
+        let d = null_uav_desc(Some(8));
+        assert_eq!(d.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE3D);
+        // SAFETY: the member the dimension names.
+        assert_eq!(unsafe { d.Anonymous.Texture3D.WSize }, u32::MAX);
+        let d = null_uav_desc(Some(5));
+        assert_eq!(d.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE2DARRAY);
+        // SAFETY: the member the dimension names.
+        assert_eq!(unsafe { d.Anonymous.Texture2DArray.ArraySize }, 1);
+        let dimension = |d| null_uav_desc(d).ViewDimension;
+        assert_eq!(dimension(Some(2)), D3D12_UAV_DIMENSION_TEXTURE1D);
+        assert_eq!(dimension(Some(4)), D3D12_UAV_DIMENSION_TEXTURE2D);
+        assert_eq!(dimension(None), D3D12_UAV_DIMENSION_TEXTURE2D);
+        // Multisampled UAVs need a cap; they stay 2D.
+        assert_eq!(dimension(Some(6)), D3D12_UAV_DIMENSION_TEXTURE2D);
+    }
+
+    /// A null 3D UAV made on the real device leaves it alive.
+    #[test]
+    fn null_3d_uav_is_accepted_by_the_device() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
+        null_for(&view, heap.cpu(0));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn dynamic_slots_are_held_until_released() {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        let a = heap.dynamic(DYNAMIC - 100).unwrap();
+        let a = heap.dynamic(heap.spare - 100).unwrap();
         let b = heap.dynamic(60).unwrap();
-        assert_eq!((a, b), (4, 4 + DYNAMIC - 100));
+        assert_eq!((a, b), (4, 4 + heap.spare - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
-        assert_eq!(heap.dynamic(40), Some(4 + DYNAMIC - 40));
+        assert_eq!(heap.dynamic(40), Some(4 + heap.spare - 40));
     }
 
     /// A sampler heap past the host's limit is capped, not lost, and keeps

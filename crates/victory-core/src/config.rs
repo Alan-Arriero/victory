@@ -1517,6 +1517,35 @@ mod tests {
     }
 
     #[test]
+    fn empty_test_titles_env_is_ignored() {
+        let file = FilePaths {
+            cache_dir: Some(abs("cache").into()),
+            data_dir: Some(abs("data").into()),
+            test_titles: vec!["from-file".into()],
+            ..Default::default()
+        };
+        let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(OsString::new);
+        let cfg = Config::resolve(file, None, env).unwrap();
+        assert_eq!(cfg.test_titles, vec![PathBuf::from("from-file")]);
+    }
+
+    #[test]
+    fn test_titles_env_splits_paths() {
+        let value = std::env::join_paths(["first", "second"]).unwrap();
+        let file = FilePaths {
+            cache_dir: Some(abs("cache").into()),
+            data_dir: Some(abs("data").into()),
+            ..Default::default()
+        };
+        let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(|| value.clone());
+        let cfg = Config::resolve(file, None, env).unwrap();
+        assert_eq!(
+            cfg.test_titles,
+            vec![PathBuf::from("first"), PathBuf::from("second")]
+        );
+    }
+
+    #[test]
     fn example_config_parses() {
         let text = include_str!("../../../victory.example.toml");
         let parsed = parse_file(text).unwrap();
@@ -1641,5 +1670,15 @@ mod tests {
         } else {
             format!("/{p}").into()
         }
+    }
+
+    #[test]
+    fn data_inside_repo_is_refused() {
+        let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+        let cfg = Config {
+            data_dir: inside,
+            ..Default::default()
+        };
+        assert!(cfg.data_subdir("x").is_err());
     }
 }
