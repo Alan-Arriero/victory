@@ -914,6 +914,12 @@ fn wave_prefix_sum_f32_pixel_quad_all_backends() {
 
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let hosts = all_hosts();
+    // No SM 6.6 adapter opens (as `run_f32_suite`): nothing to draw on. One
+    // that opens must take the pipeline and draw.
+    if hosts.is_empty() {
+        eprintln!("no SM 6.6 wave-capable adapter; skipped");
+        return;
+    }
     let mut warp_ran = false;
     for h in &hosts {
         let root = h.host.root_signature(&vs, &ps).expect("gfx root");

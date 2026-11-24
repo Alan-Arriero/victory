@@ -182,16 +182,11 @@ fn check(shader: &HostShader, want: &[u32; LANES]) {
             eprintln!("{label} device has no 32-lane wave; skipped");
             continue;
         }
-        let (root, pso) = match host.compute_pipeline(shader) {
-            Ok(p) => p,
-            // A mask read as a number needs the console's wave size,
-            // which WARP does not run.
-            Err(e) if warp => {
-                eprintln!("skipped on WARP: {e}");
-                continue;
-            }
-            Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
-        };
+        // A device that runs 32-lane waves must take the pipeline: a refusal
+        // there is the emitted DXIL's, not the device's.
+        let (root, pso) = host
+            .compute_pipeline(shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         let views = [View::RawUav(LANES as u32)];
         let words = host
