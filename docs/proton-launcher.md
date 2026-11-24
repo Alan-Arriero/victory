@@ -25,6 +25,10 @@ prefix is `${XDG_DATA_HOME:-$HOME/.local/share}/victory/proton`, and the
 default `GAMEID` is `umu-victory`. Set `WINEPREFIX`, `GAMEID` or `PROTONPATH`
 to override them. Use Windows paths in `victory.toml`.
 
+Set `VICTORY_TRACE_PIPELINES=1` to log the shader stages and hashes with the
+Windows thread ID when each host pipeline starts compiling. Match that ID to
+the faulting thread in a Proton log when several pipelines compile at once.
+
 ## Building with LLVM-MinGW
 
 Install Rust with rustup and put the x86-64 Linux UCRT distribution of
