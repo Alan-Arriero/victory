@@ -514,7 +514,8 @@ fn process_convert(
         &mut converted,
         command.target_pitch,
         command.pitch_ramp,
-        options & FLUSH != 0,
+        // FLUSH is a command option; `options` are the connection's.
+        { command.id.options } & FLUSH != 0,
     );
     if options & DEINTERLEAVED_OUTPUT != 0 && channels == 2 {
         // The converter's midpoint is `maxFrameCountPerOutput`, even when

@@ -60,6 +60,10 @@ impl Resampler {
             return 0;
         }
         let target = clamp(target);
+        // Without a ramp the target pitch applies at once.
+        if ramp == 0.0 {
+            self.pitch = target;
+        }
         self.pending.extend_from_slice(input);
         let frames = output.len() / channels;
         let mut written = 0;
@@ -89,7 +93,9 @@ impl Resampler {
         }
         // Keep the unconsumed tail, including the sample the next call
         // interpolates towards.
-        let consumed = self.position as usize;
+        // The position can run past the buffered frames at high pitch; drain
+        // only what is buffered and carry the rest of the offset forward.
+        let consumed = (self.position as usize).min(self.pending.len() / channels);
         if consumed > 0 {
             self.pending.drain(..consumed * channels);
             self.position -= consumed as f64;
@@ -195,6 +201,32 @@ mod tests {
             2
         );
         assert_eq!(output[..2], [0.0, 1.0]);
+    }
+
+    #[test]
+    fn a_pitch_past_the_buffered_input_does_not_panic() {
+        let mut resampler = Resampler::new(1, 3.0);
+        let input: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let mut output = vec![0.0; 8];
+        let frames = resampler.convert(&input, &mut output, 3.0, 0.0, false);
+        assert_eq!(output[..frames], [0.0, 3.0, 6.0]);
+        // The next frame is at position 9: one past the eight buffered.
+        let more: Vec<f32> = (8..12).map(|i| i as f32).collect();
+        let frames = resampler.convert(&more, &mut output, 3.0, 0.0, false);
+        assert_eq!(output[..frames], [9.0]);
+    }
+
+    #[test]
+    fn no_ramp_applies_the_target_pitch_at_once() {
+        let mut resampler = Resampler::new(1, 1.0);
+        let input: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let mut output = vec![0.0; 32];
+        let frames = resampler.convert(&input, &mut output, 2.0, 0.0, true);
+        assert_eq!(
+            output[..frames],
+            [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0]
+        );
+        assert_eq!(resampler.pitch(), 2.0);
     }
 
     #[test]
