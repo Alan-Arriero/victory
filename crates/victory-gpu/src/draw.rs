@@ -1026,17 +1026,16 @@ impl State {
             return;
         }
         let active_depth = (!compute).then_some(self.depth).flatten();
-        // When the view heap, descriptor generation, and bindless SRV/UAV mode
-        // are unchanged, only textures transitioned on `list` since the last
-        // sync, targets skipped on the previous draw, or the active depth
-        // target can need transitions — O(|dirty|) instead of walking every
-        // resident bindless texture.
+        // When the view heap and bindless SRV/UAV mode are unchanged, only
+        // textures whose descriptor was newly written since `cache.tex_gen`,
+        // textures transitioned on `list` since the last sync, targets skipped
+        // on the previous draw, or the active depth target can need transitions
+        // — O(|new_slots| + |dirty|) instead of walking every resident texture.
         let incremental = self
             .bindless_cache
             .as_ref()
             .filter(|cache| {
                 cache.heap == self.heaps[0]
-                    && cache.tex_gen == cur_tex_gen
                     && cache.uses_heap_srv == uses_heap_srv
                     && cache.uses_heap_uav == uses_heap_uav
             })
@@ -1046,9 +1045,7 @@ impl State {
                 if let Some(d) = active_depth {
                     candidates.push(d.resource);
                 }
-                let (got_gen, srvs, uavs) =
-                    host.pin_live_subset(&candidates, uses_heap_srv, uses_heap_uav);
-                (got_gen == cache.tex_gen).then_some((got_gen, srvs, uavs))
+                host.pin_live_subset_since(cache.tex_gen, &candidates, uses_heap_srv, uses_heap_uav)
             });
         let (tex_gen, live_srvs, live_uavs) = match incremental {
             Some(subset) => subset,
@@ -1063,8 +1060,9 @@ impl State {
         let is_active_rt = |r: usize| !compute && self.targets.contains(&r);
         // When a pipeline accesses both bindless SRVs and bindless UAVs, a
         // texture with both descriptor types resident in the heap is ambiguous:
-        // preserve its SRV state if the title already transitioned it for
-        // shader reading instead of clobbering it into UNORDERED_ACCESS.
+        // preserve its SRV state only if the title explicitly transitioned it
+        // for shader reading (not merely because an earlier bindless sweep put
+        // it in SRV state).
         let srv_set: Option<std::collections::HashSet<usize>> =
             (uses_heap_srv && uses_heap_uav && live_srvs.len() > 64)
                 .then(|| live_srvs.iter().map(|h| h.get() as usize).collect());
@@ -1086,14 +1084,14 @@ impl State {
                 }
                 if in_srvs(r)
                     && list
-                        .tracked_state(held.get())
+                        .explicit_state(held.get())
                         .is_some_and(|s| s & SHADER_RESOURCE != 0)
                 {
                     continue;
                 }
                 #[cfg(feature = "diagnostics")]
                 crate::capture::note_target(held.get());
-                crate::list::ensure_state(list, held.get(), UNORDERED_ACCESS);
+                crate::list::ensure_bindless_state(list, held.get(), UNORDERED_ACCESS);
                 if uses_heap_srv {
                     uav_transitioned.insert(r);
                 }
@@ -1111,7 +1109,11 @@ impl State {
                 {
                     if d.state == DEPTH_READ {
                         depth_sampled = true;
-                        crate::list::ensure_state(list, held.get(), DEPTH_READ | SHADER_RESOURCE);
+                        crate::list::ensure_bindless_state(
+                            list,
+                            held.get(),
+                            DEPTH_READ | SHADER_RESOURCE,
+                        );
                     }
                     continue;
                 }
@@ -1119,7 +1121,7 @@ impl State {
                     if crate::texture::title_written(t) {
                         crate::texture::upload(list, held.get(), t);
                     }
-                    crate::list::ensure_state(list, held.get(), SHADER_RESOURCE);
+                    crate::list::ensure_bindless_state(list, held.get(), SHADER_RESOURCE);
                 }
             }
         }
@@ -3840,7 +3842,6 @@ mod table_tests {
     }
 }
 
-
 #[cfg(test)]
 mod bindless_tests {
     use super::*;
@@ -4044,6 +4045,7 @@ mod bindless_tests {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
             }],
             slots: 0,
             inputs: Vec::new(),
@@ -4060,6 +4062,7 @@ mod bindless_tests {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
             }],
             slots: 0,
             inputs: Vec::new(),
@@ -4076,6 +4079,7 @@ mod bindless_tests {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
             }],
             slots: 0,
             inputs: Vec::new(),
@@ -4206,6 +4210,20 @@ mod bindless_tests {
         );
         assert_ne!(state.bindless_cache, Some(cached));
 
+        // 3b. Writing a brand-new bindless SRV descriptor mid-list bumps
+        // `tex_gen` and syncs only the newly added slot without another full walk.
+        let late_srv = make_texture(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        );
+        crate::descriptor::create_srv(null, late_srv.0, null.cast(), slot_at(6));
+        assert!(state.bind(&list, &gfx_srv_uav, false));
+        assert_eq!(
+            state.bindless_full_walks, 1,
+            "writing a new bindless descriptor mid-list must use incremental change-ring sync"
+        );
+        assert_eq!(list.tracked_state(late_srv.0), Some(SHADER_RESOURCE));
+
         // 4. Graphics bind with DEPTH_READ sets depth_sampled and keeps it on cache hit.
         let dsv_read_desc = [
             DXGI_FORMAT_D32_FLOAT.0 as u32,
@@ -4254,11 +4272,13 @@ mod bindless_tests {
         state.reset(null);
         assert!(state.bindless_cache.is_none());
 
+        let _ = host.log_messages();
+        let errors_before = host.d3d12_errors();
         list.close();
         host.execute(&[&list]);
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
-        assert_eq!(host.log_messages(), None);
+        assert_eq!(host.d3d12_errors(), errors_before);
     }
 
     #[test]
@@ -4269,7 +4289,8 @@ mod bindless_tests {
         let _ = host.log_messages();
         let (gfx_srv_uav, _, _) = make_test_pipelines(&host.device);
         const UAVS: u32 = 70;
-        let heap = make_view_heap(UAVS + 8);
+        const SRVS: u32 = 70;
+        let heap = make_view_heap(UAVS + SRVS + 8);
         let start = crate::descriptor::heap(heap.0).start;
         let slot_at = |i: u32| start + u64::from(i) * 32;
         let null = std::ptr::null();
@@ -4283,13 +4304,18 @@ mod bindless_tests {
             crate::descriptor::create_uav(null, tex.0, null, null.cast(), slot_at(i));
             uav_textures.push(tex);
         }
-        // Overlap uav_textures[0] as an SRV too, plus a separate SRV-only texture.
+        // Populate > 64 live SRVs so `live_srvs.len() > 64` exercises the
+        // `HashSet` lookup branch, including an overlapping UAV+SRV texture.
         crate::descriptor::create_srv(null, uav_textures[0].0, null.cast(), slot_at(UAVS));
-        let srv_only = make_texture(
-            DXGI_FORMAT_R8G8B8A8_UNORM,
-            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-        );
-        crate::descriptor::create_srv(null, srv_only.0, null.cast(), slot_at(UAVS + 1));
+        let mut srv_textures = Vec::with_capacity(SRVS as usize);
+        for i in 0..SRVS {
+            let tex = make_texture(
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            );
+            crate::descriptor::create_srv(null, tex.0, null.cast(), slot_at(UAVS + 1 + i));
+            srv_textures.push(tex);
+        }
 
         let list = host.new_list().expect("host list");
         let mut state = State::default();
@@ -4298,14 +4324,18 @@ mod bindless_tests {
 
         const UNORDERED_ACCESS: u32 = 0x8;
         for tex in &uav_textures {
-            assert!(list.transition(tex.0, UNORDERED_ACCESS).is_none());
+            assert_eq!(list.tracked_state(tex.0), Some(UNORDERED_ACCESS));
         }
-        assert!(list.transition(srv_only.0, SHADER_RESOURCE).is_none());
+        for tex in &srv_textures {
+            assert_eq!(list.tracked_state(tex.0), Some(SHADER_RESOURCE));
+        }
+        let _ = host.log_messages();
+        let errors_before = host.d3d12_errors();
         list.close();
         host.execute(&[&list]);
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
-        assert_eq!(host.log_messages(), None);
+        assert_eq!(host.d3d12_errors(), errors_before);
     }
 
     #[test]
@@ -4314,7 +4344,7 @@ mod bindless_tests {
             return;
         };
         let _ = host.log_messages();
-        let (gfx_srv_uav, _, _) = make_test_pipelines(&host.device);
+        let (gfx_srv_uav, gfx_srv_only, _) = make_test_pipelines(&host.device);
         let heap = make_view_heap(16);
         let start = crate::descriptor::heap(heap.0).start;
         let slot_at = |i: u32| start + u64::from(i) * 32;
@@ -4342,17 +4372,25 @@ mod bindless_tests {
 
         let mut state = State::default();
         state.set_heaps(&[heap.0]);
-        assert!(state.bind(&list, &gfx_srv_uav, false));
+        // An intervening SRV-only bindless draw temporarily sweeps B to
+        // SHADER_RESOURCE without overwriting its explicit UAV access intent.
+        assert!(state.bind(&list, &gfx_srv_only, false));
+        assert_eq!(list.tracked_state(tex_b.0), Some(SHADER_RESOURCE));
 
-        // A must remain in SHADER_RESOURCE (not clobbered to UNORDERED_ACCESS),
-        // while B remains in UNORDERED_ACCESS.
+        // A subsequent dual SRV+UAV draw must keep A in SHADER_RESOURCE
+        // (explicit SRV intent) and restore B to UNORDERED_ACCESS (explicit UAV
+        // intent, not masked by the intervening bindless sweep).
+        assert!(state.bind(&list, &gfx_srv_uav, false));
         assert_eq!(list.tracked_state(tex_a.0), Some(SHADER_RESOURCE));
         assert_eq!(list.tracked_state(tex_b.0), Some(UNORDERED_ACCESS));
+
+        let _ = host.log_messages();
+        let errors_before = host.d3d12_errors();
         list.close();
         host.execute(&[&list]);
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
-        assert_eq!(host.log_messages(), None);
+        assert_eq!(host.d3d12_errors(), errors_before);
     }
 }
 

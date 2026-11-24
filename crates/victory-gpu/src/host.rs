@@ -667,8 +667,15 @@ fn shadow_transition(
     Some(after)
 }
 
-type States =
-    std::collections::HashMap<usize, (u32, u32, std::sync::Arc<crate::resource::HostTexture>)>;
+type States = std::collections::HashMap<
+    usize,
+    (
+        u32,
+        u32,
+        Option<u32>,
+        std::sync::Arc<crate::resource::HostTexture>,
+    ),
+>;
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
@@ -1667,14 +1674,26 @@ impl HostList {
     /// The host state currently tracked for `resource` on this list, falling
     /// back to the resource's last submitted/initial host state if this list
     /// has not transitioned it yet.
+    #[cfg(test)]
     pub(crate) fn tracked_state(&self, resource: crate::object::This) -> Option<u32> {
         let copy = crate::resource::host_copy(resource)?;
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&(_, last, _)) = states.get(&(std::sync::Arc::as_ptr(&copy) as usize)) {
+        if let Some(&(_, last, _, _)) = states.get(&(std::sync::Arc::as_ptr(&copy) as usize)) {
             Some(last)
         } else {
             Some(copy.state.load(Ordering::Relaxed))
         }
+    }
+
+    /// The last state explicitly requested for `resource` on this list (via a
+    /// title barrier, copy, clear, target bind, or non-bindless descriptor
+    /// table), ignoring states chosen by bindless heap sweeps.
+    pub(crate) fn explicit_state(&self, resource: crate::object::This) -> Option<u32> {
+        let copy = crate::resource::host_copy(resource)?;
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        states
+            .get(&(std::sync::Arc::as_ptr(&copy) as usize))
+            .and_then(|&(_, _, explicit, _)| explicit)
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -1686,6 +1705,26 @@ impl HostList {
         resource: crate::object::This,
         wanted: u32,
     ) -> Option<(&'static ID3D12Resource, u32)> {
+        self.transition_inner(resource, wanted, true)
+    }
+
+    /// Same as [`HostList::transition`], for bindless heap sweeps: updates the
+    /// tracked host state without overwriting the title's explicit access
+    /// intent recorded by barriers or explicit binds.
+    pub(crate) fn transition_bindless(
+        &self,
+        resource: crate::object::This,
+        wanted: u32,
+    ) -> Option<(&'static ID3D12Resource, u32)> {
+        self.transition_inner(resource, wanted, false)
+    }
+
+    fn transition_inner(
+        &self,
+        resource: crate::object::This,
+        wanted: u32,
+        explicit: bool,
+    ) -> Option<(&'static ID3D12Resource, u32)> {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
         self.mark_work();
@@ -1694,11 +1733,15 @@ impl HostList {
             let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
             match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
                 std::collections::hash_map::Entry::Vacant(v) => {
-                    v.insert((wanted, wanted, copy));
+                    v.insert((wanted, wanted, explicit.then_some(wanted), copy));
                     (true, None)
                 }
                 std::collections::hash_map::Entry::Occupied(mut o) => {
-                    let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                    let entry = o.get_mut();
+                    let before = std::mem::replace(&mut entry.1, wanted);
+                    if explicit {
+                        entry.2 = Some(wanted);
+                    }
                     if before != wanted {
                         (true, Some((texture, before)))
                     } else {
@@ -1727,7 +1770,7 @@ impl HostList {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&(std::sync::Arc::as_ptr(copy) as usize))
-            .map(|&(_, last, _)| last)
+            .map(|&(_, last, _, _)| last)
     }
 
     /// Monotonic generation incremented whenever a texture is first tracked
@@ -1763,7 +1806,7 @@ impl HostList {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
-            .filter_map(|(first, last, copy)| {
+            .filter_map(|(first, last, _, copy)| {
                 let real = copy.state.swap(*last, Ordering::Relaxed);
                 (real != *first).then(|| {
                     transition(

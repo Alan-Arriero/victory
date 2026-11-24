@@ -539,6 +539,19 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     }
 }
 
+/// Same as [`ensure_state`], for bindless heap sweeps: records a host barrier
+/// without overwriting the title's explicit access intent.
+#[cfg(windows)]
+pub(crate) fn ensure_bindless_state(list: &crate::host::HostList, resource: This, state: u32) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
+    if let Some((texture, before)) = list.transition_bindless(resource, state) {
+        let state = crate::host::legal_state(texture, state);
+        let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
+        // SAFETY: an open list and a live texture.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+    }
+}
+
 #[cfg(windows)]
 const COPY_DEST: u32 = 0x400;
 #[cfg(windows)]

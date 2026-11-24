@@ -5,7 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -40,6 +40,11 @@ enum SlotRefresh {
     },
 }
 
+/// Maximum number of recent texture-descriptor writes retained in
+/// [`TexTracker::changes`] for incremental bindless sync across `tex_gen`
+/// bumps; overflowing falls back to a full `live_textures` walk once.
+const MAX_TEX_CHANGES: usize = 4096;
+
 /// Tracks which live host textures each view-heap slot currently references,
 /// keeping `O(active)` live sets of SRV and UAV resources for bindless heaps.
 /// Every slot entry is keyed by `(resource, is_uav)` in `res_slots` so
@@ -48,6 +53,12 @@ enum SlotRefresh {
 #[derive(Default)]
 struct TexTracker {
     generation: u64,
+    /// Generation of the last evicted entry from `changes`; any caller whose
+    /// `since_gen < oldest_gen` must perform a full `live_textures` walk.
+    oldest_gen: u64,
+    /// Bounded ring of `(generation, resource)` additions/overwrites so
+    /// `bindless_textures` can sync newly written descriptors incrementally.
+    changes: VecDeque<(u64, usize)>,
     slot_res: Vec<Option<(usize, bool)>>,
     live_srvs: HashMap<usize, u32>,
     live_uavs: HashMap<usize, u32>,
@@ -58,6 +69,8 @@ impl TexTracker {
     fn new(sampler: bool, count: u32) -> Self {
         Self {
             generation: 0,
+            oldest_gen: 0,
+            changes: VecDeque::new(),
             slot_res: if sampler {
                 Vec::new()
             } else {
@@ -67,6 +80,15 @@ impl TexTracker {
             live_uavs: HashMap::new(),
             res_slots: HashMap::new(),
         }
+    }
+
+    fn record_change(&mut self, res: usize) {
+        if self.changes.len() == MAX_TEX_CHANGES
+            && let Some((evicted_gen, _)) = self.changes.pop_front()
+        {
+            self.oldest_gen = evicted_gen;
+        }
+        self.changes.push_back((self.generation, res));
     }
 
     fn add_entry(&mut self, slot: u32, res: usize, is_uav: bool) {
@@ -540,6 +562,7 @@ impl HostHeap {
         let (resource, refresh) = match kept {
             Kept::Empty => (None, None),
             Kept::Resource(r) => (Some(r), None),
+            Kept::Texture { resource, .. } => (Some(resource), None),
             Kept::Unaligned(copy) => (
                 Some(copy.resource.clone()),
                 Some(SlotRefresh::Unaligned(copy)),
@@ -763,37 +786,14 @@ impl HostHeap {
                 make(&view, self.cpu(index))
             };
             let made_ok = kept.is_some();
-            let bound = matches!(kept, Some(Kept::Resource(_) | Kept::Unaligned(_)));
+            let new_entry = match &kept {
+                Some(Kept::Texture { title, is_uav, .. }) => Some((*title, *is_uav)),
+                _ => None,
+            };
             if !made_ok && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.unwrap_or(Kept::Empty));
-            let new_entry = if bound {
-                match &view {
-                    View::Shader(r, _)
-                        if crate::resource::host_resource(*r as crate::object::This).is_some() =>
-                    {
-                        Some((*r, false))
-                    }
-                    View::Unordered(r, _, _)
-                        if crate::resource::host_resource(*r as crate::object::This).is_some() =>
-                    {
-                        Some((*r, true))
-                    }
-                    View::Placed(false, ..) => {
-                        if let Some(View::Shader(r, _)) = placed_texture(&view)
-                            && crate::resource::host_resource(r as crate::object::This).is_some()
-                        {
-                            Some((r, false))
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
             self.track_slot(index, new_entry);
             // Close the race with `descriptor::forget` running between the initial
             // `view_at` lookup and `track_slot` before this heap's publication.
@@ -828,6 +828,9 @@ impl HostHeap {
             tracker.add_entry(index, res, is_uav);
         }
         tracker.generation += 1;
+        if let Some((res, _)) = new_entry {
+            tracker.record_change(res);
+        }
     }
 
     /// Removes all tracked references to `resource` when the title releases it,
@@ -897,35 +900,40 @@ impl HostHeap {
         (tracker.generation, srv_list, uav_list)
     }
 
-    /// Pins the subset of `candidates` currently live as SRVs and/or UAVs in
-    /// this heap, returning `(tex_gen, live_srvs, live_uavs)`. Used by the
-    /// incremental dirty-resource fast path so RT switches and copies cost
-    /// `O(|candidates|)` instead of walking every resident bindless texture.
-    pub(crate) fn pin_live_subset(
+    /// Pins the subset of resources that changed in this heap since
+    /// `since_gen` plus `extra_candidates` (e.g., list-dirtied textures and
+    /// previously skipped render targets), returning `None` if the bounded
+    /// change ring wrapped past `since_gen` so the caller falls back to a full
+    /// `live_textures` walk.
+    pub(crate) fn pin_live_subset_since(
         &self,
-        candidates: &[usize],
+        since_gen: u64,
+        extra_candidates: &[usize],
         srvs: bool,
         uavs: bool,
-    ) -> (u64, Vec<crate::object::Held>, Vec<crate::object::Held>) {
+    ) -> Option<(u64, Vec<crate::object::Held>, Vec<crate::object::Held>)> {
         let tracker = self.tex_tracker.lock().unwrap_or_else(|e| e.into_inner());
+        if since_gen < tracker.oldest_gen {
+            return None;
+        }
         let mut srv_list = Vec::new();
         let mut uav_list = Vec::new();
-        let mut seen = HashSet::with_capacity(candidates.len());
-        for &r in candidates {
+        let mut seen = HashSet::with_capacity(extra_candidates.len());
+        let mut visit = |r: usize| {
             if !seen.insert(r) {
-                continue;
+                return;
             }
             let is_srv = srvs && tracker.live_srvs.contains_key(&r);
             let is_uav = uavs && tracker.live_uavs.contains_key(&r);
             if !is_srv && !is_uav {
-                continue;
+                return;
             }
             // SAFETY: while `tex_tracker` is held, any tracked `Resource` has
             // not finished `Resource::drop` (which calls `forget_resource`
             // before deallocating), so its `refs` atomic is still allocated.
             let Some(held) = (unsafe { crate::object::Held::try_new(r as crate::object::This) })
             else {
-                continue;
+                return;
             };
             if is_srv && is_uav {
                 if let Some(second) =
@@ -940,8 +948,18 @@ impl HostHeap {
             } else {
                 uav_list.push(held);
             }
+        };
+        for &r in extra_candidates {
+            visit(r);
         }
-        (tracker.generation, srv_list, uav_list)
+        if since_gen < tracker.generation {
+            for &(gen_id, r) in &tracker.changes {
+                if gen_id > since_gen {
+                    visit(r);
+                }
+            }
+        }
+        Some((tracker.generation, srv_list, uav_list))
     }
 
     /// Raw tracked addresses for synthetic unit tests that exercise
@@ -1110,6 +1128,14 @@ fn raw_start_fits(first: u64) -> bool {
 enum Kept {
     Empty,
     Resource(ID3D12Resource),
+    /// A host texture SRV or UAV, carrying the title `Resource` address and
+    /// access kind so [`HostHeap::mirror`] can track it without re-reading the
+    /// title pointer after `make`.
+    Texture {
+        resource: ID3D12Resource,
+        title: usize,
+        is_uav: bool,
+    },
     Unaligned(UnalignedCopy),
     AliasedShadow {
         shadow: Arc<Shadow>,
@@ -1411,8 +1437,8 @@ fn supports_typed_uav(format: DXGI_FORMAT) -> bool {
 /// Default concrete format for a typeless texture when a shader or unordered
 /// access view leaves the description absent or `DXGI_FORMAT_UNKNOWN`. Depth
 /// multi-plane, block-compressed, and 96-bit `R32G32B32` formats only allow
-/// shader views (`None` for UAVs); optional BGRA typed UAVs require device
-/// format support.
+/// shader views (`None` for UAVs); every typed UAV format is gated on the host
+/// device's cached `D3D12_FEATURE_FORMAT_SUPPORT` query.
 fn default_concrete_format(typeless: u32, unordered: bool) -> Option<u32> {
     let concrete = match DXGI_FORMAT(typeless as i32) {
         // Depth-stencil multi-plane (SRV only, plane 0)
@@ -1430,7 +1456,7 @@ fn default_concrete_format(typeless: u32, unordered: bool) -> Option<u32> {
         DXGI_FORMAT_BC7_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC7_UNORM)?,
         // 96-bit RGB has no typed UAV in D3D12 (SRV only)
         DXGI_FORMAT_R32G32B32_TYPELESS => (!unordered).then_some(DXGI_FORMAT_R32G32B32_FLOAT)?,
-        // Color (SRV and UAV)
+        // Color (SRV, and UAV when supported by the host device)
         DXGI_FORMAT_R32G32B32A32_TYPELESS => DXGI_FORMAT_R32G32B32A32_FLOAT,
         DXGI_FORMAT_R16G16B16A16_TYPELESS => DXGI_FORMAT_R16G16B16A16_FLOAT,
         DXGI_FORMAT_R32G32_TYPELESS => DXGI_FORMAT_R32G32_FLOAT,
@@ -1441,21 +1467,13 @@ fn default_concrete_format(typeless: u32, unordered: bool) -> Option<u32> {
         DXGI_FORMAT_R8G8_TYPELESS => DXGI_FORMAT_R8G8_UNORM,
         DXGI_FORMAT_R16_TYPELESS => DXGI_FORMAT_R16_FLOAT,
         DXGI_FORMAT_R8_TYPELESS => DXGI_FORMAT_R8_UNORM,
-        // BGRA typed UAVs are optional driver support.
-        DXGI_FORMAT_B8G8R8A8_TYPELESS => {
-            if unordered && !supports_typed_uav(DXGI_FORMAT_B8G8R8A8_UNORM) {
-                return None;
-            }
-            DXGI_FORMAT_B8G8R8A8_UNORM
-        }
-        DXGI_FORMAT_B8G8R8X8_TYPELESS => {
-            if unordered && !supports_typed_uav(DXGI_FORMAT_B8G8R8X8_UNORM) {
-                return None;
-            }
-            DXGI_FORMAT_B8G8R8X8_UNORM
-        }
+        DXGI_FORMAT_B8G8R8A8_TYPELESS => DXGI_FORMAT_B8G8R8A8_UNORM,
+        DXGI_FORMAT_B8G8R8X8_TYPELESS => DXGI_FORMAT_B8G8R8X8_UNORM,
         _ => return None,
     };
+    if unordered && !supports_typed_uav(concrete) {
+        return None;
+    }
     Some(concrete.0 as u32)
 }
 
@@ -1723,7 +1741,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         at,
                     )
                 };
-                Some(Kept::Resource(texture.clone()))
+                Some(Kept::Texture {
+                    resource: texture.clone(),
+                    title: resource as usize,
+                    is_uav: false,
+                })
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
@@ -1770,7 +1792,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     at,
                 )
             };
-            Some(Kept::Resource(texture.clone()))
+            Some(Kept::Texture {
+                resource: texture.clone(),
+                title: resource as usize,
+                is_uav: true,
+            })
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
@@ -2338,7 +2364,7 @@ mod tests {
             Some(DXGI_FORMAT_R32G32B32_FLOAT.0 as u32)
         );
         assert_eq!(uav(DXGI_FORMAT_R32G32B32_TYPELESS), None);
-        // Color typeless: both SRV and UAV.
+        // Color typeless: always valid as SRV, gated by host typed-UAV support as UAV.
         for (typeless, concrete) in [
             (
                 DXGI_FORMAT_R32G32B32A32_TYPELESS,
@@ -2359,12 +2385,6 @@ mod tests {
             (DXGI_FORMAT_R8G8_TYPELESS, DXGI_FORMAT_R8G8_UNORM),
             (DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_FLOAT),
             (DXGI_FORMAT_R8_TYPELESS, DXGI_FORMAT_R8_UNORM),
-        ] {
-            assert_eq!(srv(typeless), Some(concrete.0 as u32));
-            assert_eq!(uav(typeless), Some(concrete.0 as u32));
-        }
-        // BGRA typeless: always valid as SRV, optional driver support as UAV.
-        for (typeless, concrete) in [
             (DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT_B8G8R8A8_UNORM),
             (DXGI_FORMAT_B8G8R8X8_TYPELESS, DXGI_FORMAT_B8G8R8X8_UNORM),
         ] {
@@ -2636,26 +2656,32 @@ mod tests {
         ] {
             let v_none = View::Shader(obj.0 as usize, None);
             assert!(
-                matches!(make(&v_none, next_slot()), Some(Kept::Resource(_))),
+                matches!(
+                    make(&v_none, next_slot()),
+                    Some(Kept::Texture { is_uav: false, .. })
+                ),
                 "default SRV failed"
             );
             let v_unknown = View::Shader(obj.0 as usize, Some(srv_unknown_2d));
             assert!(
-                matches!(make(&v_unknown, next_slot()), Some(Kept::Resource(_))),
+                matches!(
+                    make(&v_unknown, next_slot()),
+                    Some(Kept::Texture { is_uav: false, .. })
+                ),
                 "UNKNOWN SRV failed"
             );
         }
         assert!(matches!(
             make(&View::Shader(msaa_typeless.0 as usize, None), next_slot()),
-            Some(Kept::Resource(_))
+            Some(Kept::Texture { is_uav: false, .. })
         ));
         assert!(matches!(
             make(&View::Shader(tex3d.0 as usize, None), next_slot()),
-            Some(Kept::Resource(_))
+            Some(Kept::Texture { is_uav: false, .. })
         ));
         assert!(matches!(
             make(&View::Shader(tex1d_arr.0 as usize, None), next_slot()),
-            Some(Kept::Resource(_))
+            Some(Kept::Texture { is_uav: false, .. })
         ));
 
         // sRGB+UAV keeps sRGB in default SRVs.
@@ -2672,22 +2698,28 @@ mod tests {
         for obj in [&rgba_typeless, &r32_typeless, &srgb_uav] {
             let v_none = View::Unordered(obj.0 as usize, 0, None);
             assert!(
-                matches!(make(&v_none, next_slot()), Some(Kept::Resource(_))),
+                matches!(
+                    make(&v_none, next_slot()),
+                    Some(Kept::Texture { is_uav: true, .. })
+                ),
                 "default UAV failed"
             );
             let v_unknown = View::Unordered(obj.0 as usize, 0, Some(uav_unknown_2d));
             assert!(
-                matches!(make(&v_unknown, next_slot()), Some(Kept::Resource(_))),
+                matches!(
+                    make(&v_unknown, next_slot()),
+                    Some(Kept::Texture { is_uav: true, .. })
+                ),
                 "UNKNOWN UAV failed"
             );
         }
         assert!(matches!(
             make(&View::Unordered(tex3d.0 as usize, 0, None), next_slot()),
-            Some(Kept::Resource(_))
+            Some(Kept::Texture { is_uav: true, .. })
         ));
         assert!(matches!(
             make(&View::Unordered(tex1d_arr.0 as usize, 0, None), next_slot()),
-            Some(Kept::Resource(_))
+            Some(Kept::Texture { is_uav: true, .. })
         ));
 
         // Depth, BC, and MSAA UAVs return None and leave null descriptors cleanly.
