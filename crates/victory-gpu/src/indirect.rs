@@ -4,7 +4,7 @@
 //! billion vertices or a dispatch past the host's limits runs until the
 //! host resets the display driver. So every record is clamped on the GPU,
 //! just before its execution, by a compute shader of ours (HLSL compiled by
-//! the system's compiler; a 5.1 shader with its root signature inside).
+//! [`crate::hlsl`], with its root signature inside).
 //! Non-indexed rectangle-list draws follow the clamp with GPU-side
 //! rectangle expansion in [`crate::rectangles`].
 //!
@@ -18,10 +18,7 @@
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 
@@ -71,99 +68,6 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-/// Where `dxcompiler.dll` is looked for: `VICTORY_DXC` (the DLL or its
-/// folder), beside the `dxil.dll` shader validation uses (the SDK ships them
-/// together), then the executable's folder and System32.
-fn dxc_library() -> windows::core::Result<windows::Win32::Foundation::HMODULE> {
-    use windows::Win32::System::LibraryLoader::{
-        LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
-        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
-    };
-    use windows::core::{HSTRING, w};
-    let mut paths: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(p) = std::env::var_os("VICTORY_DXC").map(std::path::PathBuf::from) {
-        paths.push(if p.is_dir() {
-            p.join("dxcompiler.dll")
-        } else {
-            p
-        });
-    }
-    if let Some(dir) = victory_shader::emit::validator::Validator::default_path()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-    {
-        paths.push(dir.join("dxcompiler.dll"));
-    }
-    for path in paths.iter().filter(|p| p.is_file()) {
-        // SAFETY: a NUL-terminated path; its folder (dxil.dll) is searched first.
-        if let Ok(m) = unsafe {
-            LoadLibraryExW(
-                &HSTRING::from(path.as_path()),
-                None,
-                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
-            )
-        } {
-            return Ok(m);
-        }
-    }
-    // SAFETY: a bare name, searched only in the executable's folder and System32.
-    unsafe {
-        LoadLibraryExW(
-            w!("dxcompiler.dll"),
-            None,
-            LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
-        )
-    }
-}
-
-/// Compiles a compute shader with DXC (see [`dxc_library`]).
-fn dxc_compile(source: &str) -> windows::core::Result<Vec<u8>> {
-    use windows::Win32::Graphics::Direct3D::Dxc::*;
-    use windows::Win32::System::LibraryLoader::GetProcAddress;
-    use windows::core::{Interface, w};
-    type Create = unsafe extern "system" fn(
-        *const windows::core::GUID,
-        *const windows::core::GUID,
-        *mut *mut std::ffi::c_void,
-    ) -> windows::core::HRESULT;
-    // SAFETY: loading the compiler and calling its documented entry point with
-    // out pointers of ours; the buffer and arguments outlive the calls.
-    unsafe {
-        let library = dxc_library()?;
-        let create: Create = std::mem::transmute(
-            GetProcAddress(library, s!("DxcCreateInstance"))
-                .ok_or_else(windows::core::Error::from_thread)?,
-        );
-        let mut raw = std::ptr::null_mut();
-        create(&CLSID_DxcCompiler, &IDxcCompiler3::IID, &mut raw).ok()?;
-        let compiler = IDxcCompiler3::from_raw(raw);
-        let buffer = DxcBuffer {
-            Ptr: source.as_ptr().cast(),
-            Size: source.len(),
-            Encoding: DXC_CP_UTF8.0,
-        };
-        let arguments = [w!("-T"), w!("cs_6_0"), w!("-E"), w!("main"), w!("-O3")];
-        let result: IDxcResult = compiler.Compile(&buffer, Some(&arguments), None)?;
-        if let Err(e) = result.GetStatus()?.ok() {
-            if let Ok(errors) = result.GetErrorBuffer() {
-                let text = std::slice::from_raw_parts(
-                    errors.GetBufferPointer().cast::<u8>(),
-                    errors.GetBufferSize(),
-                );
-                tracing::warn!(
-                    "argument clamp: DXC: {}",
-                    String::from_utf8_lossy(text).trim()
-                );
-            }
-            return Err(e);
-        }
-        let blob = result.GetResult()?;
-        Ok(
-            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
-                .to_vec(),
-        )
-    }
-}
-
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
@@ -189,53 +93,11 @@ fn clamp() -> Option<&'static Clamp> {
 
 fn make() -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe {
-        D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("clamp"),
-            None,
-            None,
-            s!("main"),
-            s!("cs_5_1"),
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
-    // Wine's d3dcompiler_47 (vkd3d-shader) rejects RWByteAddressBuffer loads:
-    // then DXC (dxcompiler.dll; see `dxc_library` for where it is looked for) compiles
-    // the same source as cs_6_0, root signature inside.
-    let fallback;
-    if let Err(e) = &compiled {
-        if let Some(errors) = &errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe {
-                std::slice::from_raw_parts(
-                    errors.GetBufferPointer().cast::<u8>(),
-                    errors.GetBufferSize(),
-                )
-            };
-            tracing::info!(error = %e, "argument clamp: the system compiler refused it ({}); trying DXC", String::from_utf8_lossy(text).trim());
-        }
-        fallback = dxc_compile(SOURCE)
-            .inspect_err(|e| tracing::warn!(error = %e, "argument clamp: DXC failed too"))?;
-    } else {
-        fallback = Vec::new();
-    }
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    // Wine's d3dcompiler_47 refuses it; `compile_compute` then uses DXC.
+    let bytes = crate::hlsl::compile_compute("argument clamp", SOURCE)?;
+    let bytes = &bytes[..];
+    // SAFETY: plain object creation; the root signature is inside the shader.
     unsafe {
-        let bytes = match (&compiled, &code) {
-            (Ok(()), Some(code)) => std::slice::from_raw_parts(
-                code.GetBufferPointer().cast::<u8>(),
-                code.GetBufferSize(),
-            ),
-            _ => &fallback[..],
-        };
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
