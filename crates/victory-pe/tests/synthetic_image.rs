@@ -521,8 +521,9 @@ fn tls_directory_without_callbacks_or_without_an_rva() {
 }
 
 #[test]
-fn tls_callback_array_stops_at_the_end_of_the_section() {
-    // The last slot of the section, with no null terminator after it.
+fn tls_callback_array_running_off_the_section_is_refused() {
+    // The last slot of the section, with no null terminator after it: the
+    // list is incomplete, so the image is refused rather than half-run.
     let last = SECTION_RVA + SECTION_SIZE - 8;
     let mut d = image();
     put64(
@@ -531,8 +532,7 @@ fn tls_callback_array_stops_at_the_end_of_the_section() {
         IMAGE_BASE + u64::from(last),
     );
     put64(&mut d, at(last), IMAGE_BASE + 0x1030);
-    let tls = ImageInfo::parse(&d).unwrap().tls.unwrap();
-    assert_eq!(tls.callback_rvas, [0x1030]);
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
 }
 
 #[test]
@@ -593,9 +593,9 @@ fn import_symbols_display_as_their_name_or_ordinal() {
 }
 
 #[test]
-fn tls_callbacks_are_capped() {
+fn tls_callbacks_over_the_limit_are_refused() {
     // Grow the section so a 1100-entry callback array, with no terminator,
-    // fits after the existing contents.
+    // fits after the existing contents. More than 1024 callbacks is garbage.
     const SIZE: u32 = 0x3000;
     const ARRAY: u32 = 0x1400;
     const COUNT: usize = 1100;
@@ -613,10 +613,7 @@ fn tls_callbacks_are_capped() {
     for i in 0..COUNT {
         put64(&mut d, at(ARRAY) + i * 8, IMAGE_BASE + 0x1000 + i as u64);
     }
-    let tls = ImageInfo::parse(&d).unwrap().tls.unwrap();
-    assert_eq!(tls.callback_rvas.len(), 1024);
-    assert_eq!(tls.callback_rvas[0], 0x1000);
-    assert_eq!(tls.callback_rvas[1023], 0x1000 + 1023);
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
 }
 
 #[test]
