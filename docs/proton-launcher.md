@@ -33,7 +33,8 @@ The launcher creates shader-cache directories at
 `${XDG_CACHE_HOME:-$HOME/.cache}/victory/vkd3d` and
 `${XDG_CACHE_HOME:-$HOME/.cache}/victory/dxvk`, keeping generated caches out
 of the checkout. `VKD3D_SHADER_CACHE_PATH` and `DXVK_STATE_CACHE_PATH`
-override these defaults. Empty or relative XDG base directories fall back
+override these defaults. `VKD3D_SHADER_CACHE_PATH=0` disables the VKD3D cache
+without creating a directory. Empty or relative XDG base directories fall back
 to the standard directories under `$HOME`.
 
 Set `VICTORY_TRACE_PIPELINES=1` to log the shader stages and hashes with the

@@ -73,10 +73,12 @@ nix develop .#proton                 # adds umu-run and vulkaninfo
 nix-shell --arg withProton true
 
 vulkaninfo --summary
-./scripts/victory-proton.sh "/path/to/game/title.exe" --execute
+# Select the MSVC release build produced above:
+VICTORY_EXE="${CARGO_TARGET_DIR:-target}/x86_64-pc-windows-msvc/release/victory.exe" \
+    ./scripts/victory-proton.sh "/path/to/game/title.exe" --execute
 
 # Select a diagnostics build explicitly:
-VICTORY_EXE="$PWD/target/x86_64-pc-windows-msvc/diag/victory.exe" \
+VICTORY_EXE="${CARGO_TARGET_DIR:-target}/x86_64-pc-windows-msvc/diag/victory.exe" \
     ./scripts/victory-proton.sh "/path/to/game/title.exe" --execute
 ```
 

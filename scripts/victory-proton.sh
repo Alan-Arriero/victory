@@ -55,7 +55,11 @@ export WINEPREFIX=${WINEPREFIX:-$data_home/victory/proton}
 # Both translation layers otherwise write derived data to the working directory.
 export VKD3D_SHADER_CACHE_PATH=${VKD3D_SHADER_CACHE_PATH:-$cache_home/victory/vkd3d}
 export DXVK_STATE_CACHE_PATH=${DXVK_STATE_CACHE_PATH:-$cache_home/victory/dxvk}
-mkdir -p -- "$VKD3D_SHADER_CACHE_PATH" "$DXVK_STATE_CACHE_PATH"
+# VKD3D reserves 0 for disabling its cache.
+if [[ $VKD3D_SHADER_CACHE_PATH != 0 ]]; then
+    mkdir -p -- "$VKD3D_SHADER_CACHE_PATH"
+fi
+mkdir -p -- "$DXVK_STATE_CACHE_PATH"
 windows_title=${title//\//\\}
 windows_binary=${binary//\//\\}
 export STEAM_COMPAT_INSTALL_PATH=${STEAM_COMPAT_INSTALL_PATH:-$(dirname -- "$binary")}

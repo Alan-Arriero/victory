@@ -2,7 +2,7 @@
 # Launcher regression checks: synthetic files and a fake UMU, no GPU or Wine.
 set -euo pipefail
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
-launcher=${1:-$root/scripts/victory-proton.sh}
+launcher=$(realpath -- "${1:-$root/scripts/victory-proton.sh}")
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 mkdir -p "$work/bin" "$work/build with spaces" "$work/game with spaces"
@@ -47,5 +47,16 @@ status=0
 UMU_EXIT=42 bash "$launcher" "$work/game with spaces/title.exe" || status=$?
 test "$status" -eq 42
 printf '%s\n' "$WINEPREFIX" "$VKD3D_SHADER_CACHE_PATH" "$DXVK_STATE_CACHE_PATH" > "$work/expected"
+diff -u "$work/expected" "$ENV_RECORD"
+
+# VKD3D treats 0 as "disable caching", not as a directory name.
+export VKD3D_SHADER_CACHE_PATH=0 DXVK_STATE_CACHE_PATH="$work/disabled vkd3d/dxvk"
+(
+    cd "$work"
+    bash "$launcher" "$work/game with spaces/title.exe"
+)
+test ! -e "$work/0"
+test -d "$DXVK_STATE_CACHE_PATH"
+printf '%s\n' "$WINEPREFIX" 0 "$DXVK_STATE_CACHE_PATH" > "$work/expected"
 diff -u "$work/expected" "$ENV_RECORD"
 echo 'Proton launcher checks passed.'
