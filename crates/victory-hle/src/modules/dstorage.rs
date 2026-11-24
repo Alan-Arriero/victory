@@ -1014,15 +1014,34 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
-        // Raw reads land through the kernel, which does not fault into the
-        // GPU side's guard on title buffers; open them first.
-        victory_gpu::kernel_will_write(request.destination as usize, len);
-        // SAFETY: the title's destination holds `destination_size` bytes, at
-        // least `len`, and nothing else writes it until completion.
-        let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        let filled = fill(out);
-        victory_gpu::kernel_wrote(request.destination as usize, len);
-        return filled.map(drop);
+        if request.options & (ZLIB | BCPACK) == 0 {
+            // Raw reads are bounded by the OS file read and do not need a
+            // second potentially large buffer.
+            victory_gpu::kernel_will_write(request.destination as usize, len);
+            // SAFETY: the title's destination holds `destination_size` bytes,
+            // at least `len`, and the worker owns this request until completion.
+            let out =
+                unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
+            let filled = fill(out);
+            victory_gpu::kernel_wrote(request.destination as usize, len);
+            return filled.map(drop);
+        }
+        // Decode into host-owned memory first. A title mapping can disappear
+        // while a worker is running; copying through the kernel reports that
+        // instead of faulting this worker while it writes the destination.
+        let mut data = vec![0; len];
+        let written = fill(&mut data)?;
+        if written > len {
+            return Err(E_INVALIDARG);
+        }
+        if !victory_gpu::write_title_memory(request.destination as usize, &data[..written]) {
+            tracing::warn!(
+                bytes = written,
+                "dstorage: decompressed destination write failed"
+            );
+            return Err(E_INVALIDARG);
+        }
+        return Ok(());
     }
     let offset = (request.page_offset & 0xffff) as usize;
     // SAFETY: the title passes a page number per 64 KiB of destination,

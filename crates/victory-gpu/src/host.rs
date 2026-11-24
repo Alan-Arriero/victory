@@ -1913,6 +1913,18 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
 
+/// Copies host-owned bytes into title memory without dereferencing a
+/// potentially unmapped destination on a worker thread.
+pub fn write_title_memory(destination: usize, bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    crate::watch::kernel_will_write(destination, bytes.len());
+    let written = read(bytes.as_ptr(), destination as *mut u8, bytes.len());
+    crate::watch::kernel_wrote(destination, bytes.len());
+    written
+}
+
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 ///
@@ -1949,7 +1961,7 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 
 #[cfg(test)]
 mod title_copies {
-    use super::{copy_mapped, write_mapped};
+    use super::{copy_mapped, write_mapped, write_title_memory};
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
         VirtualAlloc, VirtualFree, VirtualProtect,
@@ -2037,6 +2049,18 @@ mod title_copies {
         assert_ne!(protected, 0);
         // SAFETY: the third block.
         write_mapped(unsafe { to.add(2 * BLOCK) }, from.as_ptr(), BLOCK);
+        assert!(block(to, 2).iter().all(|&b| b == 0xee));
+        release(to);
+    }
+
+    #[test]
+    fn title_memory_write_reports_unmapped_destination_without_faulting() {
+        let from = pattern();
+        let to = holed(0xee);
+        assert!(write_title_memory(to as usize, &from[..BLOCK]));
+        assert_eq!(block(to, 0), &from[..BLOCK]);
+        assert!(!write_title_memory(to as usize, &from));
+        assert_eq!(block(to, 0), &from[..BLOCK]);
         assert!(block(to, 2).iter().all(|&b| b == 0xee));
         release(to);
     }
