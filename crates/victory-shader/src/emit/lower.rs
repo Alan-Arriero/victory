@@ -79,15 +79,21 @@ const UNTRACKED_SELECT: Why = "a select on an untracked mask";
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    lower_with_wave32(parts, true)
+    lower_with_wave32(parts, true, None)
 }
 
-pub(crate) fn lower_with_wave32(parts: &Parts, allow_wave32: bool) -> Result<Lowered, ShaderError> {
-    match lower_program(parts, false, allow_wave32) {
+pub(crate) fn lower_with_wave32(
+    parts: &Parts,
+    allow_wave32: bool,
+    pixel_inputs: Option<&[SigElement]>,
+) -> Result<Lowered, ShaderError> {
+    match lower_program(parts, false, allow_wave32, pixel_inputs) {
         Err(ShaderError::Unsupported {
             what: UNTRACKED_SELECT,
             ..
-        }) if parts.native.stage == HwStage::Cs => lower_program(parts, true, allow_wave32),
+        }) if parts.native.stage == HwStage::Cs => {
+            lower_program(parts, true, allow_wave32, pixel_inputs)
+        }
         result => result,
     }
 }
@@ -96,10 +102,11 @@ fn lower_program(
     parts: &Parts,
     numeric_selects: bool,
     allow_wave32: bool,
+    pixel_inputs: Option<&[SigElement]>,
 ) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, numeric_selects, allow_wave32).run() {
+        match Lower::new(parts, &bad, numeric_selects, allow_wave32).run(pixel_inputs) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -183,9 +190,14 @@ fn half_shift(width: u32) -> u32 {
 /// it is a sampler, and the resource properties.
 type HandleKey = (usize, Site, u8, bool, (u32, u32));
 
+/// Source element id, element-relative channel, value, and optional f16 half.
+type ExportStore = (usize, u8, Value, Option<bool>);
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
+    /// Original to retained element ids for mesh vertex and primitive exports.
+    mesh_output_ids: Option<[Vec<Option<usize>>; 2]>,
     bad: &'a HashMap<Value, Why>,
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
@@ -594,6 +606,7 @@ impl<'a> Lower<'a> {
         Lower {
             s,
             x,
+            mesh_output_ids: None,
             bad,
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
@@ -1080,7 +1093,7 @@ impl<'a> Lower<'a> {
         acc
     }
 
-    fn run(mut self) -> Result<Lowered, Stop> {
+    fn run(mut self, pixel_inputs: Option<&[SigElement]>) -> Result<Lowered, Stop> {
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -1110,6 +1123,7 @@ impl<'a> Lower<'a> {
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
+            self.prune_mesh_outputs(mesh, pixel_inputs)?;
             self.block[order[0]] = Some(self.cur);
         }
         for &b in &order {
@@ -7724,33 +7738,70 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
-        let e = *self
-            .exports
-            .get(&(b, i))
-            .ok_or("an export I/O raising did not see")?;
-        // Two f16 channels per source dword: only the pixel color and
-        // depth targets unpack them; the rest stay refused.
-        if e.compressed && !matches!(e.target, Target::Color(_) | Target::Depth) {
-            return Err("a compressed export");
+    fn prune_mesh_outputs(
+        &mut self,
+        mesh: super::shader::Mesh,
+        pixel_inputs: Option<&[SigElement]>,
+    ) -> Result<(), Stop> {
+        use super::shader::Mesh;
+
+        if mesh.output_bytes(&self.s.outputs, &self.s.prims) <= Mesh::MAX_OUTPUT_BYTES {
+            return Ok(());
         }
-        let guard = self.guard(b, i)?;
-        let mesh = self.s.mesh.is_some();
-        let c = self.cur;
-        if let Some(g) = guard
-            && !mesh
-        {
-            if !(e.done && self.s.pixel) {
-                return Err("a conditional export");
+
+        let mut written = [
+            vec![false; self.s.outputs.len()],
+            vec![false; self.s.prims.len()],
+        ];
+        if pixel_inputs.is_none() {
+            // Standalone emission lacks a consumer. Only declarations with no
+            // corresponding export can go, and rasterizer system values stay.
+            for export in &self.x.io.exports {
+                let primitive = match export.target {
+                    Target::Param { .. } => 0,
+                    Target::PrimitiveParam { .. } => 1,
+                    _ => continue,
+                };
+                for (id, _, _, _) in self.export_stores(export).map_err(|w| unsupported(0, w))? {
+                    written[primitive][id] = true;
+                }
             }
-            let t = self.s.m.bool(true);
-            let kill = self.s.m.bin(c, Bin::Xor, g, t);
-            self.s
-                .op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
         }
-        if mesh && e.target == Target::Primitive {
-            return self.emit_indices(e, guard);
+
+        let retain = |elements: &mut Vec<SigElement>, written: &[bool]| {
+            let mut ids = Vec::with_capacity(elements.len());
+            let mut next = 0;
+            elements.retain(|e| {
+                let keep = e.kind != 0
+                    || pixel_inputs.map_or(written[ids.len()], |inputs| {
+                        inputs.iter().any(|input| {
+                            input.kind == 0
+                                && input.index == e.index
+                                && input.name.eq_ignore_ascii_case(&e.name)
+                        })
+                    });
+                ids.push(keep.then_some(next));
+                next += usize::from(keep);
+                keep
+            });
+            ids
+        };
+
+        self.mesh_output_ids = Some([
+            retain(&mut self.s.outputs, &written[0]),
+            retain(&mut self.s.prims, &written[1]),
+        ]);
+        if mesh.output_bytes(&self.s.outputs, &self.s.prims) > Mesh::MAX_OUTPUT_BYTES {
+            return Err(unsupported(
+                0,
+                "a mesh output signature beyond the host's size limit",
+            ));
         }
+        Ok(())
+    }
+
+    fn export_stores(&self, e: &Export) -> Result<Vec<ExportStore>, Why> {
+        let mesh = self.s.mesh.is_some();
         let param_row = |usage: Usage, row: u8| match usage {
             // The 2020 compiler leaves a mesh program's first entry zeroed
             // (usage "position"): its row is the one no other entry names.
@@ -7762,9 +7813,9 @@ impl<'a> Lower<'a> {
         let mut stores = Vec::new();
         let primitive = matches!(e.target, Target::PrimitiveParam { .. });
         let outputs = if primitive {
-            &self.s.prims
+            &self.x.prims
         } else {
-            &self.s.outputs
+            &self.x.outputs
         };
         let by_kind = |kind: u8| outputs.iter().position(|o| o.kind == kind);
         // 16-bit vertex outputs: the halves each dword carries, as (output
@@ -7809,8 +7860,13 @@ impl<'a> Lower<'a> {
             let found = match e.target {
                 Target::Color(n) => outputs
                     .iter()
-                    .position(|o| o.kind == 16 && o.row == Some(u32::from(n)))
-                    .map(|id| (id, ch)),
+                    .position(|o| {
+                        o.kind == 16
+                            && o.index == u32::from(n)
+                            && ch >= o.col
+                            && ch < o.col + o.cols
+                    })
+                    .map(|id| (id, ch - outputs[id].col)),
                 Target::Position(0) => by_kind(3).map(|id| (id, ch)),
                 Target::Depth => match ch {
                     0 => by_kind(17)
@@ -7861,6 +7917,50 @@ impl<'a> Lower<'a> {
                 let half = e.compressed.then_some(ch % 2 == 1);
                 stores.push((id, col, value, half));
             }
+        }
+        Ok(stores)
+    }
+
+    fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
+        let e = *self
+            .exports
+            .get(&(b, i))
+            .ok_or("an export I/O raising did not see")?;
+        // Two f16 channels per source dword: only the pixel color and
+        // depth targets unpack them; the rest stay refused.
+        if e.compressed && !matches!(e.target, Target::Color(_) | Target::Depth) {
+            return Err("a compressed export");
+        }
+        let guard = self.guard(b, i)?;
+        let mesh = self.s.mesh.is_some();
+        let c = self.cur;
+        if let Some(g) = guard
+            && !mesh
+        {
+            if !(e.done && self.s.pixel) {
+                return Err("a conditional export");
+            }
+            let t = self.s.m.bool(true);
+            let kill = self.s.m.bin(c, Bin::Xor, g, t);
+            self.s
+                .op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+        }
+        if mesh && e.target == Target::Primitive {
+            return self.emit_indices(e, guard);
+        }
+        let primitive = matches!(e.target, Target::PrimitiveParam { .. });
+        let mut stores = self.export_stores(e)?;
+        if let Some(ids) = &self.mesh_output_ids {
+            stores.retain_mut(|store| {
+                let Some(id) = ids[usize::from(primitive)][store.0] else {
+                    return false;
+                };
+                store.0 = id;
+                true
+            });
+        }
+        if mesh && stores.is_empty() {
+            return Ok(());
         }
         fn elements<'l>(l: &'l mut Lower, primitive: bool) -> &'l mut Vec<SigElement> {
             if primitive {
@@ -8012,7 +8112,7 @@ impl<'a> Lower<'a> {
                 .any(|o| o.param & 0x80 == 0 && o.usage != Usage::Other(0) && u32::from(o.row) == r)
         };
         let free: std::collections::BTreeSet<u32> = self
-            .s
+            .x
             .outputs
             .iter()
             .filter(|o| o.kind == 0)

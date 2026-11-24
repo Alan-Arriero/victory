@@ -72,7 +72,9 @@
 //!   console numbers groups in x only: the draw path passes the title's
 //!   count as `DispatchMesh(x, 1, 1)`. Per-primitive outputs (`PSG1`) are
 //!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
-//!   console never exports them).
+//!   console never exports them). When the output signature exceeds the
+//!   DXIL byte limit, the pipeline keeps only the varyings its pixel shader
+//!   declares and the rasterizer system values.
 
 mod bitcode;
 mod container;
@@ -291,6 +293,42 @@ pub fn translate_with_wave32(
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    translate_native(&c, &native, allow_wave32, None)
+}
+
+/// Emits an oversized mesh shader with only the varyings its pipeline's
+/// translated pixel shader declares. With no pixel shader, keeps rasterizer
+/// system values. Returns `None` if the original signature fits the budget.
+pub fn translate_mesh_for_pixel(
+    c: &Container<'_>,
+    native: &NativeProgram,
+    pixel_dxil: Option<&[u8]>,
+) -> Result<Option<HostShader>, ShaderError> {
+    let crate::native::StageIo::Ms(ms) = &native.io else {
+        return Err(ShaderError::Malformed("no mesh program"));
+    };
+    let mesh = shader::Mesh {
+        max_vertices: ms.max_vertices,
+        max_primitives: ms.max_primitives,
+        topology: ms.topology,
+    };
+    let (outputs, prims) = (signature_part(c, FourCC::OSG1)?, primitive_signature(c)?);
+    if mesh.output_bytes(&outputs, &prims) <= shader::Mesh::MAX_OUTPUT_BYTES {
+        return Ok(None);
+    }
+    let mut pixel_inputs = Vec::new();
+    if let Some(dxil) = pixel_dxil {
+        pixel_inputs = signature_part(&Container::parse(dxil)?, FourCC::ISG1)?;
+    }
+    translate_native(c, native, true, Some(&pixel_inputs)).map(Some)
+}
+
+fn translate_native(
+    c: &Container<'_>,
+    native: &NativeProgram,
+    allow_wave32: bool,
+    pixel_inputs: Option<&[container::SigElement]>,
+) -> Result<HostShader, ShaderError> {
     // A compute program whose root arguments all sit past the 16 user SGPRs
     // finds them through the spill table `s[0:1]` points to.
     let spilled = native.stage == HwStage::Cs
@@ -304,9 +342,9 @@ pub fn translate_with_wave32(
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
-    let io = io::raise(&p, &native)?;
+    let io = io::raise(&p, native)?;
     let st = st?;
-    emit_with_wave32(&c, &native, &p, &st, &io, &res, allow_wave32)
+    emit_parts(c, native, &p, &st, &io, &res, (allow_wave32, pixel_inputs))
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -332,7 +370,19 @@ pub fn emit_with_wave32(
     res: &resource::Resources,
     allow_wave32: bool,
 ) -> Result<HostShader, ShaderError> {
-    let original = emit_program(c, native, p, st, io, res, allow_wave32);
+    emit_parts(c, native, p, st, io, res, (allow_wave32, None))
+}
+
+fn emit_parts(
+    c: &Container<'_>,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: (bool, Option<&[container::SigElement]>),
+) -> Result<HostShader, ShaderError> {
+    let original = emit_program(c, native, p, st, io, res, options);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -346,7 +396,7 @@ pub fn emit_with_wave32(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res, allow_wave32)
+    emit_program(c, native, &p, &st, &io, &res, options)
 }
 
 fn emit_program(
@@ -356,17 +406,41 @@ fn emit_program(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
-    allow_wave32: bool,
+    (allow_wave32, pixel_inputs): (bool, Option<&[container::SigElement]>),
 ) -> Result<HostShader, ShaderError> {
-    let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
-        match c.part(fourcc) {
-            Some(part) => signature(part.data),
-            None => Ok(Vec::new()),
-        }
-    };
     let pixel = native.stage == HwStage::Ps;
-    let mut inputs = sig(FourCC::ISG1)?;
-    let mut outputs = sig(FourCC::OSG1)?;
+    let mut inputs = signature_part(c, FourCC::ISG1)?;
+    let mut outputs = signature_part(c, FourCC::OSG1)?;
+    if pixel {
+        // Coverage inputs use intrinsics. Sample index is a signature
+        // element without a register. Other rasterizer inputs are packed.
+        inputs.retain(|e| !matches!(e.kind, 14 | 15));
+        let mut next = inputs
+            .iter()
+            .filter_map(|e| e.row)
+            .max()
+            .map_or(0, |r| r + 1);
+        for e in &mut inputs {
+            if e.kind == 12 {
+                e.row = None;
+                e.col = 0;
+            } else if matches!(e.kind, 3..=5 | 10 | 13) && e.row.is_none() {
+                e.row = Some(next);
+                e.col = 0;
+                next += 1;
+            }
+        }
+        for e in &mut outputs {
+            match e.kind {
+                14 | 17..=20 => {
+                    e.row = None;
+                    e.col = 0;
+                }
+                16 => e.row = Some(e.index),
+                _ => {}
+            }
+        }
+    }
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
@@ -375,7 +449,7 @@ fn emit_program(
             (3, _) => 4,
             // Constant, as DXC declares it (the AMD compiler crashed on a
             // front face without a mode).
-            (13, _) => 1,
+            (4 | 5 | 10 | 13, _) if pixel => 1,
             (0 | 6 | 7, 9) => 2,
             (0, _) => 1,
             _ => 0,
@@ -395,14 +469,7 @@ fn emit_program(
             e.interp = 5;
         }
     }
-    // Per-primitive outputs are constant. The console never exports a
-    // primitive id or cull flag a mesh shader writes (it culls with the
-    // primitive export), so those rows are left out.
-    let mut prims = sig(FourCC::PSG1)?;
-    prims.retain(|e| !matches!(e.kind, 10 | 30));
-    for e in &mut prims {
-        e.interp = 1;
-    }
+    let prims = primitive_signature(c)?;
     // A mesh group's id arrives multiplied by max(threads, vertices,
     // primitives) (the code divides by that); the thread count is in PSV0
     // from runtime info version 2 on.
@@ -433,6 +500,7 @@ fn emit_program(
             mesh_stride,
         },
         allow_wave32,
+        pixel_inputs,
     )?;
     Ok(HostShader {
         stage: native.stage,
@@ -457,11 +525,33 @@ fn emit_program(
     })
 }
 
-/// The rows of an `ISG1`/`OSG1` part.
+fn signature_part(
+    c: &Container<'_>,
+    part: FourCC,
+) -> Result<Vec<container::SigElement>, ShaderError> {
+    c.part(part)
+        .map_or_else(|| Ok(Vec::new()), |part| signature(part.data))
+}
+
+fn primitive_signature(c: &Container<'_>) -> Result<Vec<container::SigElement>, ShaderError> {
+    // The console never exports a primitive id or cull flag as a
+    // parameter (it culls with the primitive export).
+    let mut prims = signature_part(c, FourCC::PSG1)?;
+    prims.retain(|e| !matches!(e.kind, 10 | 30));
+    for e in &mut prims {
+        e.interp = 1;
+    }
+    Ok(prims)
+}
+
+/// The rows of an `ISG1`/`OSG1`/`PSG1` part.
 fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
     let count = u32_at(part, 0)? as usize;
     let base = u32_at(part, 4)? as usize;
+    if base > part.len() || count > (part.len() - base) / 32 {
+        return Err(ShaderError::Malformed("signature records out of bounds"));
+    }
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let at = base + 32 * i;
@@ -473,6 +563,17 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
         let mask = *part
             .get(at + 24)
             .ok_or(ShaderError::Malformed("truncated"))?;
+        if mask == 0 {
+            continue;
+        }
+        let col = mask.trailing_zeros() as u8;
+        let cols = mask.count_ones() as u8;
+        if u16::from(mask) != ((1u16 << cols) - 1) << col || col + cols > 4 {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a non-contiguous signature mask",
+            });
+        }
         if u32_at(part, at + 28)? != 0 {
             return Err(ShaderError::Unsupported {
                 offset: 0,
@@ -539,8 +640,8 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             comp,
             interp: 0,
             row: (register != u32::MAX).then_some(register),
-            col: mask.trailing_zeros().min(3) as u8,
-            cols: mask.count_ones().max(1) as u8,
+            col,
+            cols,
             usage: 0,
             half: (4..=6).contains(&raw),
         });
@@ -603,6 +704,153 @@ mod tests {
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
+
+    fn varying(name: &str, index: u32, row: u32) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        }
+    }
+
+    #[test]
+    fn pixel_system_values_use_the_dxil_register_conventions() {
+        let mut sample = varying("SV_SampleIndex", 0, 2);
+        sample.kind = 12;
+        sample.comp = 5;
+        sample.cols = 1;
+        sample.col = 2;
+        let mut target = varying("SV_Target", 0, 3);
+        target.kind = 16;
+        let inputs = container::signature(&[sample], true);
+        let outputs = container::signature(&[target], false);
+        let source = crate::dxbc::build(&[(FourCC::ISG1, &inputs), (FourCC::OSG1, &outputs)]);
+        let c = Container::parse(&source).unwrap();
+        let words = [0x7E00_02F2u32, 0xF800_180F, 0, 0xBF81_0000];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 1,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        };
+        let host = translate_native(&c, &native, true, None).unwrap();
+        let c = Container::parse(&host.dxil).unwrap();
+        let inputs = signature_part(&c, FourCC::ISG1).unwrap();
+        let outputs = signature_part(&c, FourCC::OSG1).unwrap();
+        assert_eq!((inputs[0].row, inputs[0].col), (None, 0));
+        assert_eq!(outputs[0].row, Some(0));
+        #[cfg(windows)]
+        if let Some(mut v) = validator::Validator::for_test() {
+            v.validate(&mut host.dxil.clone()).unwrap();
+        }
+    }
+
+    #[test]
+    fn oversized_mesh_keeps_only_exports_needed_by_its_pixel_shader() {
+        use crate::native::{MeshIo, Usage, VsOutput};
+
+        let mut position = varying("SV_Position", 0, 0);
+        position.kind = 3;
+        let mut outputs = vec![position];
+        outputs.extend((1..=8).map(|n| varying("VALUE", n, n)));
+        let prims = [varying("VALUE", 9, 0), varying("VALUE", 10, 1)];
+        let osg1 = container::signature(&outputs, false);
+        let psg1 = container::signature(&prims, false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1), (FourCC::PSG1, &psg1)]);
+        let c = Container::parse(&bytes).unwrap();
+
+        let mut words = vec![0x7E00_02F2u32, 0xF800_00CF, 0]; // v_mov, exp pos0
+        for param in 0..10 {
+            words.extend([0xF800_020F | (param << 4), 0]); // exp paramN
+        }
+        words.push(0xBF81_0000);
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 1,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(MeshIo {
+                outputs: (0..10)
+                    .map(|param| VsOutput {
+                        usage: Usage::Generic,
+                        row: if param < 8 { param + 1 } else { param - 8 },
+                        param: if param < 8 { param } else { param | 0x80 },
+                        fp16: false,
+                        pack2: false,
+                    })
+                    .collect(),
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: 256,
+                max_primitives: 32,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        assert!(matches!(
+            translate_native(&c, &native, true, None),
+            Err(ShaderError::Unsupported {
+                what: "a mesh output signature beyond the host's size limit",
+                ..
+            })
+        ));
+        let mut pixel = super::shader::Shader::new(true);
+        pixel.inputs = vec![varying("value", 8, 8), varying("value", 10, 9)];
+        pixel.m.terminate(pixel.entry, super::bitcode::Term::Ret);
+        let ps = pixel.finish();
+        let linked = translate_mesh_for_pixel(&c, &native, Some(&ps))
+            .unwrap()
+            .unwrap();
+        let host = Container::parse(&linked.dxil).unwrap();
+        for (part, expected) in [(FourCC::OSG1, &[0, 8][..]), (FourCC::PSG1, &[10][..])] {
+            let rows = signature_part(&host, part).unwrap();
+            assert_eq!(rows.iter().map(|e| e.index).collect::<Vec<_>>(), expected);
+            let raw = host.part(part).unwrap().data;
+            assert!((0..rows.len()).all(|i| raw[8 + 32 * i + 25] == 0)); // Written mask.
+        }
+
+        // Standalone emission can also save space when the extra
+        // declarations have no corresponding native exports. With no
+        // parameter table, exp param0 is the hardware's dummy export.
+        let mut position_only = native;
+        let StageIo::Ms(ms) = &mut position_only.io else {
+            unreachable!();
+        };
+        ms.outputs.clear();
+        position_only.code = words[..5]
+            .iter()
+            .chain(words.last())
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let standalone = translate_native(&c, &position_only, true, None).unwrap();
+        let host = Container::parse(&standalone.dxil).unwrap();
+        assert_eq!(signature_part(&host, FourCC::OSG1).unwrap().len(), 1);
+        assert!(signature_part(&host, FourCC::PSG1).unwrap().is_empty());
+        #[cfg(windows)]
+        if let Some(mut v) = validator::Validator::for_test() {
+            let mut ps = ps;
+            v.validate(&mut ps).unwrap();
+            v.validate(&mut linked.dxil.clone()).unwrap();
+            v.validate(&mut standalone.dxil.clone()).unwrap();
+        }
+    }
 
     /// A pixel shader writing SV_StencilRef (channel y of `exp mrtz`).
     /// DXC sets ShaderFlags.StencilRef (bit 11) for a pixel shader whose

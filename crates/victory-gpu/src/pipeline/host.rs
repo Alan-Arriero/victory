@@ -337,6 +337,41 @@ impl Stage {
     }
 }
 
+impl Shader {
+    /// A mesh shader can need a smaller output signature for a particular
+    /// pixel shader. Keep that translation with the pipeline that uses it.
+    fn for_mesh_pipeline(self: &Arc<Self>, pixel: Option<&[u8]>) -> Result<Arc<Self>, String> {
+        use victory_shader::{Container, FourCC, HwStage};
+
+        let container = Container::parse(&self.container).map_err(|e| e.to_string())?;
+        let dxil = container.part(FourCC::DXIL).ok_or("no DXIL part")?;
+        let native = victory_shader::native_programs(dxil.data)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|p| p.stage == HwStage::Ms)
+            .ok_or("no mesh program")?;
+        let Some(host) = victory_shader::emit::translate_mesh_for_pixel(&container, &native, pixel)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(self.clone());
+        };
+        Ok(Arc::new(Self {
+            stage: self.stage,
+            hash: self.hash.clone(),
+            // This pipeline owns the finished variant. The shared shader
+            // retains the source for any other pipeline that needs it.
+            container: Vec::new(),
+            translated: Some(Translated {
+                host,
+                used: native.used,
+            })
+            .into(),
+            #[cfg(feature = "diagnostics")]
+            wave64: native.wave64.into(),
+        }))
+    }
+}
+
 pub(crate) struct HostPipeline {
     /// A compute pipeline (else graphics).
     pub(crate) compute: bool,
@@ -386,24 +421,39 @@ impl HostPipeline {
             );
         }
         let mesh = find("mesh");
+        let pipeline_mesh;
         let stages = if let Some(cs) = compute {
             vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
         } else {
+            let pixel = find("pixel");
             let first = match (mesh, find("vertex")) {
-                (Some(ms), _) => (ms, D3D12_SHADER_VISIBILITY_MESH),
+                (Some(ms), _) => {
+                    if !host()?.mesh_shaders() {
+                        return refuse(
+                            "the host GPU has no mesh shaders (or no shader model 6.6)",
+                            shaders,
+                        );
+                    }
+                    let pixel_dxil = match pixel {
+                        Some(ps) => Some(ps.translated()?.host.dxil.as_slice()),
+                        None => None,
+                    };
+                    pipeline_mesh = match ms.for_mesh_pipeline(pixel_dxil) {
+                        Ok(ms) => ms,
+                        Err(e) => {
+                            tracing::warn!(error = %e, ?shaders, "mesh shader does not link");
+                            return None;
+                        }
+                    };
+                    (&pipeline_mesh, D3D12_SHADER_VISIBILITY_MESH)
+                }
                 (None, Some(vs)) => (vs, D3D12_SHADER_VISIBILITY_VERTEX),
                 (None, None) => return refuse("no vertex or mesh shader", shaders),
             };
             let mut stages = vec![first];
-            stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            stages.extend(pixel.map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             stages
         };
-        if mesh.is_some() && !host()?.mesh_shaders() {
-            return refuse(
-                "the host GPU has no mesh shaders (or no shader model 6.6)",
-                shaders,
-            );
-        }
         for (s, _) in &stages {
             s.translated()?;
         }
