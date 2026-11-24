@@ -661,7 +661,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     };
     // Addresses given in runs of consecutive pages map in one call, so a run
     // pays one unmap, one view and one commit (per section run) instead of
-    // three system calls per page (idea from ivall/xcl#254). Pages that are
+    // three system calls per page. Pages that are
     // not consecutive slices of one section still map one by one inside the
     // call, and a run that spans two placeholders falls back to the per-page
     // calls below.
@@ -1267,8 +1267,7 @@ mod tests {
     /// A scatter of pages at consecutive addresses maps them in one call:
     /// each address shows its own page, pages asked for in a different order
     /// still land where they are asked for, a zero page in the middle unmaps
-    /// only its own address, and an unmap run goes in one call
-    /// (idea from ivall/xcl#254).
+    /// only its own address, and an unmap run goes in one call.
     #[test]
     fn scatter_maps_runs_of_consecutive_addresses() {
         let pages = allocate(3);
