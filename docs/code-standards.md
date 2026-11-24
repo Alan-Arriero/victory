@@ -140,6 +140,31 @@ in the change that closes the gap.
   only with the `diagnostics` feature, and every switch is listed in the
   README's table.
 
+## Portability and runtime boundaries
+
+- Query host capabilities and limits at runtime (display modes, VRAM/RAM
+  budgets, wave sizes, format support, descriptor limits) or provide safe
+  fallbacks. Do not hardcode limits from one machine.
+- Route hardware-dependent behaviour (wave32 vs. wave64, shader model tiers,
+  optional UAV/texture format support, CPU ISA extensions, vendor quirks)
+  through explicit capability checks and test each supported tier rather than
+  assuming a single reference machine.
+- When a buffer, heap, or budget overflows, grow or virtualize dynamically or
+  fail/drop loudly with structured diagnostics (see *Saying no* above).
+- When emitting platform artifacts, pair synthetic unit tests with external
+  validators where applicable (DXIL validation, the D3D12 debug layer, WARP,
+  and Wine/Proton smoke runs).
+- New tests should isolate their state so they do not depend on running
+  serially (`--test-threads=1`), even though Windows CI currently runs the
+  workspace suite with `--test-threads=1` for shared GPU driver state.
+- Bound host caches and resource lifetimes: do not store host GPU or memory
+  allocations in unbounded static caches that only insert; tie every
+  allocation to an explicit owner, eviction budget, or title-unmap/release
+  hook.
+- Changes touching CPU, memory, OS, or GPU boundaries should note under
+  `## Tested` which hardware and OS tiers were exercised and which remain
+  untested.
+
 ## Commits
 
 - The subject names the area, then states the behaviour as it now is:
