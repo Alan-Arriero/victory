@@ -103,6 +103,21 @@ struct BoundDsv {
     desc: Option<D3D12_DEPTH_STENCIL_VIEW_DESC>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct FreshTableKey {
+    heap: usize,
+    copy_gen: u64,
+    slots: u32,
+    records_hash: u64,
+}
+
+#[derive(Clone, Copy)]
+struct FreshTableEntry {
+    table: u64,
+    start_slot: u32,
+    first: u32,
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -134,11 +149,13 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: `(title heap, slot count, records hash)`
-    /// → `(recorded table base, recorded start slot, first dynamic slot)`.
-    /// Hits are verified by re-reading the range and checking view liveness so
-    /// no per-table record vector is allocated or retained.
-    fresh_tables: std::collections::HashMap<(usize, u32, u64), (u64, u32, u32)>,
+    /// Tables made afresh in this list, keyed by title heap, `list.copy_gen()`,
+    /// slot count, and hashed descriptor records. Partitioning by `copy_gen`
+    /// preserves `Fill -> Copy -> Fill` ordering for CBV snapshots across
+    /// intervening deferred buffer copies, and hits are verified by re-reading
+    /// the range and checking view liveness so no per-table record vector is
+    /// allocated.
+    fresh_tables: std::collections::HashMap<FreshTableKey, FreshTableEntry>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -1132,13 +1149,23 @@ impl State {
                 }
                 h.finish()
             };
-            let key = (heap_ptr, n, records_hash);
+            let key = FreshTableKey {
+                heap: heap_ptr,
+                copy_gen: list.copy_gen(),
+                slots: n,
+                records_hash,
+            };
             let offset_for = |first: u32| {
                 first
                     .checked_sub(start_slot)
                     .and_then(|base| base.checked_mul(step_bytes as u32))
             };
-            if let Some(&(prev_table, prev_start, first)) = self.fresh_tables.get(&key) {
+            if let Some(&FreshTableEntry {
+                table: prev_table,
+                start_slot: prev_start,
+                first,
+            }) = self.fresh_tables.get(&key)
+            {
                 let mut reuse_ok = true;
                 for i in 0..n {
                     let at = table + u64::from(start_slot + i) * step_bytes;
@@ -1255,7 +1282,14 @@ impl State {
                     self.depth_sampled |= readable(list, u, &view, read_only_depth);
                 }
             }
-            self.fresh_tables.insert(key, (table, start_slot, first));
+            self.fresh_tables.insert(
+                key,
+                FreshTableEntry {
+                    table,
+                    start_slot,
+                    first,
+                },
+            );
             self.dynamic.push((heap_ptr, first, n));
             made.push((slot, byte_offset));
         }
@@ -3083,6 +3117,71 @@ mod table_tests {
         assert!(made.is_empty());
         assert!(state.fresh_tables.is_empty());
         assert!(state.dynamic.is_empty());
+    }
+
+    #[test]
+    fn intervening_defer_copy_allocates_fresh_cbv_snapshot() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let views = create_title_heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 64);
+        let view_heap = crate::descriptor::heap(views.0);
+        let mut cb_dst = [1u8; 256];
+        let cb_src = [2u8; 256];
+        let cb_addr = cb_dst.as_ptr() as u64;
+        let desc = [cb_addr as u32, (cb_addr >> 32) as u32, 256, 0];
+
+        let table1 = view_heap.start;
+        let table2 = view_heap.start + 8 * 32;
+        crate::descriptor::create_cbv(std::ptr::null(), &desc, table1);
+        // Copy the exact CBV handle words into `table2` so both tables have
+        // identical descriptor content.
+        // SAFETY: both `table1` and `table2` are valid, distinct 32-byte slots in `views`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(table1 as *const u8, table2 as *mut u8, 32);
+        }
+
+        let list = host.new_list().expect("cbv defer_copy list");
+        let mut state = State::default();
+        state.set_heaps(&[views.0]);
+        state.set_table(false, 0, table1);
+        let used = [used_table(ResourceType::Cbv, 0, 0, 0)];
+
+        let made1 = state.tables(&list, &used, false);
+        assert!(!state.table_failed);
+        assert_eq!(state.dynamic.len(), 1);
+        let first1 = state.dynamic[0].1;
+        assert_eq!(made1, vec![(0, first1 * 32)]);
+
+        // Without an intervening deferred copy, identical table content at
+        // `table2` reuses `first1`.
+        state.set_table(false, 0, table2);
+        let made2 = state.tables(&list, &used, false);
+        assert!(!state.table_failed);
+        assert_eq!(state.dynamic.len(), 1);
+        assert_eq!(made2, vec![(0, first1 * 32)]);
+
+        // An intervening `defer_copy` (e.g. `CopyBufferRegion` into the CBV)
+        // must partition the cache so the next draw allocates a fresh CBV
+        // snapshot (`Fill -> Copy -> Fill`).
+        list.defer_copy(cb_dst.as_mut_ptr(), cb_src.as_ptr(), cb_src.len());
+        let made3 = state.tables(&list, &used, false);
+        assert!(!state.table_failed);
+        assert_eq!(state.dynamic.len(), 2);
+        let first2 = state.dynamic[1].1;
+        assert_ne!(first2, first1);
+        assert_eq!(made3, vec![(0, first2 * 32)]);
+
+        // Subsequent draws with no further copies reuse `first2`.
+        state.set_table(false, 0, table1);
+        let made4 = state.tables(&list, &used, false);
+        assert!(!state.table_failed);
+        assert_eq!(state.dynamic.len(), 2);
+        assert_eq!(made4, vec![(0, first2 * 32)]);
+
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(cb_dst, cb_src);
     }
 }
 
