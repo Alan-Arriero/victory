@@ -49,9 +49,9 @@ fn allow_wave32() -> bool {
 }
 
 /// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time, and whether Wave32 lowering is
-/// enabled for the active host adapter).
+/// the translation settings it runs with (the loop limit and the clean-up
+/// passes, which a diagnostics build can change at run time, and whether
+/// Wave32 lowering is enabled for the active host adapter).
 fn build(wave32: bool) -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -66,6 +66,7 @@ fn build(wave32: bool) -> &'static [u8; 32] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
                 bytes.push(u8::from(wave32));
                 *blake3::hash(&bytes).as_bytes()
             }
