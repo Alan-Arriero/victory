@@ -1562,7 +1562,8 @@ impl<'a> Tracer<'a> {
         if let Some((mask, set_val, clear_val)) = self.lane_picked(v)
             && let Some(site) = self.defs[v.0 as usize]
             && self.runs(site, known).is_ok()
-            && let Some(&bit) = lanes.masks.get(&mask)
+            // The exact pair: in wave64 either dword may have changed alone.
+            && let Some(bit) = lanes.mask_bits(mask.0, mask.1)
         {
             for (holds, arm) in [(true, set_val), (false, clear_val)] {
                 let n = known.len();
