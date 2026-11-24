@@ -29,7 +29,7 @@ Set `VICTORY_TRACE_PIPELINES=1` to log the shader stages and hashes with the
 Windows thread ID when each host pipeline starts compiling. Match that ID to
 the faulting thread in a Proton log when several pipelines compile at once.
 
-The trace also logs the 32-digit host pipeline name and worker thread before
+In a diagnostics build, the trace also logs the 32-digit host pipeline name and worker thread before
 the driver call. To bypass a particular configuration that crashes the driver,
 set `VICTORY_SKIP_HOST_PSOS` to its name or a comma-separated list of names.
 Draws and dispatches using those configurations are dropped. Other pipelines

@@ -152,6 +152,7 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 /// Exact library names from the host pipeline trace. Names describe both
 /// translated stages and fixed-function state, so a shader shared with a
 /// different pipeline can still be used there.
+#[cfg(feature = "diagnostics")]
 fn excluded_names(value: &str) -> HashSet<String> {
     value
         .split(',')
@@ -175,23 +176,26 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
-    static EXCLUDED: OnceLock<HashSet<String>> = OnceLock::new();
-    let excluded = EXCLUDED.get_or_init(|| {
-        excluded_names(&std::env::var("VICTORY_SKIP_HOST_PSOS").unwrap_or_default())
-    });
-    if excluded.contains(name) {
-        tracing::warn!(name, "skipping configured host pipeline");
-        return Err(windows::Win32::Foundation::E_ABORT.into());
-    }
-    static TRACE: OnceLock<bool> = OnceLock::new();
-    if *TRACE.get_or_init(|| crate::switch::on("VICTORY_TRACE_PIPELINES")) {
-        // SAFETY: queries the calling thread without accessing caller memory.
-        let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
-        tracing::info!(
-            tid = format_args!("{tid:04x}"),
-            name,
-            "loading or compiling host pipeline"
-        );
+    #[cfg(feature = "diagnostics")]
+    {
+        static EXCLUDED: OnceLock<HashSet<String>> = OnceLock::new();
+        let excluded = EXCLUDED.get_or_init(|| {
+            excluded_names(&std::env::var("VICTORY_SKIP_HOST_PSOS").unwrap_or_default())
+        });
+        if excluded.contains(name) {
+            tracing::warn!(name, "skipping configured host pipeline");
+            return Err(windows::Win32::Foundation::E_ABORT.into());
+        }
+        static TRACE: OnceLock<bool> = OnceLock::new();
+        if *TRACE.get_or_init(|| crate::switch::on("VICTORY_TRACE_PIPELINES")) {
+            // SAFETY: queries the calling thread without accessing caller memory.
+            let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+            tracing::info!(
+                tid = format_args!("{tid:04x}"),
+                name,
+                "loading or compiling host pipeline"
+            );
+        }
     }
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
@@ -356,6 +360,7 @@ mod tests {
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
     }
 
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn excluded_names_match_whole_host_descriptions() {
         let a = name("mesh", b"root", &[b"ms", b"ps"], "one");
@@ -365,6 +370,7 @@ mod tests {
         assert!(excluded_names("").is_empty());
     }
 
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn an_excluded_pipeline_skips_both_driver_calls() {
         // The process reads the setting once. Use a child so other tests can
