@@ -4,6 +4,10 @@ Install `umu-run` on x86-64 Linux. The game requires an AVX2 CPU and a Vulkan
 driver that exposes Shader Model 6.6 through vkd3d-proton.
 [UMU installation](https://github.com/Open-Wine-Components/umu-launcher#installation)
 
+With Nix, `nix develop .#proton` (or `nix-shell --arg withProton true`)
+provides UMU and the MSVC cross-build tools. See
+[Linux development with Nix](linux-proton.md#development-with-nix).
+
 Use a Windows x64 build of VIctory. The launcher supports MSVC builds,
 including those produced by `cargo xwin`, and LLVM-MinGW builds. Both Rust
 targets use native Windows thread-local storage (TLS). A loader test with
@@ -24,6 +28,14 @@ On first launch UMU fetches Proton and the Steam Linux Runtime. The default
 prefix is `${XDG_DATA_HOME:-$HOME/.local/share}/victory/proton`, and the
 default `GAMEID` is `umu-victory`. Set `WINEPREFIX`, `GAMEID` or `PROTONPATH`
 to override them. Use Windows paths in `victory.toml`.
+
+The launcher creates shader-cache directories at
+`${XDG_CACHE_HOME:-$HOME/.cache}/victory/vkd3d` and
+`${XDG_CACHE_HOME:-$HOME/.cache}/victory/dxvk`, keeping generated caches out
+of the checkout. `VKD3D_SHADER_CACHE_PATH` and `DXVK_STATE_CACHE_PATH`
+override these defaults. `VKD3D_SHADER_CACHE_PATH=0` disables the VKD3D cache
+without creating a directory. Empty or relative XDG base directories fall back
+to the standard directories under `$HOME`.
 
 Set `VICTORY_TRACE_PIPELINES=1` to log the shader stages and hashes with the
 Windows thread ID when each host pipeline starts compiling. Match that ID to
@@ -52,6 +64,10 @@ indirect-argument clamp and both rectangle shaders into the executable. If the
 system compiler rejects one at runtime, VIctory uses its embedded bytecode.
 
 ## Testing without game files
+
+`bash tests/proton-launcher.sh` checks argument quoting, cache paths, XDG
+fallbacks and exit status with a fake UMU. It requires neither Wine nor a GPU,
+and runs in Linux CI and `nix flake check`.
 
 `./tests/proton-smoke.sh` compiles its synthetic title with the LLVM-MinGW
 toolchain and gnullvm Rust target above, even when `VICTORY_EXE` points to

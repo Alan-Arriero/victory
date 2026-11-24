@@ -7,7 +7,9 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    DXGI_STATUS_OCCLUDED, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -15,7 +17,7 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{Interface, PCWSTR, w};
+use windows::core::{HRESULT, Interface, PCWSTR, w};
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -636,6 +638,10 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Monotonic count of deferred title-memory copies (`defer_copy`) recorded
+    /// since reset, used to partition fresh-table CBV snapshot reuse across
+    /// intervening buffer writes.
+    copy_gen: u64,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -1480,6 +1486,15 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.copy_gen += 1;
+    }
+
+    /// Monotonic count of deferred title-memory copies recorded on this list
+    /// since reset. Fresh-table dedupe partitions reuse by this generation so
+    /// an intervening `CopyBufferRegion`/`CopyResource` creates a new CBV
+    /// snapshot (`Fill -> Copy -> Fill`).
+    pub(crate) fn copy_gen(&self) -> u64 {
+        self.deferred().copy_gen
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -1722,8 +1737,10 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.copy_gen += 1;
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -1974,6 +1991,18 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
 
+/// Copies host-owned bytes into title memory without dereferencing a
+/// potentially unmapped destination on a worker thread.
+pub fn write_title_memory(destination: usize, bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    crate::watch::kernel_will_write(destination, bytes.len());
+    let written = read(bytes.as_ptr(), destination as *mut u8, bytes.len());
+    crate::watch::kernel_wrote(destination, bytes.len());
+    written
+}
+
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 ///
@@ -2010,7 +2039,7 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 
 #[cfg(test)]
 mod title_copies {
-    use super::{copy_mapped, write_mapped};
+    use super::{copy_mapped, write_mapped, write_title_memory};
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
         VirtualAlloc, VirtualFree, VirtualProtect,
@@ -2098,6 +2127,18 @@ mod title_copies {
         assert_ne!(protected, 0);
         // SAFETY: the third block.
         write_mapped(unsafe { to.add(2 * BLOCK) }, from.as_ptr(), BLOCK);
+        assert!(block(to, 2).iter().all(|&b| b == 0xee));
+        release(to);
+    }
+
+    #[test]
+    fn title_memory_write_reports_unmapped_destination_without_faulting() {
+        let from = pattern();
+        let to = holed(0xee);
+        assert!(write_title_memory(to as usize, &from[..BLOCK]));
+        assert_eq!(block(to, 0), &from[..BLOCK]);
+        assert!(!write_title_memory(to as usize, &from));
+        assert_eq!(block(to, 0), &from[..BLOCK]);
         assert!(block(to, 2).iter().all(|&b| b == 0xee));
         release(to);
     }
@@ -2276,6 +2317,13 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    last_present_issue: Option<HRESULT>,
+}
+
+/// A successful DXGI status may still mean nothing was presented.
+fn present_result(status: HRESULT) -> windows::core::Result<bool> {
+    status.ok()?;
+    Ok(status != DXGI_STATUS_OCCLUDED)
 }
 
 impl Presenter {
@@ -2432,7 +2480,8 @@ impl Meter {
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
+    /// shown or the diagnostic probe has no reading. Otherwise diagnostics
+    /// builds report whether the sampled pixels were black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
@@ -2521,10 +2570,36 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            match present_result(status) {
+                Ok(false) => {
+                    if p.last_present_issue.replace(status) != Some(status) {
+                        tracing::info!(frame, "DXGI reports the window is occluded");
+                    }
+                    return None;
+                }
+                Ok(true) => {
+                    if p.last_present_issue.take().is_some() {
+                        tracing::info!(frame, "DXGI resumed presenting frames");
+                    }
+                }
+                Err(error) => {
+                    if self.device.GetDeviceRemovedReason().is_err() {
+                        fail(format_args!(
+                            "host GPU device removed during Present: {error}{}{}",
+                            self.removal_data(&[&p.copy]),
+                            last_notes(&[&p.copy])
+                        ));
+                    }
+                    if p.last_present_issue.replace(status) != Some(status) {
+                        tracing::warn!(%error, frame, "swap chain present failed");
+                    }
+                    return None;
+                }
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
-            return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+            return probe.and_then(|b| crate::capture::black(&b));
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }
@@ -2571,6 +2646,7 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                last_present_issue: None,
             };
             p.sync_color_space(display_hdr_info().is_some());
             Ok(p)
@@ -2982,6 +3058,18 @@ fn pick_hardware_adapter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn present_result_distinguishes_occlusion_from_success_and_failure() {
+        assert!(present_result(HRESULT(0)).unwrap());
+        assert!(!present_result(DXGI_STATUS_OCCLUDED).unwrap());
+        assert_eq!(
+            present_result(DXGI_ERROR_DEVICE_REMOVED)
+                .unwrap_err()
+                .code(),
+            DXGI_ERROR_DEVICE_REMOVED
+        );
+    }
 
     #[test]
     fn shadow_buffer_transitions_between_writes_and_reads() {
