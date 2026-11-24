@@ -329,15 +329,14 @@ fn translate_native(
     allow_wave32: bool,
     pixel_inputs: Option<&[container::SigElement]>,
 ) -> Result<HostShader, ShaderError> {
-    // A compute program whose root arguments all sit past the 16 user SGPRs
-    // finds them through the spill table `s[0:1]` points to.
-    let spilled = native.stage == HwStage::Cs
-        && !native.layout.is_empty()
-        && native
-            .layout
-            .iter()
-            .all(|r| native.stage.user_sgpr(r.user_data) >= 16);
-    let p = ir::build_with(&native.patched_code(), native.wave64, native.vgprs, spilled)?;
+    // A compute program with root arguments past the 16 user SGPRs finds them
+    // through the spill table `s[0:1]` points to.
+    let p = ir::build_with(
+        &native.patched_code(),
+        native.wave64,
+        native.vgprs,
+        native.uses_spill_table(),
+    )?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);

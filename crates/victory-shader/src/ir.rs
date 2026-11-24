@@ -139,121 +139,293 @@ impl Inst {
 /// The first user SGPR that the spill table of root arguments stands for.
 const SPILL_FIRST: u8 = 16;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpillTag {
+    None,
+    Low(u32),
+    High,
+}
+
+fn spill_scalar(o: &Operand) -> Option<(u8, u8)> {
+    match *o {
+        Operand::Scalar { code, dwords } if code < 106 => Some((code, dwords.max(1))),
+        _ => None,
+    }
+}
+
+fn spill_const(o: &Operand) -> Option<u32> {
+    match *o {
+        Operand::Literal(x) => Some(x),
+        Operand::Const(c) => crate::resource::inline(c),
+        Operand::Scalar { code: 125, .. } => Some(0),
+        _ => None,
+    }
+}
+
+fn step_spill_tag(tag: &mut [SpillTag; 106], f: &Fields, name: &str) {
+    use gfx10::Fields::{Smem, Sop, Valu};
+
+    let mut written: Vec<(u8, u8)> = Vec::new();
+    match f {
+        Sop {
+            dst: Some(d),
+            src,
+            imm,
+            ..
+        } => {
+            if let Some((dc, dn)) = spill_scalar(d) {
+                match (name, dn, src.as_slice()) {
+                    ("s_mov_b32", 1, [x]) => {
+                        tag[dc as usize] =
+                            spill_scalar(x).map_or(SpillTag::None, |(c, _)| tag[c as usize]);
+                    }
+                    ("s_mov_b64", 2, [x]) if usize::from(dc) + 1 < 106 => {
+                        let pair = match spill_scalar(x) {
+                            Some((c, _)) if usize::from(c) + 1 < 106 => {
+                                [tag[c as usize], tag[c as usize + 1]]
+                            }
+                            _ => [SpillTag::None, SpillTag::None],
+                        };
+                        tag[dc as usize] = pair[0];
+                        tag[dc as usize + 1] = pair[1];
+                    }
+                    ("s_and_b32", 1, [x, y]) => {
+                        let masked = |reg: &Operand, mask: &Operand| match (spill_scalar(reg), mask)
+                        {
+                            (Some((c, _)), Operand::Literal(m)) => {
+                                tag[c as usize] == SpillTag::High && *m <= 0xFFFF
+                            }
+                            (Some((c, _)), Operand::Const(k)) => {
+                                tag[c as usize] == SpillTag::High && (129..=192).contains(k)
+                            }
+                            _ => false,
+                        };
+                        tag[dc as usize] = if masked(x, y) || masked(y, x) {
+                            SpillTag::High
+                        } else {
+                            SpillTag::None
+                        };
+                    }
+                    ("s_add_u32" | "s_add_i32", 1, [x, y]) => {
+                        let added = |reg: &Operand, rhs: &Operand| match (
+                            spill_scalar(reg),
+                            spill_const(rhs),
+                        ) {
+                            (Some((c, _)), Some(k)) => match tag[c as usize] {
+                                SpillTag::Low(off) => Some(SpillTag::Low(off.wrapping_add(k))),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        tag[dc as usize] = added(x, y)
+                            .or_else(|| added(y, x))
+                            .unwrap_or(SpillTag::None);
+                    }
+                    ("s_addk_i32", 1, _) => {
+                        tag[dc as usize] = match (tag[dc as usize], *imm) {
+                            (SpillTag::Low(off), Some(k)) => {
+                                SpillTag::Low(off.wrapping_add(i32::from(k as i16) as u32))
+                            }
+                            _ => SpillTag::None,
+                        };
+                    }
+                    ("s_addc_u32", 1, [x, y]) => {
+                        let carried = |reg: &Operand, rhs: &Operand| {
+                            spill_scalar(reg)
+                                .is_some_and(|(c, _)| tag[c as usize] == SpillTag::High)
+                                && spill_const(rhs) == Some(0)
+                        };
+                        tag[dc as usize] = if carried(x, y) || carried(y, x) {
+                            SpillTag::High
+                        } else {
+                            SpillTag::None
+                        };
+                    }
+                    _ => written.push((dc, dn)),
+                }
+            }
+        }
+        Smem { data: Some(d), .. } => written.extend(spill_scalar(d)),
+        Valu(v) => {
+            written.extend(v.dst.as_ref().and_then(spill_scalar));
+            written.extend(v.carry.as_ref().and_then(spill_scalar));
+        }
+        _ => {}
+    }
+    for (c, n) in written {
+        for k in c..c.saturating_add(n).min(106) {
+            tag[k as usize] = SpillTag::None;
+        }
+    }
+}
+
 /// Rewrites loads from the spill table (`s[0:1]`, the high dword masked to a
-/// 40-bit address, usually through copies in `s2`/`s3`) into `s_mov_b32` from
-/// the user SGPRs the table's dwords stand for. Only loads with a constant
-/// offset, in code no branch joins after the pointer is set up, are rewritten.
+/// 40- or 48-bit address, through copies and constant offsets across control
+/// flow where the pointer holds on every predecessor) into `s_mov_b32` from
+/// the user SGPRs the table's dwords stand for.
 fn spill_loads(
     list: Vec<Instruction>,
     wave64: bool,
     code_len: usize,
 ) -> Result<Vec<Instruction>, ShaderError> {
-    use gfx10::Fields::{Smem, Sop, Valu};
-    let mut targets = std::collections::BTreeSet::new();
-    for inst in list.iter() {
+    use gfx10::Fields::Smem;
+    if list.is_empty() {
+        return Ok(list);
+    }
+
+    let mut flows = Vec::with_capacity(list.len());
+    let mut leaders = vec![0usize];
+    for (i, inst) in list.iter().enumerate() {
         let flow = gfx10::control(inst, code_len, |at| {
             list[..list.partition_point(|i| i.offset < at)].last()
         })?;
         if let Flow::Jump(t) | Flow::Branch(t) = flow {
-            targets.insert(t);
+            leaders.push(t);
         }
-    }
-    // 1: a copy of s0, 2: a copy of s1 (masked to the address's high bits).
-    let mut tag = [0u8; 128];
-    tag[0] = 1;
-    tag[1] = 2;
-    let mut out = Vec::with_capacity(list.len());
-    let scalar = |o: &Operand| match *o {
-        Operand::Scalar { code, dwords } if code < 106 => Some((code, dwords.max(1))),
-        _ => None,
-    };
-    for inst in list {
-        if targets.contains(&inst.offset) {
-            tag = [0; 128];
-        }
-        let f = inst.fields(wave64);
-        let name = inst.name().unwrap_or("");
-        // The load of the table.
-        if let Smem {
-            data: Some(ref d),
-            ref base,
-            offset,
-            ref soffset,
-            ..
-        } = f
-            && name.starts_with("s_load_dword")
-            && let Some((a, 2)) = scalar(base)
-            && tag[a as usize] == 1
-            && tag[a as usize + 1] == 2
-            && offset >= 0
-            && offset % 4 == 0
-            && matches!(*soffset, Operand::Scalar { code: 125, .. })
-            && let Some((dst, n)) = scalar(d)
+        if flow != Flow::Next
+            && let Some(next) = list.get(i + 1)
         {
-            let first = u32::from(SPILL_FIRST) + (offset as u32) / 4;
-            if first + u32::from(n) <= 105 {
-                for k in 0..n {
-                    let mov =
-                        0xBE80_0000 | u32::from(dst + k) << 16 | 3 << 8 | (first + u32::from(k));
-                    let mut bytes = mov.to_le_bytes().to_vec();
-                    bytes.extend(0xBF81_0000u32.to_le_bytes()); // s_endpgm
-                    let mut one = gfx10::decode(&bytes)?.remove(0);
-                    one.offset = inst.offset;
-                    out.push(one);
-                }
-                for k in 0..n {
-                    tag[(dst + k) as usize] = 0;
-                }
-                continue;
-            }
+            leaders.push(next.offset);
         }
-        // What this instruction does to the tracked registers.
-        let mut written: Vec<(u8, u8)> = Vec::new();
-        match &f {
-            Sop {
-                dst: Some(d), src, ..
-            } => {
-                if let Some((dc, dn)) = scalar(d) {
-                    let new = match (name, src.as_slice()) {
-                        ("s_mov_b32", [x]) => match scalar(x) {
-                            Some((c, _)) if tag[c as usize] != 0 => tag[c as usize],
-                            _ => 0,
-                        },
-                        ("s_and_b32", [x, y]) => {
-                            // `s1 & mask` with a small mask, either way round.
-                            let masked = |reg: &Operand, mask: &Operand| match (scalar(reg), mask) {
-                                (Some((c, _)), Operand::Literal(m)) => {
-                                    tag[c as usize] == 2 && *m <= 0xFFFF
-                                }
-                                (Some((c, _)), Operand::Const(k)) => {
-                                    tag[c as usize] == 2 && (129..=192).contains(k)
-                                }
-                                _ => false,
-                            };
-                            if masked(x, y) || masked(y, x) { 2 } else { 0 }
-                        }
-                        _ => 0,
-                    };
-                    if dn == 1 {
-                        tag[dc as usize] = new;
-                    } else {
-                        written.push((dc, dn));
-                    }
+        flows.push(flow);
+    }
+    leaders.sort_unstable();
+    leaders.dedup();
+
+    let nblocks = leaders.len();
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(nblocks);
+    let mut start = 0usize;
+    for b in 0..nblocks {
+        let next_off = leaders.get(b + 1).copied();
+        let end = match next_off {
+            Some(off) => list[start..].partition_point(|i| i.offset < off) + start,
+            None => list.len(),
+        };
+        ranges.push(start..end);
+        start = end;
+    }
+
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nblocks];
+    for (b, range) in ranges.iter().enumerate() {
+        let Some(last) = range.end.checked_sub(1).filter(|&i| i >= range.start) else {
+            continue;
+        };
+        match flows[last] {
+            Flow::Next => {
+                if b + 1 < nblocks {
+                    succs[b].push(b + 1);
                 }
             }
-            Smem { data: Some(d), .. } => written.extend(scalar(d)),
-            Valu(v) => {
-                written.extend(v.dst.as_ref().and_then(scalar));
-                written.extend(v.carry.as_ref().and_then(scalar));
+            Flow::Jump(t) => {
+                if let Ok(tb) = leaders.binary_search(&t) {
+                    succs[b].push(tb);
+                }
+            }
+            Flow::Branch(t) => {
+                if let Ok(tb) = leaders.binary_search(&t) {
+                    succs[b].push(tb);
+                }
+                if b + 1 < nblocks {
+                    succs[b].push(b + 1);
+                }
             }
             _ => {}
         }
-        for (c, n) in written {
-            for k in c..c.saturating_add(n).min(128) {
-                tag[k as usize] = 0;
+    }
+
+    let mut entry = [SpillTag::None; 106];
+    entry[0] = SpillTag::Low(0);
+    entry[1] = SpillTag::High;
+    let mut in_tags: Vec<Option<[SpillTag; 106]>> = vec![None; nblocks];
+    in_tags[0] = Some(entry);
+
+    let max_rounds = nblocks.saturating_mul(4).max(8);
+    for _ in 0..max_rounds {
+        let mut changed = false;
+        for b in 0..nblocks {
+            let Some(mut tag) = in_tags[b] else {
+                continue;
+            };
+            for inst in &list[ranges[b].clone()] {
+                let f = inst.fields(wave64);
+                let name = inst.name().unwrap_or("");
+                step_spill_tag(&mut tag, &f, name);
+            }
+            for &s in &succs[b] {
+                match &mut in_tags[s] {
+                    None => {
+                        in_tags[s] = Some(tag);
+                        changed = true;
+                    }
+                    Some(cur) => {
+                        for r in 0..106 {
+                            if cur[r] != SpillTag::None && cur[r] != tag[r] {
+                                cur[r] = SpillTag::None;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
             }
         }
-        out.push(inst);
+        if !changed {
+            break;
+        }
+    }
+
+    let mut out = Vec::with_capacity(list.len());
+    let mut iter = list.into_iter();
+    for (b, range) in ranges.into_iter().enumerate() {
+        let mut tag = in_tags[b].unwrap_or([SpillTag::None; 106]);
+        for _ in range {
+            let inst = iter.next().expect("range within list");
+            let f = inst.fields(wave64);
+            let name = inst.name().unwrap_or("");
+            if let Smem {
+                data: Some(ref d),
+                ref base,
+                offset,
+                ref soffset,
+                ..
+            } = f
+                && name.starts_with("s_load_dword")
+                && let Some((a, 2)) = spill_scalar(base)
+                && usize::from(a) + 1 < 106
+                && let SpillTag::Low(base_off) = tag[a as usize]
+                && tag[a as usize + 1] == SpillTag::High
+                && matches!(
+                    *soffset,
+                    Operand::Scalar { code: 125, .. } | Operand::Const(128)
+                )
+                && let Some((dst, n)) = spill_scalar(d)
+            {
+                let total = i64::from(base_off) + i64::from(offset);
+                if total >= 0 && total % 4 == 0 {
+                    let first = u32::from(SPILL_FIRST) + (total as u32) / 4;
+                    if first + u32::from(n) <= 105 {
+                        for k in 0..n {
+                            let mov = 0xBE80_0000
+                                | u32::from(dst + k) << 16
+                                | 3 << 8
+                                | (first + u32::from(k));
+                            let mut bytes = mov.to_le_bytes().to_vec();
+                            bytes.extend(0xBF81_0000u32.to_le_bytes()); // s_endpgm
+                            let mut one = gfx10::decode(&bytes)?.remove(0);
+                            one.offset = inst.offset;
+                            out.push(one);
+                        }
+                        for k in 0..n {
+                            if usize::from(dst + k) < 106 {
+                                tag[(dst + k) as usize] = SpillTag::None;
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+            step_spill_tag(&mut tag, &f, name);
+            out.push(inst);
+        }
     }
     Ok(out)
 }
@@ -616,7 +788,8 @@ pub fn build_with(
             blocks[b].exit = Exit::Jump(fallthrough()?);
             continue;
         }
-        let ends = flow != Flow::Next || next.is_none_or(|n| leaders.binary_search(&n).is_ok());
+        let ends = flow != Flow::Next
+            || next.is_none_or(|n| n != machine.offset && leaders.binary_search(&n).is_ok());
         if ends {
             blocks[b].exit = match flow {
                 Flow::Next => Exit::Jump(fallthrough()?),

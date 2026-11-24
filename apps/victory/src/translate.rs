@@ -541,7 +541,7 @@ fn tally_program(
     checks: &mut Checks,
 ) {
     t.programs += 1;
-    match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
+    match ir::build_with(&p.patched_code(), p.wave64, p.vgprs, p.uses_spill_table()) {
         Ok(program) => {
             t.translated += 1;
             t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();

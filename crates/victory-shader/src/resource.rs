@@ -175,6 +175,12 @@ pub fn track(
     // and loads that entry: accesses, offset reads and loads by block.
     let mut offset_at =
         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
+    // Waterfall loops whose first-lane read is of the table/heap address
+    // itself: each load must feed a descriptor access in the same block whose
+    // waterfall proof succeeds.
+    let mut pending_waterfall_loads = std::collections::BTreeMap::<Site, Vec<Value>>::new();
+    let mut address_waterfall_at =
+        std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -184,17 +190,22 @@ pub fn track(
             };
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
+            let mut address_wf = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
                 let source = t.descriptor(inst, op, b).map_err(fail)?;
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
                 if let Source::Loaded { load, .. } = source
                     && load.0 == b
                     && load.1 < i
-                    && let Some((_, a)) = out.scalar.iter().find(|s| s.0 == load)
-                    && let Some(d) = a.dynamic
-                    && let Some(reads) = t.offset_reads(b, d)
                 {
-                    offset.push((reads, load));
+                    if let Some(reads) = pending_waterfall_loads.get(&load) {
+                        address_wf.push((reads.clone(), load));
+                    } else if let Some((_, a)) = out.scalar.iter().find(|s| s.0 == load)
+                        && let Some(d) = a.dynamic
+                        && let Some(reads) = t.offset_reads(b, d)
+                    {
+                        offset.push((reads, load));
+                    }
                 }
                 out.descriptors.push(Descriptor { site, role, source });
                 Ok(())
@@ -223,7 +234,19 @@ pub fn track(
                     soffset,
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
-                    let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
+                    let address = match t.smem_address(inst, base, *offset, soffset) {
+                        Ok(a) => a,
+                        Err("an address read from the first lane of a per-lane value") => {
+                            let (a, reads) = t
+                                .smem_waterfall_address(b, inst, base, *offset, soffset)
+                                .ok_or_else(|| {
+                                    fail("an address read from the first lane of a per-lane value")
+                                })?;
+                            pending_waterfall_loads.insert(site, reads);
+                            a
+                        }
+                        Err(what) => return Err(fail(what)),
+                    };
                     out.scalar.push((site, address));
                 }
                 Fields::Flat {
@@ -243,6 +266,14 @@ pub fn track(
                 let (accesses, reads) = first_lane_at.entry(b).or_default();
                 accesses.push(i);
                 reads.extend(first_lane);
+            }
+            if !address_wf.is_empty() {
+                let (accesses, reads, loads) = address_waterfall_at.entry(b).or_default();
+                accesses.push(i);
+                for (vs, load) in address_wf {
+                    reads.extend(vs);
+                    loads.push(load);
+                }
             }
             if !offset.is_empty() {
                 let (accesses, reads, loads) = offset_at.entry(b).or_default();
@@ -270,6 +301,32 @@ pub fn track(
                 })?;
         out.waterfall.compares.extend(proof.compares);
         out.waterfall.reads.extend(proof.reads);
+    }
+    let mut proved_waterfall_loads = Vec::new();
+    for (block, (accesses, mut reads, mut loads)) in address_waterfall_at {
+        reads.sort_unstable();
+        reads.dedup();
+        loads.sort_unstable();
+        loads.dedup();
+        let proof =
+            t.waterfall(block, &accesses, &reads)
+                .map_err(|_| ShaderError::Unsupported {
+                    offset: t.inst(loads[0]).machine.offset,
+                    what: "an address read from the first lane of a per-lane value",
+                })?;
+        out.waterfall.compares.extend(proof.compares);
+        out.waterfall.reads.extend(proof.reads);
+        out.waterfall.loads.extend(loads.iter().copied());
+        proved_waterfall_loads.extend(loads);
+    }
+    if let Some(&unproved) = pending_waterfall_loads
+        .keys()
+        .find(|site| !proved_waterfall_loads.contains(site))
+    {
+        return Err(ShaderError::Unsupported {
+            offset: t.inst(unproved).machine.offset,
+            what: "an address read from the first lane of a per-lane value",
+        });
     }
     // Unproven, an offset read stays the first lane's (one uniform entry),
     // which is what the hardware reads outside a waterfall loop.
@@ -320,6 +377,40 @@ struct Sum {
     base: Option<Value>,
     offset: u32,
     dynamic: Option<Value>,
+    /// `dynamic` is an SSA value that already includes `base` (e.g. a
+    /// same-base phi, select, or `s_lshl*_add_u32` on a table/heap base).
+    /// Only accepted for table/heap addresses where lowering reads the
+    /// instruction's SSA register directly.
+    base_included: bool,
+}
+
+impl Sum {
+    const fn constant(offset: u32) -> Self {
+        Self {
+            base: None,
+            offset,
+            dynamic: None,
+            base_included: false,
+        }
+    }
+
+    const fn base(v: Value) -> Self {
+        Self {
+            base: Some(v),
+            offset: 0,
+            dynamic: None,
+            base_included: false,
+        }
+    }
+
+    const fn dynamic(v: Value) -> Self {
+        Self {
+            base: None,
+            offset: 0,
+            dynamic: Some(v),
+            base_included: false,
+        }
+    }
 }
 
 struct Tracer<'a> {
@@ -353,15 +444,46 @@ const UNIFORM_VALU: &[&str] = &[
     "v_add_co_ci_u32",
     "v_sub_co_u32",
     "v_sub_nc_u32",
+    "v_sub_co_ci_u32",
+    "v_subrev_co_u32",
+    "v_subrev_nc_u32",
+    "v_subrev_co_ci_u32",
     "v_lshlrev_b32",
     "v_lshlrev_b64",
+    "v_lshrrev_b32",
+    "v_lshrrev_b64",
     "v_lshl_add_u32",
+    "v_lshl_or_b32",
     "v_add3_u32",
     "v_ashrrev_i32",
+    "v_min_u32",
+    "v_max_u32",
+    "v_min_i32",
+    "v_max_i32",
     "v_med3_i32",
+    "v_med3_u32",
     "v_and_b32",
     "v_or_b32",
+    "v_xor_b32",
+    "v_not_b32",
+    "v_bfrev_b32",
+    "v_bfe_u32",
+    "v_bfe_i32",
+    "v_bfi_b32",
+    "v_alignbit_b32",
+    "v_alignbyte_b32",
+    "v_and_or_b32",
+    "v_or3_b32",
+    "v_xor3_b32",
     "v_mul_lo_u32",
+    "v_mul_hi_u32",
+    "v_mul_hi_i32",
+    "v_mul_u32_u24",
+    "v_mul_i32_i24",
+    "v_mad_u32_u24",
+    "v_mad_i32_i24",
+    "v_mad_u64_u32",
+    "v_mad_i64_i32",
 ];
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -537,73 +659,368 @@ impl<'a> Tracer<'a> {
         ))
     }
 
+    fn is_address_param(&self, param: usize) -> bool {
+        matches!(
+            self.layout[param].root,
+            RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap | RootType::Descriptor
+        )
+    }
+
+    fn is_heap_param(&self, param: usize) -> bool {
+        matches!(
+            self.layout[param].root,
+            RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap
+        )
+    }
+
     fn sum(&self, t: Term) -> Sum {
+        self.sum_with(t, &mut Vec::new())
+    }
+
+    fn combine_sum(x: Sum, y: Sum, v: Value) -> Sum {
+        if x.base.is_some() && y.base.is_some() {
+            return Sum::dynamic(v);
+        }
+        if x.base_included && y.base.is_none() {
+            return Sum {
+                base: x.base,
+                offset: x.offset.wrapping_add(y.offset),
+                dynamic: Some(v),
+                base_included: true,
+            };
+        }
+        if y.base_included && x.base.is_none() {
+            return Sum {
+                base: y.base,
+                offset: x.offset.wrapping_add(y.offset),
+                dynamic: Some(v),
+                base_included: true,
+            };
+        }
+        if x.dynamic.is_some() && y.dynamic.is_some() {
+            return Sum::dynamic(v);
+        }
+        Sum {
+            base: x.base.or(y.base),
+            offset: x.offset.wrapping_add(y.offset),
+            dynamic: x.dynamic.or(y.dynamic),
+            base_included: false,
+        }
+    }
+
+    fn sum_with(&self, t: Term, visiting: &mut Vec<Value>) -> Sum {
         let v = match t {
-            Term::Const(c) => {
-                return Sum {
-                    base: None,
-                    offset: c,
-                    dynamic: None,
-                };
-            }
+            Term::Const(c) => return Sum::constant(c),
             Term::Value(v) => v,
         };
         let index = v.0 as usize;
-        if let Some(&Some(sum)) = self.sums.borrow().get(index) {
+        if visiting.is_empty()
+            && let Some(&Some(sum)) = self.sums.borrow().get(index)
+        {
             return sum;
         }
-        let dynamic = Sum {
-            base: None,
-            offset: 0,
-            dynamic: Some(v),
-        };
         if let Some(reg) = self.inputs[index] {
             return match self.param_of(reg) {
-                Some((_, 0)) => Sum {
-                    base: Some(v),
-                    offset: 0,
-                    dynamic: None,
-                },
-                _ => dynamic,
+                Some((param, 0)) if self.is_address_param(param) => Sum::base(v),
+                _ => Sum::dynamic(v),
             };
         }
         if self.getpc(v).is_some() {
-            return Sum {
-                base: Some(v),
-                offset: 0,
-                dynamic: None,
-            };
+            return Sum::base(v);
         }
         if let Some(src) = self.uniform_first_lane(v) {
-            return self.sum(self.vorigin(src));
+            return self.sum_with(self.vorigin(src), visiting);
         }
-        let Some([a, b]) = self
+        let sum = self.compute_sum(v, visiting);
+        // Memoize only top-level sums (outside provisional loop-phi markers).
+        if visiting.is_empty() {
+            let mut sums = self.sums.borrow_mut();
+            if index >= sums.len() {
+                sums.resize(index + 1, None);
+            }
+            sums[index] = Some(sum);
+        }
+        sum
+    }
+
+    fn compute_sum(&self, v: Value, visiting: &mut Vec<Value>) -> Sum {
+        if let Some((b, i)) = self.phis[v.0 as usize] {
+            if visiting.contains(&v) {
+                return Sum::base(v);
+            }
+            if visiting.len() >= MAX_JOINS {
+                return Sum::dynamic(v);
+            }
+            let phi = &self.p.blocks[b].phis[i];
+            let vector = matches!(phi.reg, Reg::V(_));
+            visiting.push(v);
+            let mut entry: Option<(Value, u32, Option<Value>, bool)> = None;
+            let mut exact = true;
+            let mut ok = true;
+            let mut min_off = u32::MAX;
+            for &arg in &phi.args {
+                let term = if vector {
+                    self.vorigin(arg)
+                } else {
+                    self.origin(arg)
+                };
+                let arm = self.sum_with(term, visiting);
+                if arm.base == Some(v) {
+                    exact = false;
+                    continue;
+                }
+                let Some(base) = arm.base else {
+                    ok = false;
+                    break;
+                };
+                if visiting.contains(&base) {
+                    ok = false;
+                    break;
+                }
+                min_off = min_off.min(arm.offset);
+                match entry {
+                    None => entry = Some((base, arm.offset, arm.dynamic, arm.base_included)),
+                    Some((eb, eo, ed, ebi)) if eb == base => {
+                        if eo != arm.offset || ed != arm.dynamic || ebi || arm.base_included {
+                            exact = false;
+                        }
+                    }
+                    Some(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            visiting.pop();
+            if ok && let Some((base, offset, dynamic, base_included)) = entry {
+                return if exact && !base_included {
+                    Sum {
+                        base: Some(base),
+                        offset,
+                        dynamic,
+                        base_included: false,
+                    }
+                } else {
+                    Sum {
+                        base: Some(base),
+                        offset: min_off,
+                        dynamic: Some(v),
+                        base_included: true,
+                    }
+                };
+            }
+            return Sum::dynamic(v);
+        }
+
+        if let Some((_, set, clear)) = self.picked(v) {
+            return self.join_select_sum(v, set, clear, false, visiting);
+        }
+        if let Some((_, set, clear)) = self.lane_picked(v) {
+            return self.join_select_sum(v, set, clear, true, visiting);
+        }
+
+        // `s_addk_i32 sD, simm16`
+        if let Some(inst) = self.def(v)
+            && inst.name() == "s_addk_i32"
+            && let Fields::Sop {
+                dst: Some(Operand::Scalar { code, dwords: 1 }),
+                imm: Some(imm),
+                ..
+            } = inst.fields
+            && inst.writes.first().is_some_and(|w| w.1 == v)
+            && let Some(old) = inst.read(Reg::S(code))
+        {
+            let x = self.sum_with(self.origin(old), visiting);
+            let y = Sum::constant(i32::from(imm as i16) as u32);
+            return Self::combine_sum(x, y, v);
+        }
+
+        // `s_add_u32` / `s_add_i32` / `v_add_co_u32` / `v_add_nc_u32`
+        if let Some([a, b]) = self
             .sop2(v, &["s_add_u32", "s_add_i32"])
             .map(|(_, t)| t)
             .or_else(|| self.vadd(v))
-        else {
-            return dynamic;
+        {
+            let (x, y) = (self.sum_with(a, visiting), self.sum_with(b, visiting));
+            return Self::combine_sum(x, y, v);
+        }
+
+        // `s_sub_u32` / `s_sub_i32` / `v_sub_*` / `v_subrev_*` with constant subtrahend
+        if let Some((a, c)) = self.sub_const(v) {
+            let x = self.sum_with(a, visiting);
+            return Self::combine_sum(x, Sum::constant(c.wrapping_neg()), v);
+        }
+
+        // `v_add3_u32`
+        if let Some([a, b, c]) = self.vadd3(v) {
+            let xy = Self::combine_sum(self.sum_with(a, visiting), self.sum_with(b, visiting), v);
+            return Self::combine_sum(xy, self.sum_with(c, visiting), v);
+        }
+
+        // `s_lshl{1..4}_add_u32` and `v_lshl_add_u32`
+        if let Some((scaled, shift, addend)) = self.lshl_add(v) {
+            if let (Term::Const(c), Term::Const(k)) = (scaled, shift) {
+                let x = self.sum_with(addend, visiting);
+                return Self::combine_sum(x, Sum::constant(c.wrapping_shl(k & 31)), v);
+            }
+            if shift == Term::Const(0) {
+                let (x, y) = (
+                    self.sum_with(scaled, visiting),
+                    self.sum_with(addend, visiting),
+                );
+                return Self::combine_sum(x, y, v);
+            }
+            let base_sum = self.sum_with(addend, visiting);
+            let idx_sum = self.sum_with(scaled, visiting);
+            if base_sum.base.is_some() && idx_sum.base.is_none() {
+                return Sum {
+                    base: base_sum.base,
+                    offset: base_sum.offset,
+                    dynamic: Some(v),
+                    base_included: true,
+                };
+            }
+        }
+
+        Sum::dynamic(v)
+    }
+
+    fn join_select_sum(
+        &self,
+        v: Value,
+        set: Term,
+        clear: Term,
+        vector: bool,
+        visiting: &mut Vec<Value>,
+    ) -> Sum {
+        let norm = |t| match t {
+            Term::Value(u) if vector => self.vorigin(u),
+            other => other,
         };
-        let (x, y) = (self.sum(a), self.sum(b));
-        let sum =
-            if x.base.is_some() && y.base.is_some() || x.dynamic.is_some() && y.dynamic.is_some() {
-                dynamic
+        let a = self.sum_with(norm(set), visiting);
+        let b = self.sum_with(norm(clear), visiting);
+        if a.base.is_some() && a.base == b.base {
+            if !a.base_included
+                && !b.base_included
+                && a.offset == b.offset
+                && a.dynamic == b.dynamic
+            {
+                a
             } else {
                 Sum {
-                    base: x.base.or(y.base),
-                    offset: x.offset.wrapping_add(y.offset),
-                    dynamic: x.dynamic.or(y.dynamic),
+                    base: a.base,
+                    offset: a.offset.min(b.offset),
+                    dynamic: Some(v),
+                    base_included: true,
                 }
-            };
-        // The operands' origins are settled before tracing starts. Every
-        // use of this value can reuse its sum, including an opaque result.
-        let mut sums = self.sums.borrow_mut();
-        if index >= sums.len() {
-            sums.resize(index + 1, None);
+            }
+        } else {
+            Sum::dynamic(v)
         }
-        sums[index] = Some(sum);
-        drop(sums);
-        sum
+    }
+
+    /// The operands `(a, const)` of a subtraction `a - const` writing `v`.
+    fn sub_const(&self, v: Value) -> Option<(Term, u32)> {
+        if let Some((_, [a, Term::Const(c)])) = self.sop2(v, &["s_sub_u32", "s_sub_i32"]) {
+            return Some((a, c));
+        }
+        let inst = self.def(v)?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        let Operand::Vector { reg, .. } = f.dst? else {
+            return None;
+        };
+        if inst.write(Reg::V(reg)) != Some(v)
+            || f.abs != 0
+            || f.neg != 0
+            || f.sdwa.is_some()
+            || f.dpp.is_some()
+        {
+            return None;
+        }
+        let a = self.vterm(inst, f.src.first()?)?;
+        let b = self.vterm(inst, f.src.get(1)?)?;
+        match inst.name() {
+            "v_sub_co_u32" | "v_sub_nc_u32" => match b {
+                Term::Const(c) => Some((a, c)),
+                _ => None,
+            },
+            "v_subrev_co_u32" | "v_subrev_nc_u32" => match a {
+                Term::Const(c) => Some((b, c)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The three operands of `v_add3_u32` writing `v`.
+    fn vadd3(&self, v: Value) -> Option<[Term; 3]> {
+        let inst = self.def(v)?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        let Operand::Vector { reg, .. } = f.dst? else {
+            return None;
+        };
+        if inst.name() != "v_add3_u32"
+            || inst.write(Reg::V(reg)) != Some(v)
+            || f.abs != 0
+            || f.neg != 0
+            || f.sdwa.is_some()
+            || f.dpp.is_some()
+        {
+            return None;
+        }
+        Some([
+            self.vterm(inst, f.src.first()?)?,
+            self.vterm(inst, f.src.get(1)?)?,
+            self.vterm(inst, f.src.get(2)?)?,
+        ])
+    }
+
+    /// `(scaled, shift, addend)` for `s_lshl{1..4}_add_u32` or `v_lshl_add_u32`
+    /// computing `(scaled << shift) + addend`.
+    fn lshl_add(&self, v: Value) -> Option<(Term, Term, Term)> {
+        if let Some((inst, [a, b])) = self.sop2(
+            v,
+            &[
+                "s_lshl1_add_u32",
+                "s_lshl2_add_u32",
+                "s_lshl3_add_u32",
+                "s_lshl4_add_u32",
+            ],
+        ) {
+            let shift = match inst.name() {
+                "s_lshl1_add_u32" => 1,
+                "s_lshl2_add_u32" => 2,
+                "s_lshl3_add_u32" => 3,
+                "s_lshl4_add_u32" => 4,
+                _ => return None,
+            };
+            return Some((a, Term::Const(shift), b));
+        }
+        let inst = self.def(v)?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        let Operand::Vector { reg, .. } = f.dst? else {
+            return None;
+        };
+        if inst.name() != "v_lshl_add_u32"
+            || inst.write(Reg::V(reg)) != Some(v)
+            || f.abs != 0
+            || f.neg != 0
+            || f.sdwa.is_some()
+            || f.dpp.is_some()
+        {
+            return None;
+        }
+        Some((
+            self.vterm(inst, f.src.first()?)?,
+            self.vterm(inst, f.src.get(1)?)?,
+            self.vterm(inst, f.src.get(2)?)?,
+        ))
     }
 
     /// The `s_getpc_b64` writing `lo` as its low dword.
@@ -695,15 +1112,7 @@ impl<'a> Tracer<'a> {
                 let (Some(lo), Some(hi)) = (word(0), word(1)) else {
                     return Err("a global address");
                 };
-                self.address(
-                    lo,
-                    hi,
-                    Sum {
-                        base: None,
-                        offset: off,
-                        dynamic: None,
-                    },
-                )
+                self.address(lo, hi, Sum::constant(off))
             }
         }
     }
@@ -718,6 +1127,9 @@ impl<'a> Tracer<'a> {
         }
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
+            if s.base_included {
+                return Err(self.why_no_base(s.dynamic));
+            }
             // A table in the code: the base is the next instruction's offset.
             let high = pc.writes.get(1).map(|w| w.1);
             if !self.high_half(hi, high) && !high.is_some_and(|h| self.carried(hi, h)) {
@@ -735,6 +1147,9 @@ impl<'a> Tracer<'a> {
         let (param, _) = self
             .param_of(reg)
             .ok_or("an address not from a root parameter")?;
+        if s.base_included && !self.is_heap_param(param) {
+            return Err(self.why_no_base(s.dynamic));
+        }
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
             RootType::Descriptor => {
@@ -759,26 +1174,144 @@ impl<'a> Tracer<'a> {
         })
     }
 
-    /// `hi` is `high` (0 for a table), possibly plus a carry.
+    /// `hi` is `high` (0 for a table), possibly plus a carry, through joins.
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
+        self.high_half_in(hi, high, &mut Vec::new())
+    }
+
+    fn high_half_in(&self, hi: Term, high: Option<Value>, visiting: &mut Vec<Value>) -> bool {
+        let hi = self.unlaned(hi);
         let want = high.map_or(Term::Const(0), Term::Value);
-        hi == want
-            || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
-                |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
-            ))
+        if hi == want {
+            return true;
+        }
+        let Term::Value(v) = hi else {
+            return false;
+        };
+        if visiting.contains(&v) {
+            return true;
+        }
+        if visiting.len() >= MAX_JOINS {
+            return false;
+        }
+        if let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) {
+            visiting.push(v);
+            let ok = (b == Term::Const(0) && self.high_half_in(a, high, visiting))
+                || (a == Term::Const(0) && self.high_half_in(b, high, visiting));
+            visiting.pop();
+            if ok {
+                return true;
+            }
+        }
+        if high.is_none()
+            && let Some(inst) = self.def(v)
+            && inst.name() == "v_add_co_ci_u32"
+            && let Fields::Valu(f) = &inst.fields
+            && let (Some(a), Some(b)) = (
+                f.src.first().and_then(|o| self.vterm(inst, o)),
+                f.src.get(1).and_then(|o| self.vterm(inst, o)),
+            )
+        {
+            visiting.push(v);
+            let ok = (b == Term::Const(0) && self.high_half_in(a, None, visiting))
+                || (a == Term::Const(0) && self.high_half_in(b, None, visiting));
+            visiting.pop();
+            if ok {
+                return true;
+            }
+        }
+        if let Some((_, set, clear)) = self.picked(v) {
+            visiting.push(v);
+            let ok =
+                self.high_half_in(set, high, visiting) && self.high_half_in(clear, high, visiting);
+            visiting.pop();
+            return ok;
+        }
+        if let Some((_, set, clear)) = self.lane_picked(v) {
+            let norm = |t| match t {
+                Term::Value(u) => self.vorigin(u),
+                other => other,
+            };
+            visiting.push(v);
+            let ok = self.high_half_in(norm(set), high, visiting)
+                && self.high_half_in(norm(clear), high, visiting);
+            visiting.pop();
+            return ok;
+        }
+        if let Some((b, i)) = self.phis[v.0 as usize] {
+            let phi = &self.p.blocks[b].phis[i];
+            let vector = matches!(phi.reg, Reg::V(_));
+            visiting.push(v);
+            let ok = phi.args.iter().all(|&arg| {
+                let term = if vector {
+                    self.vorigin(arg)
+                } else {
+                    self.origin(arg)
+                };
+                self.high_half_in(term, high, visiting)
+            });
+            visiting.pop();
+            return ok;
+        }
+        false
     }
 
     /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
-    /// `v_add_co_ci_u32` with `high` as an operand.
+    /// `v_add_co_ci_u32` with `high` as an operand, possibly through joins.
     fn carried(&self, hi: Term, high: Value) -> bool {
+        self.carried_in(hi, high, &mut Vec::new())
+    }
+
+    fn carried_in(&self, hi: Term, high: Value, visiting: &mut Vec<Value>) -> bool {
         let Term::Value(v) = self.unlaned(hi) else {
             return false;
         };
         if v == high {
             return true;
         }
+        if visiting.contains(&v) {
+            return true;
+        }
+        if visiting.len() >= MAX_JOINS {
+            return false;
+        }
         if let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) {
-            return self.carried(a, high) || self.carried(b, high);
+            visiting.push(v);
+            let ok = self.carried_in(a, high, visiting) || self.carried_in(b, high, visiting);
+            visiting.pop();
+            return ok;
+        }
+        if let Some((_, set, clear)) = self.picked(v) {
+            visiting.push(v);
+            let ok = self.carried_in(set, high, visiting) && self.carried_in(clear, high, visiting);
+            visiting.pop();
+            return ok;
+        }
+        if let Some((_, set, clear)) = self.lane_picked(v) {
+            let norm = |t| match t {
+                Term::Value(u) => self.vorigin(u),
+                other => other,
+            };
+            visiting.push(v);
+            let ok = self.carried_in(norm(set), high, visiting)
+                && self.carried_in(norm(clear), high, visiting);
+            visiting.pop();
+            return ok;
+        }
+        if let Some((b, i)) = self.phis[v.0 as usize] {
+            let phi = &self.p.blocks[b].phis[i];
+            let vector = matches!(phi.reg, Reg::V(_));
+            visiting.push(v);
+            let ok = phi.args.iter().all(|&arg| {
+                let term = if vector {
+                    self.vorigin(arg)
+                } else {
+                    self.origin(arg)
+                };
+                self.carried_in(term, high, visiting)
+            });
+            visiting.pop();
+            return ok;
         }
         let Some(inst) = self.def(v) else {
             return false;
@@ -786,18 +1319,30 @@ impl<'a> Tracer<'a> {
         let Fields::Valu(f) = &inst.fields else {
             return false;
         };
-        inst.name() == "v_add_co_ci_u32"
-            && f.src[..2.min(f.src.len())]
-                .iter()
-                .any(|o| self.vterm(inst, o).is_some_and(|t| self.carried(t, high)))
+        inst.name() == "v_add_co_ci_u32" && {
+            visiting.push(v);
+            let ok = f.src[..2.min(f.src.len())].iter().any(|o| {
+                self.vterm(inst, o)
+                    .is_some_and(|t| self.carried_in(t, high, visiting))
+            });
+            visiting.pop();
+            ok
+        }
     }
 
     fn why_no_base(&self, dynamic: Option<Value>) -> &'static str {
         let Some(v) = dynamic else {
             return "a constant address";
         };
-        if self.inputs[v.0 as usize].is_some() {
-            return "an address in an SGPR that is no root parameter";
+        if let Some(reg) = self.inputs[v.0 as usize] {
+            return if self
+                .param_of(reg)
+                .is_some_and(|(param, dword)| dword == 0 && !self.is_address_param(param))
+            {
+                "an address from a root parameter that is no address"
+            } else {
+                "an address in an SGPR that is no root parameter"
+            };
         }
         if self
             .leaves(v)
@@ -849,6 +1394,70 @@ impl<'a> Tracer<'a> {
         }
         extra.offset = extra.offset.wrapping_add(offset as u32);
         self.address(lo, hi, extra)
+    }
+
+    /// For a scalar load inside a self-loop block whose base address is read
+    /// from the first active lane of a per-lane table/heap address in VGPRs:
+    /// traces the underlying VGPR address and returns the first-lane read(s)
+    /// that the waterfall proof must match.
+    fn smem_waterfall_address(
+        &self,
+        block: usize,
+        inst: &Inst,
+        base: &Operand,
+        offset: i32,
+        soffset: &Operand,
+    ) -> Option<(Address, Vec<Value>)> {
+        if !matches!(
+            self.p.blocks[block].exit,
+            Exit::Branch { taken, not_taken } if taken == block && not_taken != block
+        ) {
+            return None;
+        }
+        let Operand::Scalar { code, .. } = *base else {
+            return None;
+        };
+        let lo = self.origin(inst.read(Reg::S(code))?);
+        let hi = self.origin(inst.read(Reg::S(code + 1))?);
+        let Term::Value(lo_read) = lo else {
+            return None;
+        };
+        if self.defs[lo_read.0 as usize].is_none_or(|(b, _)| b != block) {
+            return None;
+        }
+        let lo_src = self.first_lane_source(lo_read)?;
+        let mut reads = vec![lo_read];
+        let hi_term = match hi {
+            Term::Value(hi_read) => {
+                if let Some(hi_src) = self.first_lane_source(hi_read) {
+                    if self.defs[hi_read.0 as usize].is_none_or(|(b, _)| b != block) {
+                        return None;
+                    }
+                    reads.push(hi_read);
+                    self.vorigin(hi_src)
+                } else {
+                    hi
+                }
+            }
+            Term::Const(_) => hi,
+        };
+        let mut extra = self.sum(self.term(inst, soffset)?);
+        if extra.base.is_some() {
+            return None;
+        }
+        extra.offset = extra.offset.wrapping_add(offset as u32);
+        let address = self.address(self.vorigin(lo_src), hi_term, extra).ok()?;
+        if address.param == CODE || !self.is_heap_param(address.param) {
+            return None;
+        }
+        Some((
+            Address {
+                param: address.param,
+                offset: address.offset,
+                dynamic: Some(lo_read),
+            },
+            reads,
+        ))
     }
 
     /// The source of the descriptor operand `op` of `inst`, in block `at`.
@@ -912,15 +1521,7 @@ impl<'a> Tracer<'a> {
             {
                 (hi, bits) = (x, bits | more);
             }
-            let address = self.address(
-                lo,
-                hi,
-                Sum {
-                    base: None,
-                    offset: 0,
-                    dynamic: None,
-                },
-            )?;
+            let address = self.address(lo, hi, Sum::constant(0))?;
             return Ok(Source::Built {
                 address,
                 bits,
@@ -1146,16 +1747,29 @@ impl<'a> Tracer<'a> {
         known
     }
 
+    fn value_reg(&self, v: Value) -> Option<Reg> {
+        match (self.inputs[v.0 as usize], self.phis[v.0 as usize]) {
+            (Some(reg), _) => Some(reg),
+            (None, Some((b, i))) => Some(self.p.blocks[b].phis[i].reg),
+            (None, None) => self
+                .def(v)
+                .and_then(|i| i.writes.iter().find(|w| w.1 == v))
+                .map(|w| w.0),
+        }
+    }
+
     fn uniform_now(&self, v: Value) -> bool {
-        if let Some(reg) = self.inputs[v.0 as usize] {
-            return matches!(reg, Reg::S(_));
+        // Every wave-wide SGPR (inputs, scalar memory loads, SOP results,
+        // SGPR phis, first-lane/readlane results) holds one value per wave.
+        if let Some(Reg::S(code)) = self.value_reg(v)
+            && code != EXEC
+            && code != EXEC + 1
+        {
+            return true;
         }
         let Some(inst) = self.def(v) else {
             return false;
         };
-        if inst.name() == "v_readfirstlane_b32" {
-            return true;
-        }
         let uniform_op = |op: &Operand| match *op {
             Operand::Vector { reg, dwords } => {
                 (0..dwords).all(|k| inst.read(Reg::V(reg + k)).is_some_and(|x| self.uniform(x)))
@@ -1171,8 +1785,8 @@ impl<'a> Tracer<'a> {
             // give boundary lanes zero or their old value) and SDWA can keep
             // part of the old register: neither result follows from its
             // operands alone.
-            // A carry-in is a lane mask: each lane adds its own bit, so the
-            // mask's bits must agree, not only its value.
+            // A carry-in or cndmask selector is a lane mask: each lane reads
+            // its own bit, so the mask's bits must agree across all lanes.
             Fields::Valu(f) if UNIFORM_VALU.contains(&inst.name()) => {
                 let carry_in = inst.name().ends_with("_co_ci_u32");
                 f.dpp.is_none()
@@ -1186,13 +1800,22 @@ impl<'a> Tracer<'a> {
                     })
                     && self.writes_every_lane(v)
             }
+            Fields::Valu(f) if inst.name() == "v_cndmask_b32" => {
+                f.dpp.is_none()
+                    && f.sdwa.is_none()
+                    && f.src.len() == 3
+                    && uniform_op(&f.src[0])
+                    && uniform_op(&f.src[1])
+                    && self.same_bit_in_every_lane(inst, &f.src[2])
+                    && self.writes_every_lane(v)
+            }
             _ => false,
         }
     }
 
     /// Whether lane mask `op` of `inst` has the same bit in every lane: an
-    /// inline 0 or -1, or the carry-out of a VALU add or subtract whose own
-    /// result is uniform (every lane then carries the same).
+    /// inline 0 or -1, the carry-out of a uniform VALU add or subtract, or
+    /// a `v_cmp_*` comparing uniform operands.
     fn same_bit_in_every_lane(&self, inst: &Inst, op: &Operand) -> bool {
         let Operand::Scalar { code, dwords } = *op else {
             return matches!(*op, Operand::Const(128 | 193));
@@ -1210,6 +1833,33 @@ impl<'a> Tracer<'a> {
         let Fields::Valu(f) = &writer.fields else {
             return false;
         };
+        if writer.name().starts_with("v_cmp_")
+            && f.dpp.is_none()
+            && f.sdwa.is_none()
+            && f.src.len() == 2
+            && let Some(Operand::Scalar { code: out, .. }) = f.dst
+        {
+            let matched = dwords
+                .iter()
+                .enumerate()
+                .all(|(k, &d)| writer.write(Reg::S(out + k as u8)) == Some(d));
+            let uniform_op = |src: &Operand| match *src {
+                Operand::Vector { reg, dwords } => (0..dwords).all(|k| {
+                    writer
+                        .read(Reg::V(reg + k))
+                        .is_some_and(|x| self.uniform(x))
+                }),
+                Operand::Scalar { code, dwords } if code != NULL => (0..dwords).all(|k| {
+                    writer
+                        .read(Reg::S(code + k))
+                        .is_some_and(|x| self.uniform(x))
+                }),
+                _ => true,
+            };
+            if matched && f.src.iter().all(uniform_op) {
+                return true;
+            }
+        }
         let (Some(Operand::Scalar { code: out, .. }), Some(Operand::Vector { reg, .. })) =
             (f.carry, f.dst)
         else {
@@ -1222,7 +1872,12 @@ impl<'a> Tracer<'a> {
         carried
             && matches!(
                 writer.name(),
-                "v_add_co_u32" | "v_sub_co_u32" | "v_add_co_ci_u32"
+                "v_add_co_u32"
+                    | "v_sub_co_u32"
+                    | "v_subrev_co_u32"
+                    | "v_add_co_ci_u32"
+                    | "v_sub_co_ci_u32"
+                    | "v_subrev_co_ci_u32"
             )
             && writer.write(Reg::V(reg)).is_some_and(|r| self.uniform(r))
     }
