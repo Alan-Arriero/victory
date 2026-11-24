@@ -863,7 +863,15 @@ impl State {
             }
         };
         if let (Some((a, s)), Some((_, _, len))) = (&shadow, view) {
-            s.refresh(list, *a, len.min(1 << 20));
+            let wanted = match access {
+                RawAccess::Read if compute => D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                RawAccess::Read => {
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                        | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                }
+                RawAccess::ReadWrite => D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            };
+            s.refresh_as(list, *a, len.min(1 << 20), wanted);
             if access == RawAccess::ReadWrite {
                 s.gpu_writes(list, *a, len);
             }
@@ -1596,10 +1604,7 @@ impl State {
             );
             return false;
         };
-        args.refresh(list, arguments, len);
-        if let Some((s, at)) = &counter {
-            s.refresh(list, *at, 4);
-        }
+        args.refresh_as(list, arguments, len, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
@@ -1611,6 +1616,9 @@ impl State {
                 Some("not bounded (no clamp, or arguments not 4-byte aligned)"),
             );
             return false;
+        }
+        if let Some((s, at)) = &counter {
+            s.refresh_as(list, *at, 4, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
@@ -1626,7 +1634,6 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.frame_op("indirect", kind == DISPATCH, ran);
         if !ran {
-            crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1656,7 +1663,6 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1745,9 +1751,11 @@ fn readable(
         && len > 0
         && let Some(shadow) = crate::shadow::find(address, len)
     {
-        shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
+            shadow.refresh_as(list, address, len, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             shadow.gpu_writes(list, address, len);
+        } else {
+            shadow.refresh(list, address, len);
         }
     }
     match (view, u.kind) {
@@ -1860,18 +1868,84 @@ mod tests {
     use super::{expanded_vertices, rect_source};
 
     #[test]
-    fn bounded_root_views_bind_without_a_title_heap() {
+    fn bounded_root_dispatch_writes_then_reads_without_a_title_heap() {
+        use super::*;
         let Some(host) = crate::host::host() else {
+            eprintln!("no host D3D12 device; skipped bounded root dispatch");
             return;
         };
+        let pipeline = |source| {
+            let bytes = crate::hlsl::compile_compute("raw root test", source).unwrap();
+            // SAFETY: synthetic shader bytecode contains its matching root signature.
+            unsafe {
+                let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &bytes).unwrap();
+                let pso: ID3D12PipelineState = host
+                    .device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: bytes.as_ptr().cast(),
+                            BytecodeLength: bytes.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .unwrap();
+                (root, pso)
+            }
+        };
+        let first = pipeline(
+            r#"RWByteAddressBuffer dst : register(u0);
+                [RootSignature("DescriptorTable(UAV(u0))")]
+                [numthreads(1,1,1)] void main() { dst.Store(4, 29); }"#,
+        );
+        let second = pipeline(
+            r#"RWByteAddressBuffer dst : register(u0);
+                ByteAddressBuffer src : register(t0);
+                [RootSignature("DescriptorTable(UAV(u0)), DescriptorTable(SRV(t0))")]
+                [numthreads(1,1,1)] void main() { dst.Store(8, src.Load(4) + 5); }"#,
+        );
+        #[repr(align(16))]
+        struct Words([u32; 4]);
+        struct Registration(u64);
+        impl Drop for Registration {
+            fn drop(&mut self) {
+                crate::shadow::unregister(self.0 as usize, self.0);
+            }
+        }
+        let register = |words: &mut Words| {
+            let addr = words.0.as_mut_ptr() as u64;
+            crate::shadow::register(addr as usize, addr, 16);
+            Registration(addr)
+        };
+        let mut source = Words([0; 4]);
+        let mut destination = Words([0; 4]);
+        let src = register(&mut source);
+        let dst = register(&mut destination);
         let list = host.new_list().unwrap();
-        let mut state = super::State::default();
+        let mut state = State::default();
         assert!(state.bind_heaps(&list, true));
         assert_eq!(state.host_heaps, [crate::descriptor::ROOT_VIEW_HEAP, 0]);
         assert_eq!(state.heaps, [0, 0]);
+        for ((root, pso), dst, src) in [(&first, src.0, None), (&second, dst.0, Some(src.0))] {
+            // SAFETY: an open list and matching live root signature and pipeline.
+            unsafe {
+                list.list.SetComputeRootSignature(root);
+                list.list.SetPipelineState(pso);
+            }
+            assert!(state.root_buffer_table(&list, Some(dst), 0, true, RawAccess::ReadWrite));
+            if let Some(src) = src {
+                assert!(state.root_buffer_table(&list, Some(src), 1, true, RawAccess::Read));
+            }
+            // SAFETY: a single workgroup with the required tables bound.
+            unsafe { list.list.Dispatch(1, 1, 1) };
+        }
         assert!(state.bind_heaps(&list, false));
         assert_eq!(state.host_heaps, [0, 0]);
         list.close();
+        host.execute(&[&list]);
+        assert_eq!(source.0, [0, 29, 0, 0]);
+        assert_eq!(destination.0, [0, 0, 34, 0]);
+        eprintln!("bounded root UAV to SRV dispatch readback verified");
     }
 
     #[test]
