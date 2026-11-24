@@ -426,6 +426,7 @@ fn build_prefix_cs(wave64: bool, float: bool, inclusive: bool, mode: Mode) -> Ho
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -780,6 +781,7 @@ fn wave_prefix_sum_f32_pixel_quad_all_backends() {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
     };
 
     // PS: root constants s0..s3 hold terms cycled by active rank (`rank & 3`).
@@ -884,6 +886,7 @@ fn wave_prefix_sum_f32_pixel_quad_all_backends() {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

@@ -89,6 +89,7 @@ fn build_any(words: &[u32], buffers: bool) -> (HostShader, lower::Lowered) {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs.clone(),
         root_srvs: lowered.root_srvs.clone(),
+        root_uavs: lowered.root_uavs.clone(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())

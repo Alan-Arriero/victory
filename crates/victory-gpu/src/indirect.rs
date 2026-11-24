@@ -20,7 +20,7 @@
 
 use windows::Win32::Graphics::Direct3D12::*;
 
-use crate::host::{HostList, host, transition};
+use crate::host::{HostList, host};
 
 const SOURCE: &str = include_str!("../shaders/argument_clamp.hlsl");
 
@@ -117,28 +117,8 @@ pub(crate) fn bound(
     if !clamp_uav(list, gpu, spec) {
         return false;
     }
-    // SAFETY: an open list and a live buffer.
-    unsafe {
-        list.list.ResourceBarrier(&[transition(
-            buffer,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        )]);
-    }
+    list.use_shadow(buffer, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     true
-}
-
-/// After the execution: the buffer back to unordered access, where the
-/// title's passes keep using it.
-pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
-    // SAFETY: an open list and a live buffer.
-    unsafe {
-        list.list.ResourceBarrier(&[transition(
-            buffer,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        )])
-    };
 }
 
 pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {

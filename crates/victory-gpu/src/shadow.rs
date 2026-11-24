@@ -19,7 +19,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
-use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATES, ID3D12Resource,
+};
 
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
@@ -146,6 +148,18 @@ impl Shadow {
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        self.refresh_as(list, address, len, D3D12_RESOURCE_STATE_GENERIC_READ);
+    }
+
+    /// Refresh a range and prepare its host buffer for the specified GPU use.
+    pub(crate) fn refresh_as(
+        self: &Arc<Self>,
+        list: &HostList,
+        address: u64,
+        len: u64,
+        access: D3D12_RESOURCE_STATES,
+    ) {
+        list.use_shadow(&self.buffer, access);
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
     }
