@@ -94,6 +94,11 @@ enum RawAccess {
     ReadWrite,
 }
 
+/// A raw UAV exposes whole dwords, and D3D12 stores the element count in a u32.
+fn writable_root_bytes(remaining: u64) -> Option<u64> {
+    u32::try_from(remaining / 4).ok().map(|n| u64::from(n) * 4)
+}
+
 /// A raw view describes bytes of a particular host resource. The descriptor
 /// slot keeps that resource alive for the recorded commands.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -823,8 +828,8 @@ impl State {
         true
     }
 
-    /// Bind a bounded raw buffer. Writable views have no declared size, so
-    /// limit the span the renderer may write and copy back to one MiB.
+    /// Bind a raw view of the remaining host buffer. A writable view, its
+    /// initial contents, and its copy-back all cover the same whole dwords.
     fn root_buffer_table(
         &mut self,
         list: &HostList,
@@ -841,21 +846,34 @@ impl State {
         let shadow = address
             .filter(|&a| a != 0)
             .and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-        let view = shadow.as_ref().and_then(|(a, s)| {
+        let view = if let Some((a, s)) = &shadow {
             let offset = s.offset(*a);
-            if !offset.is_multiple_of(16) {
+            if offset.is_multiple_of(16) {
+                let remaining = s.left(*a);
+                let len = match access {
+                    RawAccess::Read => remaining,
+                    RawAccess::ReadWrite => {
+                        let Some(len) = writable_root_bytes(remaining) else {
+                            once!(
+                                remaining,
+                                "writable root buffer exceeds the D3D12 element count: the draw is dropped"
+                            );
+                            return false;
+                        };
+                        len
+                    }
+                };
+                (len >= 4).then_some((&s.buffer, offset, len))
+            } else {
                 once!(
                     address = format_args!("{a:#x}"),
                     "an unaligned raw root view is bound as null"
                 );
-                return None;
+                None
             }
-            let len = match access {
-                RawAccess::Read => s.left(*a),
-                RawAccess::ReadWrite => s.left(*a).min(1 << 20) & !3,
-            };
-            (len >= 4).then_some((&s.buffer, offset, len))
-        });
+        } else {
+            None
+        };
         let range = view.map(|(buffer, offset, len)| RawBufferRange {
             resource: buffer.as_raw() as usize,
             offset,
@@ -892,9 +910,12 @@ impl State {
                 }
                 RawAccess::ReadWrite => D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             };
-            s.refresh_as(list, *a, len.min(1 << 20), wanted);
-            if access == RawAccess::ReadWrite {
-                s.gpu_writes(list, *a, len);
+            match access {
+                RawAccess::Read => s.refresh_as(list, *a, len.min(1 << 20), wanted),
+                RawAccess::ReadWrite => {
+                    s.refresh_as(list, *a, len, wanted);
+                    s.gpu_writes(list, *a, len);
+                }
             }
         }
         let handle = host.gpu_handle(index);
@@ -2020,6 +2041,18 @@ mod tests {
     use super::{expanded_vertices, rect_source};
 
     #[test]
+    fn writable_root_extent_covers_every_representable_whole_dword() {
+        let max = u64::from(u32::MAX) * 4;
+        assert_eq!(super::writable_root_bytes(3), Some(0));
+        assert_eq!(
+            super::writable_root_bytes((1 << 20) + 7),
+            Some((1 << 20) + 4)
+        );
+        assert_eq!(super::writable_root_bytes(max + 3), Some(max));
+        assert_eq!(super::writable_root_bytes(max + 4), None);
+    }
+
+    #[test]
     fn bounded_root_dispatch_writes_then_reads_without_a_title_heap() {
         use super::*;
         let Some(host) = crate::host::host() else {
@@ -2048,29 +2081,29 @@ mod tests {
         let first = pipeline(
             r#"RWByteAddressBuffer dst : register(u0);
                 [RootSignature("DescriptorTable(UAV(u0))")]
-                [numthreads(1,1,1)] void main() { dst.Store(4, 29); }"#,
+                [numthreads(1,1,1)] void main() { dst.Store(1048580, dst.Load(1048580) + 22); }"#,
         );
         let second = pipeline(
             r#"RWByteAddressBuffer dst : register(u0);
                 ByteAddressBuffer src : register(t0);
                 [RootSignature("DescriptorTable(UAV(u0)), DescriptorTable(SRV(t0))")]
-                [numthreads(1,1,1)] void main() { dst.Store(8, src.Load(4) + 5); }"#,
+                [numthreads(1,1,1)] void main() { dst.Store(8, src.Load(1048580) + 5); }"#,
         );
-        #[repr(align(16))]
-        struct Words([u32; 4]);
+        // One dword beyond the old one-MiB view.
+        const WORD: usize = (1 << 20) / 4 + 1;
         struct Registration(u64);
         impl Drop for Registration {
             fn drop(&mut self) {
                 crate::shadow::unregister(self.0 as usize, self.0);
             }
         }
-        let register = |words: &mut Words| {
-            let addr = words.0.as_mut_ptr() as u64;
-            crate::shadow::register(addr as usize, addr, 16);
+        let register = |words: &mut [u32]| {
+            let addr = words.as_mut_ptr() as u64;
+            crate::shadow::register(addr as usize, addr, std::mem::size_of_val(words) as u64);
             Registration(addr)
         };
-        let mut source = Words([0; 4]);
-        let mut destination = Words([0; 4]);
+        let mut source = vec![7; WORD + 3];
+        let mut destination = [0; 4];
         let src = register(&mut source);
         let dst = register(&mut destination);
         let list = host.new_list().unwrap();
@@ -2095,8 +2128,14 @@ mod tests {
         assert_eq!(state.host_heaps, [0, 0]);
         list.close();
         host.execute(&[&list]);
-        assert_eq!(source.0, [0, 29, 0, 0]);
-        assert_eq!(destination.0, [0, 0, 34, 0]);
+        assert_eq!(source[WORD], 29);
+        assert!(
+            source[..WORD]
+                .iter()
+                .chain(&source[WORD + 1..])
+                .all(|&word| word == 7)
+        );
+        assert_eq!(destination, [0, 0, 34, 0]);
         eprintln!("bounded root UAV to SRV dispatch readback verified");
     }
 
