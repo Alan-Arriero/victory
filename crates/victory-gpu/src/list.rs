@@ -118,22 +118,46 @@ struct List {
     /// Shared with submissions still to run (queues held back by a wait).
     #[cfg(windows)]
     host: std::sync::Mutex<Option<std::sync::Arc<crate::host::HostList>>>,
+    /// Closed host list segments and mid-list memory waits recorded before the
+    /// active `host` list. Lock order: `host` -> `segments` -> `state`.
+    #[cfg(windows)]
+    segments: std::sync::Mutex<Vec<Segment>>,
+    /// Whether `host` has GPU or deferred work recorded since the last split or
+    /// reset.
+    #[cfg(windows)]
+    has_work: std::sync::atomic::AtomicBool,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 
+/// One segment of a recorded command list in submission order.
+#[cfg(windows)]
+#[derive(Clone)]
+pub(crate) enum Segment {
+    List(std::sync::Arc<crate::host::HostList>),
+    Wait(crate::timeline::MemoryWait),
+}
+
 #[cfg(windows)]
 impl Drop for List {
     fn drop(&mut self) {
         let uploads = std::mem::take(self.uploads.get_mut().unwrap_or_else(|e| e.into_inner()));
-        if let Some(pending) = self
+        let segments = std::mem::take(self.segments.get_mut().unwrap_or_else(|e| e.into_inner()));
+        let current = self
             .host
             .get_mut()
             .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            && std::sync::Arc::strong_count(pending) > 1
+            .take();
+        if let Some(pending) = segments
+            .iter()
+            .filter_map(|s| match s {
+                Segment::List(l) => Some(l),
+                Segment::Wait(_) => None,
+            })
+            .chain(current.as_ref())
+            .rfind(|l| std::sync::Arc::strong_count(l) > 1)
         {
             pending.keep_uploads(uploads);
             let dynamic = self
@@ -156,9 +180,41 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(&list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// Marks the active host list segment as having recorded GPU or deferred work.
+#[cfg(windows)]
+fn mark_work(this: This) {
+    if !this.is_null() {
+        // SAFETY: the title passes one of our lists.
+        unsafe { &*this.cast::<List>() }
+            .has_work
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Closed host list segments and mid-list memory waits recorded on `this`,
+/// including the active host list when it has work or when no prior segments
+/// exist.
+#[cfg(windows)]
+pub(crate) fn segments(this: This) -> Vec<Segment> {
+    if this.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    let host = list.host.lock().unwrap_or_else(|e| e.into_inner());
+    let segments = list.segments.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = segments.clone();
+    if let Some(current) = host.as_ref()
+        && (list.has_work.load(std::sync::atomic::Ordering::Acquire) || out.is_empty())
+    {
+        out.push(Segment::List(current.clone()));
+    }
+    out
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
-pub(crate) fn host_list(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
+fn host_list(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
     if this.is_null() {
         return None;
     }
@@ -254,6 +310,10 @@ fn new_list(
             }
         })),
         #[cfg(windows)]
+        segments: std::sync::Mutex::new(Vec::new()),
+        #[cfg(windows)]
+        has_work: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
             state.set_pipeline(pipeline);
@@ -301,33 +361,46 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     // SAFETY: the title passes one of our lists.
     let list = unsafe { &*this.cast::<List>() };
     let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
-    // A submission of the list still to run (its queue waits for a fence)
-    // keeps the host list, its upload memory and its dynamic descriptor
-    // slots; recording goes on in a pooled or new list, open already.
+    // A submission of the list still to run (its queue waits for a fence or
+    // memory wait) keeps the last pending segment's host list, upload memory,
+    // and dynamic descriptor slots; recording goes on in a pooled or new list,
+    // open already.
     #[cfg(windows)]
     let (fresh, keep_pending) = {
         let mut host = list.host.lock().unwrap_or_else(|e| e.into_inner());
-        match host.as_ref() {
-            Some(pending) if std::sync::Arc::strong_count(pending) > 1 => {
-                pending.keep_uploads(uploads);
-                let dynamic = list
-                    .state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take_dynamic();
-                pending.keep_dynamic(dynamic);
-                match crate::host::host().map(|h| h.acquire_list()) {
-                    Some(Ok(new)) => {
-                        *host = Some(std::sync::Arc::new(new));
-                        (true, false)
-                    }
-                    _ => {
-                        tracing::warn!("no new host list: a list to run is reset");
-                        (false, true)
-                    }
+        let mut segments = list.segments.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pending) = segments
+            .iter()
+            .filter_map(|s| match s {
+                Segment::List(l) => Some(l),
+                Segment::Wait(_) => None,
+            })
+            .chain(host.as_ref())
+            .rfind(|l| std::sync::Arc::strong_count(l) > 1)
+        {
+            pending.keep_uploads(uploads);
+            pending.keep_dynamic(state.take_dynamic());
+        }
+        segments.clear();
+        list.has_work
+            .store(false, std::sync::atomic::Ordering::Release);
+        let current_pending = host
+            .as_ref()
+            .is_some_and(|l| std::sync::Arc::strong_count(l) > 1);
+        if current_pending {
+            match crate::host::host().map(|h| h.acquire_list()) {
+                Some(Ok(new)) => {
+                    *host = Some(std::sync::Arc::new(new));
+                    (true, false)
+                }
+                _ => {
+                    tracing::warn!("no new host list: a list to run is reset");
+                    (false, true)
                 }
             }
-            _ => (false, false),
+        } else {
+            (false, false)
         }
     };
     #[cfg(windows)]
@@ -447,6 +520,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             };
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
+            mark_work(this);
         }
     }
     0
@@ -497,6 +571,7 @@ extern "system" fn copy_buffer_region(
         && let Some(from) = buffer_range(src, src_offset, len)
     {
         list.defer_copy(to, from, len as usize);
+        mark_work(this);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
@@ -522,11 +597,13 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
+            mark_work(this);
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
             list.defer_copy(to, from, a.min(b) as usize);
+            mark_work(this);
         }
     }
     #[cfg(not(windows))]
@@ -678,6 +755,7 @@ extern "system" fn copy_texture_region(
                 row_bytes as usize,
                 total as usize,
             );
+            mark_work(this);
             return;
         }
         let Some(to) = crate::resource::host_resource(dst.resource) else {
@@ -756,6 +834,7 @@ extern "system" fn copy_texture_region(
                 host_box,
             )
         };
+        mark_work(this);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
@@ -837,6 +916,7 @@ extern "system" fn resolve(
                 );
             }
         }
+        mark_work(this);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_sub, src, src_sub, format);
@@ -896,6 +976,7 @@ extern "system" fn clear_rtv(
             }
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
+        mark_work(this);
     }
     #[cfg(not(windows))]
     let _ = (this, handle, color, count, rects);
@@ -942,6 +1023,7 @@ extern "system" fn clear_dsv(
                 rects,
             )
         };
+        mark_work(this);
     }
     #[cfg(not(windows))]
     let _ = (this, handle, flags, depth, stencil, count, rects);
@@ -964,6 +1046,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
                 unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
             }
         });
+        mark_work(this);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src, len);
@@ -1104,7 +1187,7 @@ extern "system" fn ignored_state(_: This) {}
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, host_list, with_state};
+    use super::{This, with_state};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -1126,25 +1209,20 @@ mod state {
         count: u32,
         viewports: *const D3D12_VIEWPORT,
     ) {
-        if let Some(list) = host_list(this) {
-            crate::draw::viewports(&list, items(viewports, count));
-        }
+        with_state(this, |list, s| {
+            s.set_viewports(list, items(viewports, count))
+        });
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
-        if let Some(list) = host_list(this) {
-            crate::draw::scissors(&list, items(rects, count));
-        }
+        with_state(this, |list, s| s.set_scissors(list, items(rects, count)));
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
-        if let Some(list) = host_list(this) {
-            // SAFETY: the title passes four floats or null.
-            crate::draw::blend_factor(&list, unsafe { factor.as_ref() });
-        }
+        // SAFETY: the title passes four floats or null.
+        let factor = unsafe { factor.as_ref() };
+        with_state(this, |list, s| s.set_blend_factor(list, factor));
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
-        if let Some(list) = host_list(this) {
-            crate::draw::stencil_ref(&list, reference);
-        }
+        with_state(this, |list, s| s.set_stencil_ref(list, reference));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
@@ -1241,27 +1319,30 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        super::mark_work(this);
         with_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
+        super::mark_work(this);
         with_state(this, |list, s| s.dispatch(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
+        super::mark_work(this);
         if y * z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
-    /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
-    /// shortcut: dispatches whose group count is in GPU memory (indirect)
-    /// are dropped; make them ExecuteIndirect when the title uses them.
+    /// `DispatchMeshX(x, flags, indirect arguments, payload)`: dispatches `x`
+    /// mesh groups directly, or one indirect mesh dispatch from `indirect`
+    /// when non-zero.
     pub(super) extern "system" fn dispatch_mesh_x(
         this: This,
         x: u32,
@@ -1270,9 +1351,16 @@ mod state {
         _payload: u64,
     ) {
         super::count_draw();
+        super::mark_work(this);
         if indirect != 0 {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            const MESH: u32 = 10;
+            let mut ran = false;
+            with_state(this, |list, s| {
+                ran = s.execute_indirect(list, (MESH, 12, 1), indirect, None);
+            });
+            if !ran {
+                super::INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -1286,6 +1374,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        super::mark_work(this);
         with_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
@@ -1350,6 +1439,8 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
+    #[cfg(windows)]
+    mark_work(this);
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
@@ -1419,10 +1510,89 @@ pub(crate) fn take_counts() -> (u64, u64) {
     (DRAWS.swap(0, Relaxed), DISPATCHES.swap(0, Relaxed))
 }
 
-/// A GPU wait for a memory value `(address, comparison, reference, ...)`.
-/// Lists run one after another and to completion, so a value another queue
-/// or the CPU has to write first cannot be waited for; nothing to do.
-extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _reference: u64) {}
+/// A GPU wait for a 32-bit `(address, comparison, reference, mask)` or
+/// 64-bit `(address, comparison, reference, flags)` memory value: splits
+/// a recording with earlier work into a closed host list before the wait and
+/// a fresh open host list after it.
+extern "system" fn wait32(this: This, address: u64, comparison: u32, reference: u32, mask: u32) {
+    record_wait(this, address, comparison, u64::from(reference), mask, 4);
+}
+
+extern "system" fn wait64(this: This, address: u64, comparison: u32, reference: u64, _flags: u32) {
+    record_wait(this, address, comparison, reference, u32::MAX, 8);
+}
+
+/// Maximum number of mid-list host command-list splits per title list.
+/// Real titles issue only a handful of mid-list memory waits per list; capping
+/// splits bounds host list allocation and `segments()` cloning on pathological
+/// wait chains.
+#[cfg(windows)]
+const MAX_WAIT_SPLITS: usize = 64;
+
+fn record_wait(this: This, address: u64, comparison: u32, reference: u64, mask: u32, width: u8) {
+    const ALWAYS: u32 = 8;
+    if address == 0 || comparison == ALWAYS {
+        return;
+    }
+    if !(2..=7).contains(&comparison) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(comparison, "unsupported GPU memory wait comparison skipped");
+        });
+        return;
+    }
+    #[cfg(windows)]
+    if !this.is_null() {
+        // SAFETY: the title passes one of our lists.
+        let list = unsafe { &*this.cast::<List>() };
+        let mut host = list.host.lock().unwrap_or_else(|e| e.into_inner());
+        let mut segments = list.segments.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+        let splits = segments
+            .iter()
+            .filter(|s| matches!(s, Segment::List(_)))
+            .count();
+        if list.has_work.load(std::sync::atomic::Ordering::Acquire) {
+            if splits >= MAX_WAIT_SPLITS {
+                static CAPPED: std::sync::Once = std::sync::Once::new();
+                CAPPED.call_once(|| {
+                    tracing::warn!(
+                        cap = MAX_WAIT_SPLITS,
+                        "mid-list GPU memory wait split cap reached; skipping further splits"
+                    );
+                });
+                return;
+            }
+            if list
+                .has_work
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+                && let Some(prev) = host.take()
+            {
+                prev.close();
+                segments.push(Segment::List(prev.clone()));
+                match crate::host::host().and_then(|h| h.acquire_list().ok()) {
+                    Some(new) => {
+                        let new = std::sync::Arc::new(new);
+                        state.reapply_host(&new, &prev);
+                        *host = Some(new);
+                    }
+                    None => {
+                        tracing::warn!("no new host list after mid-list wait split");
+                    }
+                }
+            }
+        }
+        segments.push(Segment::Wait(crate::timeline::MemoryWait {
+            address,
+            reference,
+            mask,
+            width,
+            comparison,
+        }));
+    }
+    #[cfg(not(windows))]
+    let _ = (this, reference, mask, width);
+}
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
@@ -1440,6 +1610,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
             unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
+        mark_work(this);
     }
     #[cfg(not(windows))]
     let _ = (this, count);
@@ -1469,6 +1640,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
     #[cfg(windows)]
     if let Some(list) = host_list(this) {
         list.defer_write(address as *mut u8, what, bytes);
+        mark_work(this);
         return;
     }
     let _ = this;
@@ -1526,8 +1698,8 @@ const METHODS: [(usize, *const ()); 52] = [
     (68, ignored_state as *const ()),             // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
-    (71, wait_value as *const ()),                // 0x238, 32 bits
-    (72, wait_value as *const ()),                // 0x240, 64 bits
+    (71, wait32 as *const ()),                    // 0x238, 32 bits
+    (72, wait64 as *const ()),                    // 0x240, 64 bits
     (73, ignored_state as *const ()),             // 0x248 pixel shader depth order
     (83, copy_texture_region_x as *const ()),     // 0x298
     (84, copy_resource_x as *const ()),           // 0x2a0
@@ -1595,6 +1767,18 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 /// titles add.
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_slot(list: This, slot_index: usize) -> usize {
+    // SAFETY: one of our command lists; its first field is the vtable pointer.
+    let table = unsafe { *list.cast::<*const *const ()>() };
+    let resolved = if table == NEWER_LIST_FUNCTIONS.0.as_ptr() {
+        newer_slot(slot_index)
+    } else {
+        slot_index
+    };
+    resolved * size_of::<*const ()>()
+}
 
 #[cfg(test)]
 mod tests {
@@ -1816,6 +2000,413 @@ mod tests {
         );
 
         for object in [list, allocator, waits, ready, done] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    fn list_slot(list: This, slot_index: usize) -> usize {
+        test_slot(list, slot_index)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mid_list_write_wait_write_orders_across_memory_wait() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        type Execute = extern "system" fn(This, u32, *const This);
+        type Write32 = extern "system" fn(This, u64, u32, u32, u32);
+        type Wait32 = extern "system" fn(This, u64, u32, u32, u32);
+
+        let null = std::ptr::null();
+        let (queue, _sig_slot) = crate::queue::test_queue();
+        let execute = slot::<Execute>(queue, 0x50);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        let first = AtomicU32::new(0);
+        let second = AtomicU32::new(0);
+        let gate = std::sync::Arc::new(AtomicU32::new(0));
+
+        let call_write32 = slot::<Write32>(list, list_slot(list, 69));
+        let call_wait32 = slot::<Wait32>(list, list_slot(list, 71));
+
+        call_write32(list, (&raw const first) as u64, 11, 0, 0);
+        // EQUAL (3): wait until gate == 42 (masked with u32::MAX).
+        call_wait32(list, (&raw const *gate) as u64, 3, 42, u32::MAX);
+        call_write32(list, (&raw const second) as u64, 22, 0, 0);
+        assert_eq!(close(list), S_OK);
+
+        execute(queue, 1, &list);
+
+        // First segment ran immediately before the wait; second segment stays blocked.
+        assert_eq!(first.load(Ordering::Acquire), 11);
+        assert_eq!(second.load(Ordering::Acquire), 0);
+
+        let gate_thread = gate.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            gate_thread.store(42, Ordering::Release);
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while second.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(second.load(Ordering::Acquire), 22);
+
+        for object in [list, allocator, queue] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn indirect_dispatch_mesh_x_routes_through_execute_indirect() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        type DispatchMeshX = extern "system" fn(This, u32, u64, u64, u64);
+
+        let null = std::ptr::null();
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        let _ = take_indirect();
+        let call_mesh_x = slot::<DispatchMeshX>(list, list_slot(list, 98));
+        // Non-zero indirect address outside shadow buffers increments INDIRECT via execute_indirect.
+        call_mesh_x(list, 0, 0, 0x1000, 0);
+        assert_eq!(take_indirect(), 1);
+        assert!(
+            // SAFETY: the list is ours.
+            unsafe { &(*list.cast::<List>()).has_work }.load(std::sync::atomic::Ordering::Acquire),
+            "indirect DispatchMeshX must mark has_work"
+        );
+
+        let mut gate = 0u32;
+        let call_wait32 =
+            slot::<extern "system" fn(This, u64, u32, u32, u32)>(list, list_slot(list, 71));
+        call_wait32(list, (&raw mut gate) as u64, 3, 1, u32::MAX);
+        assert!(
+            matches!(
+                segments(list).as_slice(),
+                [Segment::List(_), Segment::Wait(_)]
+            ),
+            "indirect DispatchMeshX followed by wait must emit [List, Wait]"
+        );
+
+        // Direct DispatchMeshX also marks has_work.
+        call_mesh_x(list, 1, 0, 0, 0);
+        assert!(
+            // SAFETY: the list is ours.
+            unsafe { &(*list.cast::<List>()).has_work }.load(std::sync::atomic::Ordering::Acquire),
+            "direct DispatchMeshX must mark has_work"
+        );
+
+        assert_eq!(close(list), S_OK);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn leading_and_consecutive_waits_produce_no_empty_host_segments() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        type SetPipeline = extern "system" fn(This, This);
+        type Topology = extern "system" fn(This, u32);
+        type Viewports = extern "system" fn(This, u32, *const D3D12_VIEWPORT);
+        type Scissors = extern "system" fn(This, u32, *const RECT);
+        type BlendFactor = extern "system" fn(This, *const [f32; 4]);
+        type StencilRef = extern "system" fn(This, u32);
+        type Write32 = extern "system" fn(This, u64, u32, u32, u32);
+        type Wait32 = extern "system" fn(This, u64, u32, u32, u32);
+        type Wait64 = extern "system" fn(This, u64, u32, u64, u32);
+
+        let null = std::ptr::null();
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        // Pure state setters must not mark has_work.
+        slot::<SetPipeline>(list, list_slot(list, 25))(list, null);
+        slot::<Topology>(list, list_slot(list, 20))(list, 4);
+        let vp = D3D12_VIEWPORT {
+            Width: 8.0,
+            Height: 8.0,
+            MaxDepth: 1.0,
+            ..Default::default()
+        };
+        slot::<Viewports>(list, list_slot(list, 21))(list, 1, &vp);
+        let rc = RECT {
+            right: 8,
+            bottom: 8,
+            ..Default::default()
+        };
+        slot::<Scissors>(list, list_slot(list, 22))(list, 1, &rc);
+        let blend = [1.0, 0.5, 0.25, 1.0];
+        slot::<BlendFactor>(list, list_slot(list, 23))(list, &blend);
+        slot::<StencilRef>(list, list_slot(list, 24))(list, 3);
+
+        let call_write32 = slot::<Write32>(list, list_slot(list, 69));
+        let call_wait32 = slot::<Wait32>(list, list_slot(list, 71));
+        let call_wait64 = slot::<Wait64>(list, list_slot(list, 72));
+
+        let mut mem32 = 0u32;
+        let mut mem64 = 0u64;
+        let addr32 = (&raw mut mem32) as u64;
+        let addr64 = (&raw mut mem64) as u64;
+
+        // Skipped waits: null address, NEVER (1), ALWAYS (8), unknown (99).
+        call_wait32(list, 0, 3, 1, u32::MAX);
+        call_wait32(list, addr32, 1, 1, u32::MAX);
+        call_wait32(list, addr32, 8, 1, u32::MAX);
+        call_wait32(list, addr32, 99, 1, u32::MAX);
+        assert!(
+            matches!(segments(list).as_slice(), [Segment::List(_)]),
+            "skipped waits leave a single initial empty List segment only when no segments exist"
+        );
+
+        // Leading wait + consecutive wait produce [Wait, Wait] with no empty List segments.
+        call_wait32(list, addr32, 3, 1, u32::MAX);
+        call_wait64(list, addr64, 7, 2, 0);
+        let segs = segments(list);
+        assert_eq!(segs.len(), 2);
+        assert!(matches!(segs[0], Segment::Wait(_)));
+        assert!(matches!(segs[1], Segment::Wait(_)));
+
+        // Work -> Wait -> Wait -> Work -> Wait produces [Wait, Wait, List, Wait, Wait, List, Wait].
+        let mut out = 0u32;
+        call_write32(list, (&raw mut out) as u64, 1, 0, 0);
+        call_wait32(list, addr32, 3, 3, u32::MAX);
+        call_wait64(list, addr64, 3, 4, 0);
+        call_write32(list, (&raw mut out) as u64, 2, 0, 0);
+        call_wait32(list, addr32, 3, 5, u32::MAX);
+
+        let segs = segments(list);
+        assert_eq!(segs.len(), 7);
+        assert!(matches!(segs[0], Segment::Wait(_)));
+        assert!(matches!(segs[1], Segment::Wait(_)));
+        assert!(matches!(segs[2], Segment::List(_)));
+        assert!(matches!(segs[3], Segment::Wait(_)));
+        assert!(matches!(segs[4], Segment::Wait(_)));
+        assert!(matches!(segs[5], Segment::List(_)));
+        assert!(matches!(segs[6], Segment::Wait(_)));
+
+        assert_eq!(close(list), S_OK);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wait_comparison_modes_and_64_bit_mask_on_queue() {
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        type Execute = extern "system" fn(This, u32, *const This);
+        type Write32 = extern "system" fn(This, u64, u32, u32, u32);
+        type Wait32 = extern "system" fn(This, u64, u32, u32, u32);
+        type Wait64 = extern "system" fn(This, u64, u32, u64, u32);
+
+        let null = std::ptr::null();
+        let (queue, _) = crate::queue::test_queue();
+        let execute = slot::<Execute>(queue, 0x50);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        let gate32 = AtomicU32::new(0xdead_0001);
+        let gate64 = std::sync::Arc::new(AtomicU64::new(7));
+        let done = std::sync::Arc::new(AtomicU32::new(0));
+
+        let call_write32 = slot::<Write32>(list, list_slot(list, 69));
+        let call_wait32 = slot::<Wait32>(list, list_slot(list, 71));
+        let call_wait64 = slot::<Wait64>(list, list_slot(list, 72));
+
+        // 1 (NEVER) and 8 (ALWAYS) must not block at all.
+        call_wait32(list, (&raw const gate32) as u64, 1, 0, u32::MAX);
+        call_wait32(list, (&raw const gate32) as u64, 8, 0, u32::MAX);
+        // Masked 32-bit EQUAL: (0xdead_0001 & 0xffff) == 1 passes at once.
+        call_wait32(list, (&raw const gate32) as u64, 3, 1, 0xffff);
+        call_write32(list, (&raw const *done) as u64, 1, 0, 0);
+        // 64-bit EQUAL: low 32 bits already 7, upper 32 bits differ -> blocks until full 64 bits match.
+        call_wait64(
+            list,
+            (&raw const *gate64) as u64,
+            3,
+            0x0001_0000_0000_0007,
+            0,
+        );
+        call_write32(list, (&raw const *done) as u64, 2, 0, 0);
+        assert_eq!(close(list), S_OK);
+
+        execute(queue, 1, &list);
+        assert_eq!(done.load(Ordering::Acquire), 1);
+
+        let g64 = gate64.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            g64.store(0x0001_0000_0000_0007, Ordering::Release);
+        });
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while done.load(Ordering::Acquire) < 2 && std::time::Instant::now() < limit {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(done.load(Ordering::Acquire), 2);
+
+        for object in [list, allocator, queue] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pending_segmented_list_reset_and_drop_keep_uploads_until_last_segment_runs() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        type Sync = extern "system" fn(This, This, u64) -> HRESULT;
+        type Execute = extern "system" fn(This, u32, *const This);
+        type Wait32 = extern "system" fn(This, u64, u32, u32, u32);
+        type Write32 = extern "system" fn(This, u64, u32, u32, u32);
+
+        let null = std::ptr::null();
+        let (queue, sig_slot) = crate::queue::test_queue();
+        let wait_fence = slot::<Sync>(queue, sig_slot + 8);
+        let execute = slot::<Execute>(queue, 0x50);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let mut ready = null;
+        assert_eq!(
+            crate::fence::create(null, 0, 0, fence_iid, &mut ready),
+            S_OK
+        );
+
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        let call_write32 = slot::<Write32>(list, list_slot(list, 69));
+        let call_wait32 = slot::<Wait32>(list, list_slot(list, 71));
+
+        // Reset case: upload used after mid-list wait stays alive while second segment is pending.
+        let gate = AtomicU32::new(0);
+        let src1 = allocate_upload(list, 32, 16);
+        assert!(!src1.is_null());
+        // SAFETY: 32 bytes handed out above.
+        unsafe { src1.write_bytes(0x7a, 32) };
+        let mut dst1 = [0u8; 32];
+        let mut first_done = 0u32;
+        call_write32(list, (&raw mut first_done) as u64, 1, 0, 0);
+        call_wait32(list, (&raw const gate) as u64, 3, 1, u32::MAX);
+        copy_memory(list, dst1.as_mut_ptr() as u64, src1 as u64, 32, 0);
+        assert_eq!(close(list), S_OK);
+
+        execute(queue, 1, &list);
+        assert_eq!(first_done, 1);
+        assert_eq!(dst1, [0u8; 32]);
+
+        // Reset while second segment is held on the memory wait.
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert!(segments(list).len() == 1 && matches!(segments(list)[0], Segment::List(_)));
+        assert!(
+            // SAFETY: the list is ours.
+            !unsafe { &(*list.cast::<List>()).has_work }.load(Ordering::Acquire)
+        );
+        assert_eq!(dst1, [0u8; 32]);
+
+        gate.store(1, Ordering::Release);
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while dst1[0] == 0 && std::time::Instant::now() < limit {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(dst1, [0x7a; 32]);
+
+        // Drop case: segment 1 pending behind queue fence, trailing wait leaves current non-pending.
+        let mut list2 = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list2),
+            S_OK
+        );
+        let src2 = allocate_upload(list2, 32, 16);
+        assert!(!src2.is_null());
+        // SAFETY: 32 bytes handed out above.
+        unsafe { src2.write_bytes(0x4e, 32) };
+        let mut dst2 = [0u8; 32];
+        assert_eq!(wait_fence(queue, ready, 1), S_OK);
+        copy_memory(list2, dst2.as_mut_ptr() as u64, src2 as u64, 32, 0);
+        slot::<Wait32>(list2, list_slot(list2, 71))(
+            list2,
+            (&raw const gate) as u64,
+            3,
+            1,
+            u32::MAX,
+        );
+        assert_eq!(close(list2), S_OK);
+        execute(queue, 1, &list2);
+        assert_eq!(release(list2), 0);
+        assert_eq!(dst2, [0u8; 32]);
+
+        assert_eq!(crate::fence::signal(ready, 1), S_OK);
+        assert_eq!(dst2, [0x4e; 32]);
+
+        for object in [list, allocator, queue, ready] {
             assert_eq!(release(object), 0);
         }
     }

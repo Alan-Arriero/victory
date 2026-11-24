@@ -121,30 +121,128 @@ fn watch_loop() {
     }
 }
 
+/// Pending GPU memory waits registered by timelines that are held back.
+/// Leaf lock relative to `Timeline::state`, never held while taking `LIVE` or
+/// any `Fence` lock.
+static MEMORY_WAITERS: Mutex<Vec<(crate::timeline::MemoryWait, Instant, Weak<Timeline>)>> =
+    Mutex::new(Vec::new());
+
+#[cfg(any(feature = "diagnostics", test))]
+fn parse_wait_timeout(value: Option<&str>) -> Duration {
+    let ms = value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(2000)
+        .max(1);
+    Duration::from_millis(ms)
+}
+
+/// How long a GPU memory wait waits before timing out and failing open
+/// (2000 ms; overridable with `VICTORY_WAIT_TIMEOUT_MS` in `diagnostics` builds).
+pub(crate) fn memory_wait_timeout() -> Duration {
+    #[cfg(feature = "diagnostics")]
+    {
+        parse_wait_timeout(std::env::var("VICTORY_WAIT_TIMEOUT_MS").ok().as_deref())
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        Duration::from_millis(2000)
+    }
+}
+
+/// Returns whether `wait` is already satisfied or expired; otherwise
+/// registers `timeline` to be woken once the value matches or the deadline passes.
+pub(crate) fn wait_memory(
+    wait: crate::timeline::MemoryWait,
+    deadline: Instant,
+    timeline: &Arc<Timeline>,
+) -> bool {
+    let mut waiters = MEMORY_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
+    let weak = Arc::downgrade(timeline);
+    if wait.satisfied() || Instant::now() >= deadline {
+        waiters.retain(|(_, _, t)| !t.ptr_eq(&weak));
+        return true;
+    }
+    if let Some(existing) = waiters.iter_mut().find(|(_, _, t)| t.ptr_eq(&weak)) {
+        existing.0 = wait;
+        existing.1 = deadline;
+    } else {
+        waiters.push((wait, deadline, weak));
+    }
+    drop(waiters);
+    watch_notify();
+    false
+}
+
+/// Unregisters any pending GPU memory wait for `timeline`.
+///
+/// Called whenever `Timeline::run` consumes an `Op::WaitMemory` without
+/// re-queueing it (for example after `Timeline::submit` sees a CPU write or
+/// deadline expiry before the watcher scans), so `scan_memory_waiters` cannot
+/// later read a retired address after post-wait work reports completion.
+pub(crate) fn cancel_memory_wait(timeline: &Arc<Timeline>) {
+    let weak = Arc::downgrade(timeline);
+    let mut waiters = MEMORY_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
+    waiters.retain(|(_, _, t)| !t.ptr_eq(&weak));
+}
+
+#[cfg(test)]
+pub(crate) fn has_memory_waiter(timeline: &Arc<Timeline>) -> bool {
+    let weak = Arc::downgrade(timeline);
+    MEMORY_WAITERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|(_, _, t)| t.ptr_eq(&weak))
+}
+
+/// Checks pending GPU memory waits, waking any live timeline whose condition is
+/// satisfied or whose deadline has passed.
+fn scan_memory_waiters() -> (Vec<Arc<Timeline>>, bool) {
+    let mut waiters = MEMORY_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut woken = Vec::new();
+    waiters.retain(|(wait, deadline, timeline)| {
+        let Some(live) = timeline.upgrade() else {
+            return false;
+        };
+        if wait.satisfied() || Instant::now() >= *deadline {
+            woken.push(live);
+            false
+        } else {
+            true
+        }
+    });
+    (woken, !waiters.is_empty())
+}
+
 /// Checks every live fence for event or queue waits whose value has been
 /// reached outside `Signal` / bottom-of-pipe writes (for example a CPU write
 /// to the fence's memory).
 fn scan_live_fences() -> (Vec<Arc<Timeline>>, bool) {
-    let live = live();
-    let mut woken = Vec::new();
-    let mut any_waiting = false;
-    for &ptr in live.values() {
-        // SAFETY: registered fences stay alive until `Fence::drop`, which
-        // takes the `LIVE` lock we hold here.
-        let fence = unsafe { &*(ptr as *const Fence) };
-        let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
-        let mut queues = fence.queues.lock().unwrap_or_else(|e| e.into_inner());
-        if waiters.is_empty() && queues.is_empty() {
-            continue;
+    let (mut woken, any_waiting) = {
+        let live = live();
+        let mut woken = Vec::new();
+        let mut any_waiting = false;
+        for &ptr in live.values() {
+            // SAFETY: registered fences stay alive until `Fence::drop`, which
+            // takes the `LIVE` lock we hold here.
+            let fence = unsafe { &*(ptr as *const Fence) };
+            let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+            let mut queues = fence.queues.lock().unwrap_or_else(|e| e.into_inner());
+            if waiters.is_empty() && queues.is_empty() {
+                continue;
+            }
+            let (more, moved) = wake_locked(fence, &mut waiters, &mut queues);
+            if moved {
+                fence.moved.notify_all();
+            }
+            woken.extend(more);
+            any_waiting |= !waiters.is_empty() || !queues.is_empty();
         }
-        let (more, moved) = wake_locked(fence, &mut waiters, &mut queues);
-        if moved {
-            fence.moved.notify_all();
-        }
-        woken.extend(more);
-        any_waiting |= !waiters.is_empty() || !queues.is_empty();
-    }
-    (woken, any_waiting)
+        (woken, any_waiting)
+    };
+    let (mem_woken, mem_waiting) = scan_memory_waiters();
+    woken.extend(mem_woken);
+    (woken, any_waiting || mem_waiting)
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -240,7 +338,8 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     let fence = fence(this);
     let waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
-    let queues = wake(fence, waiters);
+    let mut queues = wake(fence, waiters);
+    queues.extend(scan_memory_waiters().0);
     run_held(queues);
     S_OK
 }
@@ -347,24 +446,26 @@ impl Held {
 }
 
 /// After a bottom-of-pipe write of `bytes` at `at`: wakes the waits of a
-/// fence whose value the write touched, and returns its held queues.
+/// fence whose value the write touched, plus any satisfied memory waits, and
+/// returns the held queues.
 pub(crate) fn written(at: usize, bytes: usize) -> Woken {
     let end = at.saturating_add(bytes);
-    let live = live();
-    let Some((&value_at, &fence)) = live.range(..end).next_back() else {
-        return Woken::default();
+    let mut queues = {
+        let live = live();
+        match live.range(..end).next_back() {
+            Some((&value_at, &fence)) if value_at + size_of::<u64>() > at => {
+                // SAFETY: registered fences are alive until their drop, which takes
+                // the registry lock we hold.
+                let fence = unsafe { &*(fence as *const Fence) };
+                wake(
+                    fence,
+                    fence.waiters.lock().unwrap_or_else(|e| e.into_inner()),
+                )
+            }
+            _ => Vec::new(),
+        }
     };
-    if value_at + size_of::<u64>() <= at {
-        return Woken::default();
-    }
-    // SAFETY: registered fences are alive until their drop, which takes
-    // the registry lock we hold.
-    let fence = unsafe { &*(fence as *const Fence) };
-    let queues = wake(
-        fence,
-        fence.waiters.lock().unwrap_or_else(|e| e.into_inner()),
-    );
-    drop(live);
+    queues.extend(scan_memory_waiters().0);
     Woken(queues)
 }
 
@@ -610,5 +711,44 @@ mod tests {
         assert!(!inside.load(Ordering::SeqCst), "ran inside the write");
         assert_eq!(ran.load(Ordering::SeqCst), 1);
         release_fence(f);
+    }
+
+    #[test]
+    fn wait_timeout_parsing_respects_bounds_and_default() {
+        assert_eq!(parse_wait_timeout(None), Duration::from_millis(2000));
+        assert_eq!(parse_wait_timeout(Some("bad")), Duration::from_millis(2000));
+        assert_eq!(parse_wait_timeout(Some("0")), Duration::from_millis(1));
+        assert_eq!(parse_wait_timeout(Some(" 45 ")), Duration::from_millis(45));
+    }
+
+    #[test]
+    fn bottom_of_pipe_write_wakes_memory_wait_on_non_fence_address() {
+        use crate::timeline::{MemoryWait, Op, Timeline};
+        use std::sync::atomic::AtomicU32;
+
+        let target = AtomicU32::new(0);
+        let done = Arc::new(AtomicU32::new(0));
+        let queue = Arc::new(Timeline::default());
+        let wait = MemoryWait {
+            address: (&raw const target) as u64,
+            reference: 7,
+            mask: u32::MAX,
+            width: 4,
+            comparison: 3,
+        };
+        queue.submit(Op::WaitMemory(wait, None));
+        let done_work = done.clone();
+        queue.submit(Op::Run(Box::new(move || {
+            done_work.store(1, Ordering::Release);
+        })));
+        assert_eq!(done.load(Ordering::Acquire), 0);
+
+        crate::queue::Written::Value(7)
+            .write((&raw const target) as *mut u8, 4)
+            .run();
+        // If the background watch thread raced ahead and claimed the wakeup,
+        // wait for its in-flight `Timeline::run` pass to complete.
+        queue.submit(Op::Run(Box::new(|| {})));
+        assert_eq!(done.load(Ordering::Acquire), 1);
     }
 }
