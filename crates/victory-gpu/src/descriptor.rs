@@ -148,10 +148,34 @@ fn mirror(handle: u64) {
     }
 }
 
+/// A host-only key, distinct from any aligned title heap pointer and from no heap.
+#[cfg(windows)]
+pub(crate) const ROOT_VIEW_HEAP: usize = usize::MAX;
+
+/// Resolve one of the recording's bound heap keys. The renderer supplies a
+/// small view heap for bounded root descriptors if the title supplied none.
+#[cfg(windows)]
+pub(crate) fn recording_heap(key: usize) -> Option<&'static host::HostHeap> {
+    match key {
+        0 => None,
+        ROOT_VIEW_HEAP => {
+            static ROOT: std::sync::OnceLock<Option<host::HostHeap>> = std::sync::OnceLock::new();
+            ROOT.get_or_init(host::HostHeap::root_views).as_ref()
+        }
+        _ => heap(key as This).host(),
+    }
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+    if heap == ROOT_VIEW_HEAP {
+        if let Some(host) = recording_heap(heap) {
+            host.release(first, n);
+        }
+        return;
+    }
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).

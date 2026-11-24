@@ -209,6 +209,25 @@ impl HostHeap {
         Self::with(host, heap, kind, count, extra)
     }
 
+    /// All slots are allocated dynamically and held by recordings.
+    pub(super) fn root_views() -> Option<Self> {
+        const SLOTS: u32 = 4096;
+        let host = host()?;
+        let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        // SAFETY: a shader-visible view heap of a supported size.
+        let heap = unsafe {
+            host.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: SLOTS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+        }
+        .ok()?;
+        Self::with(host, heap, kind, 0, SLOTS)
+    }
+
     /// The host heap over `heap`: `count` title slots, then `extra` dynamic
     /// ones, all made null.
     fn with(
@@ -588,9 +607,44 @@ impl HostHeap {
         self.keep(index, Kept::Empty);
     }
 
-    /// Whether this is a sampler heap.
-    pub(crate) fn is_sampler(&self) -> bool {
-        self.sampler
+    /// Makes slot `index` (a dynamic one) a raw buffer view with unordered
+    /// access of `len` bytes of `buffer` from byte `offset` (a multiple of
+    /// 16): a root UAV with a size, whose writes past it are dropped
+    /// instead of reaching whatever the host placed after the buffer.
+    pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
+        let Some(host) = host() else { return };
+        let Some(elements) = raw_element_count(len) else {
+            self.null_raw_uav_at(index);
+            return;
+        };
+        let desc = raw_uav_desc(offset / 4, elements.get());
+        // SAFETY: a slot of our heap and a live buffer covering the range.
+        unsafe {
+            host.device.CreateUnorderedAccessView(
+                buffer,
+                None::<&ID3D12Resource>,
+                Some(&desc),
+                self.cpu(index),
+            )
+        };
+        self.keep(index, Kept::Resource(buffer.clone()));
+    }
+
+    /// Makes slot `index` a raw buffer view with unordered access of no
+    /// buffer: reads return zeros and writes are dropped.
+    pub(crate) fn null_raw_uav_at(&self, index: u32) {
+        let Some(host) = host() else { return };
+        let desc = raw_uav_desc(0, 1);
+        // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+        unsafe {
+            host.device.CreateUnorderedAccessView(
+                None::<&ID3D12Resource>,
+                None::<&ID3D12Resource>,
+                Some(&desc),
+                self.cpu(index),
+            )
+        };
+        self.keep(index, Kept::Empty);
     }
 
     /// The shader-visible handle of slot `index`.
@@ -775,6 +829,22 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
         base + buffer.FirstElement * element,
         u64::from(buffer.NumElements) * element,
     ))
+}
+
+fn raw_uav_desc(first: u64, elements: u32) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_UAV {
+                FirstElement: first,
+                NumElements: elements,
+                StructureByteStride: 0,
+                CounterOffsetInBytes: 0,
+                Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+            },
+        },
+    }
 }
 
 /// Whether a raw buffer view may start at element `first` (4 bytes each):

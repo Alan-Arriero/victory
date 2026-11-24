@@ -295,11 +295,7 @@ impl Prepared {
             ));
         }
         if let Some(counter) = &self.counter {
-            barriers.push(transition(
-                counter,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ));
+            list.use_shadow(counter, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
         }
         // SAFETY: an open list and live buffers owned by the list or shadows.
         unsafe {
@@ -326,13 +322,7 @@ impl Prepared {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             ));
         }
-        if let Some(counter) = &self.counter {
-            barriers.push(transition(
-                counter,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            ));
-        }
+
         // SAFETY: an open list and live buffers owned by the list or shadows.
         unsafe { list.list.ResourceBarrier(&barriers) };
     }
@@ -448,12 +438,22 @@ pub(crate) fn expand(
 
     // Refresh title buffers at submission time.
     let args_len = u64::from(stride) * u64::from(max.max(1));
-    args.refresh(list, arguments, args_len);
+    args.refresh_as(
+        list,
+        arguments,
+        args_len,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    );
     if let Some((c, at)) = counter {
-        c.refresh(list, at, 4);
+        c.refresh_as(list, at, 4, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
     for w in &work {
-        w.shadow.refresh(list, w.address, u64::from(w.size));
+        w.shadow.refresh_as(
+            list,
+            w.address,
+            u64::from(w.size),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
     }
 
     let src_args_gpu = args.gpu(arguments);

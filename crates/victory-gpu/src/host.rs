@@ -440,6 +440,8 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// Actual D3D12 access state per host buffer for this recording.
+    shadow_states: Mutex<std::collections::HashMap<usize, (ID3D12Resource, D3D12_RESOURCE_STATES)>>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// Memory handed out for the list's recording, kept until it is finished
@@ -489,6 +491,28 @@ const STAMPS: u32 = 4096;
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
+
+/// A single first access can promote implicitly. Use an explicit state for
+/// a combined read mask and retain existing read permissions on later reads.
+fn shadow_transition(
+    before: D3D12_RESOURCE_STATES,
+    wanted: D3D12_RESOURCE_STATES,
+) -> Option<D3D12_RESOURCE_STATES> {
+    if before == D3D12_RESOURCE_STATE_COMMON {
+        return (wanted.0.count_ones() != 1).then_some(wanted);
+    }
+    if before.contains(wanted) {
+        return None;
+    }
+    let after = if before != D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        && wanted != D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    {
+        before | wanted
+    } else {
+        wanted
+    };
+    Some(after)
+}
 
 type States =
     std::collections::HashMap<usize, (u32, u32, std::sync::Arc<crate::resource::HostTexture>)>;
@@ -763,6 +787,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                shadow_states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 kept_uploads: Mutex::default(),
                 kept_dynamic: Mutex::default(),
@@ -1236,7 +1261,39 @@ impl HostList {
         times
     }
 
+    /// Track resolved buffers by resource identity, including aliasing title addresses.
+    pub(crate) fn use_shadow(&self, buffer: &ID3D12Resource, wanted: D3D12_RESOURCE_STATES) {
+        let mut states = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
+        let (_, state) = states
+            .entry(buffer.as_raw() as usize)
+            .or_insert_with(|| (buffer.clone(), D3D12_RESOURCE_STATE_COMMON));
+        let before = *state;
+        if let Some(after) = shadow_transition(before, wanted) {
+            // SAFETY: this open list retains the resource and tracks its previous state.
+            unsafe {
+                self.list
+                    .ResourceBarrier(&[transition(buffer, before, after)])
+            };
+            *state = after;
+        } else if before == D3D12_RESOURCE_STATE_COMMON {
+            *state = wanted;
+        }
+    }
+
     pub(crate) fn close(&self) {
+        // Lists can execute together, in a different order, or more than once.
+        // Buffers do not decay between lists in the same ExecuteCommandLists.
+        // Restore a known entry state for the next recording.
+        let states = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
+        if !states.is_empty() {
+            let barriers: Vec<_> = states
+                .values()
+                .map(|(buffer, state)| transition(buffer, *state, D3D12_RESOURCE_STATE_COMMON))
+                .collect();
+            // SAFETY: an open list and resources retained until reset.
+            unsafe { self.list.ResourceBarrier(&barriers) };
+        }
+        drop(states);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count =
@@ -1260,6 +1317,10 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         self.release_kept();
+        self.shadow_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         *self.deferred() = Deferred::default();
         self.states
             .lock()
@@ -3008,6 +3069,20 @@ mod tests {
                 .code(),
             DXGI_ERROR_DEVICE_REMOVED
         );
+    }
+
+    #[test]
+    fn shadow_buffer_transitions_between_writes_and_reads() {
+        let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        let srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        let index = D3D12_RESOURCE_STATE_INDEX_BUFFER;
+        assert_eq!(shadow_transition(D3D12_RESOURCE_STATE_COMMON, uav), None);
+        assert_eq!(shadow_transition(D3D12_RESOURCE_STATE_COMMON, srv), None);
+        assert_eq!(shadow_transition(uav, srv), Some(srv));
+        assert_eq!(shadow_transition(srv, index), Some(srv | index));
+        assert_eq!(shadow_transition(srv | index, srv), None);
+        assert_eq!(shadow_transition(srv | index, uav), Some(uav));
+        assert_eq!(shadow_transition(uav, uav), None);
     }
 
     #[test]

@@ -88,7 +88,18 @@ fn fullscreen_structured_alias(vertex_hash: &str, pixel_hash: &str) -> Option<St
     }
 }
 
-/// A raw SRV describes bytes of a particular host resource. The descriptor
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum RawAccess {
+    Read,
+    ReadWrite,
+}
+
+/// A raw UAV exposes whole dwords, and D3D12 stores the element count in a u32.
+fn writable_root_bytes(remaining: u64) -> Option<u64> {
+    u32::try_from(remaining / 4).ok().map(|n| u64::from(n) * 4)
+}
+
+/// A raw view describes bytes of a particular host resource. The descriptor
 /// slot keeps that resource alive for the recorded commands.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct RawBufferRange {
@@ -172,8 +183,8 @@ pub(crate) struct State {
     dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
-    /// One slot per view in each heap, including a shared null view.
-    root_srv_slots: std::collections::HashMap<(usize, Option<RawBufferRange>), u32>,
+    /// One slot per view and access kind in each heap, including null views.
+    root_view_slots: std::collections::HashMap<(usize, RawAccess, Option<RawBufferRange>), u32>,
 }
 
 impl Drop for State {
@@ -277,7 +288,7 @@ impl State {
     pub(crate) fn take_dynamic(&mut self) -> Vec<(usize, u32, u32)> {
         // A following segment must acquire its own slots before recording a bind.
         self.fresh_tables.clear();
-        self.root_srv_slots.clear();
+        self.root_view_slots.clear();
         std::mem::take(&mut self.dynamic)
     }
 
@@ -654,21 +665,13 @@ impl State {
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         self.depth_sampled = false;
         let l = &list.list;
-        // Heaps first: a root signature with directly indexed heaps must be
-        // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
-            // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
-            self.host_roots = [0; 2];
+        let needs_root_heap = self.heaps[0] == 0
+            && p.stages.iter().any(|stage| {
+                !stage.root_uavs.is_empty()
+                    || (!stage.root_srvs.is_empty() && crate::pipeline::host::bounded_root_srvs())
+            });
+        if !self.bind_heaps(list, needs_root_heap) {
+            return false;
         }
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
@@ -748,13 +751,21 @@ impl State {
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         // An unset table is undefined: a null view instead.
-                        if tabled && !self.root_srv_table(list, None, param, compute) {
+                        if tabled
+                            && !self.root_buffer_table(list, None, param, compute, RawAccess::Read)
+                        {
                             return false;
                         }
                         continue;
                     };
                     if tabled {
-                        if !self.root_srv_table(list, Some(address), param, compute) {
+                        if !self.root_buffer_table(
+                            list,
+                            Some(address),
+                            param,
+                            compute,
+                            RawAccess::Read,
+                        ) {
                             return false;
                         }
                         continue;
@@ -773,46 +784,96 @@ impl State {
                     }
                 }
             }
+            for &(slot, param) in &stage.root_uavs {
+                let address = match self.roots_ref(compute).get(usize::from(slot)) {
+                    Some(&Root::View(address)) => Some(address),
+                    _ => {
+                        once!(slot, "a shader writes a root view the title did not set");
+                        None
+                    }
+                };
+                if !self.root_buffer_table(list, address, param, compute, RawAccess::ReadWrite) {
+                    return false;
+                }
+            }
         }
         true
     }
 
-    /// Binds a root SRV as a one-view table (see
-    /// [`crate::pipeline::host::bounded_root_srvs`]): a raw view of the
-    /// title buffer's host copy from `address` to the copy's end, or a null
-    /// view (no address, or no host copy).
-    /// False if no dynamic slot could be had (the draw is dropped).
-    fn root_srv_table(
+    /// The host heap must precede the root signature, including when switching
+    /// between the renderer's view heap and either of the title's heaps.
+    fn bind_heaps(&mut self, list: &HostList, needs_root_heap: bool) -> bool {
+        let mut keys = self.heaps;
+        if keys[0] == 0 && needs_root_heap {
+            keys[0] = crate::descriptor::ROOT_VIEW_HEAP;
+        }
+        if keys != self.host_heaps {
+            let mut heaps = Vec::new();
+            for key in keys {
+                if key == 0 {
+                    continue;
+                }
+                let Some(heap) = crate::descriptor::recording_heap(key) else {
+                    once!("a bound descriptor heap could not be created on the host");
+                    return false;
+                };
+                list.keep(&heap.heap);
+                heaps.push(Some(heap.heap.clone()));
+            }
+            // SAFETY: an open list and shader-visible heaps retained for the recording.
+            unsafe { list.list.SetDescriptorHeaps(&heaps) };
+            self.host_heaps = keys;
+            self.host_roots = [0; 2];
+        }
+        true
+    }
+
+    /// Bind a raw view of the remaining host buffer. A writable view, its
+    /// initial contents, and its copy-back all cover the same whole dwords.
+    fn root_buffer_table(
         &mut self,
         list: &HostList,
         address: Option<u64>,
         param: u32,
         compute: bool,
+        access: RawAccess,
     ) -> bool {
-        let Some((heap, host)) = self
-            .heaps
-            .iter()
-            .filter(|&&h| h != 0)
-            .map(|&h| crate::descriptor::heap(h as This))
-            .find_map(|h| h.host().filter(|x| !x.is_sampler()).map(|x| (h, x)))
-        else {
-            once!("a root SRV without a bound view heap: the draw is dropped");
+        let heap_id = self.host_heaps[0];
+        let Some(host) = crate::descriptor::recording_heap(heap_id) else {
+            once!("a raw root view without a host heap: the draw is dropped");
             return false;
         };
-        let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-        let view = shadow.as_ref().and_then(|(a, s)| {
+        let shadow = address
+            .filter(|&a| a != 0)
+            .and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+        let view = if let Some((a, s)) = &shadow {
             let offset = s.offset(*a);
-            if !offset.is_multiple_of(16) {
+            if offset.is_multiple_of(16) {
+                let remaining = s.left(*a);
+                let len = match access {
+                    RawAccess::Read => remaining,
+                    RawAccess::ReadWrite => {
+                        let Some(len) = writable_root_bytes(remaining) else {
+                            once!(
+                                remaining,
+                                "writable root buffer exceeds the D3D12 element count: the draw is dropped"
+                            );
+                            return false;
+                        };
+                        len
+                    }
+                };
+                (len >= 4).then_some((&s.buffer, offset, len))
+            } else {
                 once!(
                     address = format_args!("{a:#x}"),
-                    "a root SRV not on 16 bytes reads zeros"
+                    "an unaligned raw root view is bound as null"
                 );
-                return None;
+                None
             }
-            let len = s.left(*a);
-            (len >= 4).then_some((&s.buffer, offset, len))
-        });
-        let heap_id = std::ptr::from_ref(heap) as usize;
+        } else {
+            None
+        };
         let range = view.map(|(buffer, offset, len)| RawBufferRange {
             resource: buffer.as_raw() as usize,
             offset,
@@ -820,22 +881,42 @@ impl State {
         });
         // A title address may now resolve to a different buffer. Earlier
         // commands still reference the old slot, so allocate on a miss.
-        let index = match self.root_srv_slots.entry((heap_id, range)) {
+        let index = match self.root_view_slots.entry((heap_id, access, range)) {
             std::collections::hash_map::Entry::Occupied(slot) => *slot.get(),
             std::collections::hash_map::Entry::Vacant(slot) => {
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
-                match view {
-                    Some((buffer, offset, len)) => host.raw_at(index, buffer, offset, len),
-                    None => host.null_raw_at(index),
+                match (access, view) {
+                    (RawAccess::Read, Some((buffer, offset, len))) => {
+                        host.raw_at(index, buffer, offset, len)
+                    }
+                    (RawAccess::ReadWrite, Some((buffer, offset, len))) => {
+                        host.raw_uav_at(index, buffer, offset, len)
+                    }
+                    (RawAccess::Read, None) => host.null_raw_at(index),
+                    (RawAccess::ReadWrite, None) => host.null_raw_uav_at(index),
                 }
                 self.dynamic.push((heap_id, index, 1));
                 *slot.insert(index)
             }
         };
-        if let Some((a, s)) = &shadow {
-            s.refresh(list, *a, s.left(*a).min(1 << 20));
+        if let (Some((a, s)), Some((_, _, len))) = (&shadow, view) {
+            let wanted = match access {
+                RawAccess::Read if compute => D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                RawAccess::Read => {
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                        | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                }
+                RawAccess::ReadWrite => D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            };
+            match access {
+                RawAccess::Read => s.refresh_as(list, *a, len.min(1 << 20), wanted),
+                RawAccess::ReadWrite => {
+                    s.refresh_as(list, *a, len, wanted);
+                    s.gpu_writes(list, *a, len);
+                }
+            }
         }
         let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
@@ -971,7 +1052,12 @@ impl State {
                     let _ = write!(text, " [{at} {index}: {slot}]");
                 }
             }
-            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs) {
+            for &(slot, _) in stage
+                .root_cbvs
+                .iter()
+                .chain(&stage.root_srvs)
+                .chain(&stage.root_uavs)
+            {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));
@@ -1691,10 +1777,7 @@ impl State {
             );
             return false;
         };
-        args.refresh(list, arguments, len);
-        if let Some((s, at)) = &counter {
-            s.refresh(list, *at, 4);
-        }
+        args.refresh_as(list, arguments, len, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
@@ -1706,6 +1789,9 @@ impl State {
                 Some("not bounded (no clamp, or arguments not 4-byte aligned)"),
             );
             return false;
+        }
+        if let Some((s, at)) = &counter {
+            s.refresh_as(list, *at, 4, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
@@ -1721,7 +1807,6 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.frame_op("indirect", kind == DISPATCH, ran);
         if !ran {
-            crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1751,7 +1836,6 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1840,9 +1924,11 @@ fn readable(
         && len > 0
         && let Some(shadow) = crate::shadow::find(address, len)
     {
-        shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
+            shadow.refresh_as(list, address, len, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             shadow.gpu_writes(list, address, len);
+        } else {
+            shadow.refresh(list, address, len);
         }
     }
     match (view, u.kind) {
@@ -1955,16 +2041,139 @@ mod tests {
     use super::{expanded_vertices, rect_source};
 
     #[test]
+    fn writable_root_extent_covers_every_representable_whole_dword() {
+        let max = u64::from(u32::MAX) * 4;
+        assert_eq!(super::writable_root_bytes(3), Some(0));
+        assert_eq!(
+            super::writable_root_bytes((1 << 20) + 7),
+            Some((1 << 20) + 4)
+        );
+        assert_eq!(super::writable_root_bytes(max + 3), Some(max));
+        assert_eq!(super::writable_root_bytes(max + 4), None);
+    }
+
+    #[test]
+    fn bounded_root_dispatch_writes_then_reads_without_a_title_heap() {
+        use super::*;
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host D3D12 device; skipped bounded root dispatch");
+            return;
+        };
+        let pipeline = |source| {
+            let bytes = crate::hlsl::compile_compute("raw root test", source).unwrap();
+            // SAFETY: synthetic shader bytecode contains its matching root signature.
+            unsafe {
+                let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &bytes).unwrap();
+                let pso: ID3D12PipelineState = host
+                    .device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: bytes.as_ptr().cast(),
+                            BytecodeLength: bytes.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .unwrap();
+                (root, pso)
+            }
+        };
+        let first = pipeline(
+            r#"RWByteAddressBuffer dst : register(u0);
+                [RootSignature("DescriptorTable(UAV(u0))")]
+                [numthreads(1,1,1)] void main() { dst.Store(1048580, dst.Load(1048580) + 22); }"#,
+        );
+        let second = pipeline(
+            r#"RWByteAddressBuffer dst : register(u0);
+                ByteAddressBuffer src : register(t0);
+                [RootSignature("DescriptorTable(UAV(u0)), DescriptorTable(SRV(t0))")]
+                [numthreads(1,1,1)] void main() { dst.Store(8, src.Load(1048580) + 5); }"#,
+        );
+        // One dword beyond the old one-MiB view.
+        const WORD: usize = (1 << 20) / 4 + 1;
+        struct Registration(u64);
+        impl Drop for Registration {
+            fn drop(&mut self) {
+                crate::shadow::unregister(self.0 as usize, self.0);
+            }
+        }
+        let register = |words: &mut [u32]| {
+            let addr = words.as_mut_ptr() as u64;
+            crate::shadow::register(addr as usize, addr, std::mem::size_of_val(words) as u64);
+            Registration(addr)
+        };
+        let mut source = vec![7; WORD + 3];
+        let mut destination = [0; 4];
+        let src = register(&mut source);
+        let dst = register(&mut destination);
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        assert!(state.bind_heaps(&list, true));
+        assert_eq!(state.host_heaps, [crate::descriptor::ROOT_VIEW_HEAP, 0]);
+        assert_eq!(state.heaps, [0, 0]);
+        for ((root, pso), dst, src) in [(&first, src.0, None), (&second, dst.0, Some(src.0))] {
+            // SAFETY: an open list and matching live root signature and pipeline.
+            unsafe {
+                list.list.SetComputeRootSignature(root);
+                list.list.SetPipelineState(pso);
+            }
+            assert!(state.root_buffer_table(&list, Some(dst), 0, true, RawAccess::ReadWrite));
+            if let Some(src) = src {
+                assert!(state.root_buffer_table(&list, Some(src), 1, true, RawAccess::Read));
+            }
+            // SAFETY: a single workgroup with the required tables bound.
+            unsafe { list.list.Dispatch(1, 1, 1) };
+        }
+        assert!(state.bind_heaps(&list, false));
+        assert_eq!(state.host_heaps, [0, 0]);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(source[WORD], 29);
+        assert!(
+            source[..WORD]
+                .iter()
+                .chain(&source[WORD + 1..])
+                .all(|&word| word == 7)
+        );
+        assert_eq!(destination, [0, 0, 34, 0]);
+        eprintln!("bounded root UAV to SRV dispatch readback verified");
+    }
+
+    #[test]
     fn bounded_root_slots_belong_to_the_recording_that_allocated_them() {
         let mut state = super::State::default();
         let heap = 1;
-        state.fresh_tables.insert((10, 11), 4);
-        state.root_srv_slots.insert((heap, None), 5);
-        state.dynamic.extend([(heap, 4, 1), (heap, 5, 1)]);
+        state.fresh_tables.insert(
+            super::FreshTableKey {
+                heap,
+                copy_gen: 0,
+                slots: 1,
+                records_hash: 11,
+            },
+            super::FreshTableEntry {
+                table: 10,
+                start_slot: 0,
+                first: 4,
+                dead_slots: Vec::new(),
+            },
+        );
+        state
+            .root_view_slots
+            .insert((heap, super::RawAccess::Read, None), 5);
+        state
+            .root_view_slots
+            .insert((heap, super::RawAccess::ReadWrite, None), 6);
+        state
+            .dynamic
+            .extend([(heap, 4, 1), (heap, 5, 1), (heap, 6, 1)]);
 
-        assert_eq!(state.take_dynamic(), [(heap, 4, 1), (heap, 5, 1)]);
+        assert_eq!(state.root_view_slots.len(), 2);
+        assert_eq!(
+            state.take_dynamic(),
+            [(heap, 4, 1), (heap, 5, 1), (heap, 6, 1)]
+        );
         assert!(state.fresh_tables.is_empty());
-        assert!(state.root_srv_slots.is_empty());
+        assert!(state.root_view_slots.is_empty());
         assert!(state.take_dynamic().is_empty());
     }
 
