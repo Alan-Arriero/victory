@@ -88,7 +88,13 @@ fn fullscreen_structured_alias(vertex_hash: &str, pixel_hash: &str) -> Option<St
     }
 }
 
-/// A raw SRV describes bytes of a particular host resource. The descriptor
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum RawAccess {
+    Read,
+    ReadWrite,
+}
+
+/// A raw view describes bytes of a particular host resource. The descriptor
 /// slot keeps that resource alive for the recorded commands.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct RawBufferRange {
@@ -151,8 +157,8 @@ pub(crate) struct State {
     dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
-    /// One slot per view in each heap, including a shared null view.
-    root_srv_slots: std::collections::HashMap<(usize, Option<RawBufferRange>), u32>,
+    /// One slot per view and access kind in each heap, including null views.
+    root_view_slots: std::collections::HashMap<(usize, RawAccess, Option<RawBufferRange>), u32>,
 }
 
 impl Drop for State {
@@ -256,7 +262,7 @@ impl State {
     pub(crate) fn take_dynamic(&mut self) -> Vec<(usize, u32, u32)> {
         // A following segment must acquire its own slots before recording a bind.
         self.fresh_tables.clear();
-        self.root_srv_slots.clear();
+        self.root_view_slots.clear();
         std::mem::take(&mut self.dynamic)
     }
 
@@ -723,13 +729,21 @@ impl State {
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         // An unset table is undefined: a null view instead.
-                        if tabled && !self.root_srv_table(list, None, param, compute) {
+                        if tabled
+                            && !self.root_buffer_table(list, None, param, compute, RawAccess::Read)
+                        {
                             return false;
                         }
                         continue;
                     };
                     if tabled {
-                        if !self.root_srv_table(list, Some(address), param, compute) {
+                        if !self.root_buffer_table(
+                            list,
+                            Some(address),
+                            param,
+                            compute,
+                            RawAccess::Read,
+                        ) {
                             return false;
                         }
                         continue;
@@ -748,21 +762,31 @@ impl State {
                     }
                 }
             }
+            for &(slot, param) in &stage.root_uavs {
+                let address = match self.roots_ref(compute).get(usize::from(slot)) {
+                    Some(&Root::View(address)) => Some(address),
+                    _ => {
+                        once!(slot, "a shader writes a root view the title did not set");
+                        None
+                    }
+                };
+                if !self.root_buffer_table(list, address, param, compute, RawAccess::ReadWrite) {
+                    return false;
+                }
+            }
         }
         true
     }
 
-    /// Binds a root SRV as a one-view table (see
-    /// [`crate::pipeline::host::bounded_root_srvs`]): a raw view of the
-    /// title buffer's host copy from `address` to the copy's end, or a null
-    /// view (no address, or no host copy).
-    /// False if no dynamic slot could be had (the draw is dropped).
-    fn root_srv_table(
+    /// Bind a bounded raw buffer. Writable views have no declared size, so
+    /// limit the span the renderer may write and copy back to one MiB.
+    fn root_buffer_table(
         &mut self,
         list: &HostList,
         address: Option<u64>,
         param: u32,
         compute: bool,
+        access: RawAccess,
     ) -> bool {
         let Some((heap, host)) = self
             .heaps
@@ -771,20 +795,25 @@ impl State {
             .map(|&h| crate::descriptor::heap(h as This))
             .find_map(|h| h.host().filter(|x| !x.is_sampler()).map(|x| (h, x)))
         else {
-            once!("a root SRV without a bound view heap: the draw is dropped");
+            once!("a raw root view without a bound view heap: the draw is dropped");
             return false;
         };
-        let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+        let shadow = address
+            .filter(|&a| a != 0)
+            .and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
         let view = shadow.as_ref().and_then(|(a, s)| {
             let offset = s.offset(*a);
             if !offset.is_multiple_of(16) {
                 once!(
                     address = format_args!("{a:#x}"),
-                    "a root SRV not on 16 bytes reads zeros"
+                    "an unaligned raw root view is bound as null"
                 );
                 return None;
             }
-            let len = s.left(*a);
+            let len = match access {
+                RawAccess::Read => s.left(*a),
+                RawAccess::ReadWrite => s.left(*a).min(1 << 20) & !3,
+            };
             (len >= 4).then_some((&s.buffer, offset, len))
         });
         let heap_id = std::ptr::from_ref(heap) as usize;
@@ -795,22 +824,31 @@ impl State {
         });
         // A title address may now resolve to a different buffer. Earlier
         // commands still reference the old slot, so allocate on a miss.
-        let index = match self.root_srv_slots.entry((heap_id, range)) {
+        let index = match self.root_view_slots.entry((heap_id, access, range)) {
             std::collections::hash_map::Entry::Occupied(slot) => *slot.get(),
             std::collections::hash_map::Entry::Vacant(slot) => {
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
-                match view {
-                    Some((buffer, offset, len)) => host.raw_at(index, buffer, offset, len),
-                    None => host.null_raw_at(index),
+                match (access, view) {
+                    (RawAccess::Read, Some((buffer, offset, len))) => {
+                        host.raw_at(index, buffer, offset, len)
+                    }
+                    (RawAccess::ReadWrite, Some((buffer, offset, len))) => {
+                        host.raw_uav_at(index, buffer, offset, len)
+                    }
+                    (RawAccess::Read, None) => host.null_raw_at(index),
+                    (RawAccess::ReadWrite, None) => host.null_raw_uav_at(index),
                 }
                 self.dynamic.push((heap_id, index, 1));
                 *slot.insert(index)
             }
         };
-        if let Some((a, s)) = &shadow {
-            s.refresh(list, *a, s.left(*a).min(1 << 20));
+        if let (Some((a, s)), Some((_, _, len))) = (&shadow, view) {
+            s.refresh(list, *a, len.min(1 << 20));
+            if access == RawAccess::ReadWrite {
+                s.gpu_writes(list, *a, len);
+            }
         }
         let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
@@ -946,7 +984,12 @@ impl State {
                     let _ = write!(text, " [{at} {index}: {slot}]");
                 }
             }
-            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs) {
+            for &(slot, _) in stage
+                .root_cbvs
+                .iter()
+                .chain(&stage.root_srvs)
+                .chain(&stage.root_uavs)
+            {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));
@@ -1788,12 +1831,23 @@ mod tests {
         let mut state = super::State::default();
         let heap = 1;
         state.fresh_tables.insert((10, 11), 4);
-        state.root_srv_slots.insert((heap, None), 5);
-        state.dynamic.extend([(heap, 4, 1), (heap, 5, 1)]);
+        state
+            .root_view_slots
+            .insert((heap, super::RawAccess::Read, None), 5);
+        state
+            .root_view_slots
+            .insert((heap, super::RawAccess::ReadWrite, None), 6);
+        state
+            .dynamic
+            .extend([(heap, 4, 1), (heap, 5, 1), (heap, 6, 1)]);
 
-        assert_eq!(state.take_dynamic(), [(heap, 4, 1), (heap, 5, 1)]);
+        assert_eq!(state.root_view_slots.len(), 2);
+        assert_eq!(
+            state.take_dynamic(),
+            [(heap, 4, 1), (heap, 5, 1), (heap, 6, 1)]
+        );
         assert!(state.fresh_tables.is_empty());
-        assert!(state.root_srv_slots.is_empty());
+        assert!(state.root_view_slots.is_empty());
         assert!(state.take_dynamic().is_empty());
     }
 
