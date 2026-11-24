@@ -231,12 +231,34 @@ extern "system" fn token_async(
         url = text(url).unwrap_or_default(),
         "token and signature: offline"
     );
-    // Report success with the empty (but non-null) TOKEN result buffer rather than
+    // Report success with an empty token and signature rather than
     // FAILED_TO_GET_TOKEN. The title's auth path only initialises the object it later
     // dereferences when this call completes successfully; with the failure it took a null
     // read in its account init right after XUserAddAsync (issue #348). Nothing is contacted:
-    // the URL is never opened, the buffer stays empty, and the offline user is unchanged.
-    xasync::finished(block, (&raw const TOKEN).cast(), S_OK)
+    // the URL is never opened and the offline user is unchanged.
+    xasync::finished_with(block, (&raw const TOKEN).cast(), Ok(empty_token()))
+}
+
+/// `XUserGetTokenAndSignatureData`, at the start of the result buffer; its
+/// strings follow it in the same buffer.
+#[repr(C)]
+struct TokenData {
+    /// Bytes of `token`, its NUL included.
+    token_size: usize,
+    signature_size: usize,
+    token: *const c_char,
+    signature: *const c_char,
+}
+
+/// The result of an offline token call: the header with sizes for an empty
+/// token and signature (one NUL each), which follow it. The pointers are
+/// set in [`token_result`], once the bytes are in the title's buffer.
+fn empty_token() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(size_of::<TokenData>() + 2);
+    bytes.extend(1usize.to_le_bytes());
+    bytes.extend(1usize.to_le_bytes());
+    bytes.resize(size_of::<TokenData>() + 2, 0);
+    bytes
 }
 extern "system" fn token_size(_: This, block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
     xasync::XAsyncGetResultSize(block, out)
@@ -246,10 +268,26 @@ extern "system" fn token_result(
     block: *mut AsyncBlock,
     size: usize,
     buffer: *mut c_void,
-    _data: *mut *const c_void,
+    data: *mut *const TokenData,
     used: *mut usize,
 ) -> HRESULT {
-    xasync::XAsyncGetResult(block, (&raw const TOKEN).cast(), size, buffer, used)
+    let hr = xasync::XAsyncGetResult(block, (&raw const TOKEN).cast(), size, buffer, used);
+    if hr < 0 {
+        return hr;
+    }
+    // `XAsyncGetResult` succeeded, so `buffer` holds the whole result.
+    let header = buffer.cast::<TokenData>();
+    let strings = buffer.cast::<c_char>().wrapping_add(size_of::<TokenData>());
+    // SAFETY: the title's buffer holds the header and both strings (the
+    // size checked above); it need not be aligned.
+    unsafe {
+        (&raw mut (*header).token).write_unaligned(strings);
+        (&raw mut (*header).signature).write_unaligned(strings.add(1));
+    }
+    if !data.is_null() {
+        put(data, header.cast_const());
+    }
+    hr
 }
 
 /// The user never changes and no device is ever associated, so these
@@ -435,5 +473,32 @@ mod tests {
         // FAILED_TO_GET_TOKEN (the title only initialises its auth object on
         // success; see token_async).
         assert_eq!(xasync::XAsyncGetStatus(&mut block, true), S_OK);
+        let mut size = 0;
+        assert_eq!(token_size(this, &mut block, &mut size), S_OK);
+        assert_eq!(size, size_of::<TokenData>() + 2);
+        let mut buffer = vec![0xAAu8; size];
+        let (mut data, mut used) = (std::ptr::null(), 0);
+        assert_eq!(
+            token_result(
+                this,
+                &mut block,
+                size,
+                buffer.as_mut_ptr().cast(),
+                &mut data,
+                &mut used
+            ),
+            S_OK
+        );
+        assert_eq!((data.cast::<u8>(), used), (buffer.as_ptr(), size));
+        // SAFETY: `data` points at the header in `buffer`, which is alive.
+        let (token, signature) = unsafe {
+            let d = data.read_unaligned();
+            assert_eq!((d.token_size, d.signature_size), (1, 1));
+            (
+                std::ffi::CStr::from_ptr(d.token),
+                std::ffi::CStr::from_ptr(d.signature),
+            )
+        };
+        assert!(token.is_empty() && signature.is_empty());
     }
 }
