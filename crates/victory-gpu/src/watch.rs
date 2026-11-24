@@ -211,16 +211,21 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     Some(written)
 }
 
-/// Whether `[start, end)` contains any mapped view region. Checks `start`
-/// first via [`mapped`] (fast path), and if `start` lands on an unmapped
-/// placeholder or hole, walks `VirtualQuery` across `[start, end)` so a
-/// range spanning unmapped blocks before a mapped view is still guarded.
+/// Whether `[start, end)` contains a mapped view and no committed non-view
+/// memory. Checks `start` first via [`mapped`] (fast path); when `start` is
+/// not a view (e.g. an unmapped placeholder/hole inside a view pool), walks
+/// `VirtualQuery` across `[start, end)` and rejects the range if any
+/// committed non-view region is present so private/image memory is never
+/// read-protected.
 fn has_mapped(start: usize, end: usize) -> bool {
     if mapped(start) {
         return true;
     }
-    use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
     let mut at = start;
+    let mut found_mapped = false;
     while at < end {
         let mut info = MEMORY_BASIC_INFORMATION::default();
         // SAFETY: queries virtual memory metadata without dereferencing `at`.
@@ -230,7 +235,9 @@ fn has_mapped(start: usize, end: usize) -> bool {
             break;
         }
         if info.Type == MEM_MAPPED {
-            return true;
+            found_mapped = true;
+        } else if info.State == MEM_COMMIT {
+            return false;
         }
         let Some(next) = (info.BaseAddress as usize).checked_add(info.RegionSize) else {
             break;
@@ -240,7 +247,7 @@ fn has_mapped(start: usize, end: usize) -> bool {
         }
         at = next;
     }
-    false
+    found_mapped
 }
 
 /// Whether the current allocation at `at` is a mapped view. Asking only for
@@ -627,50 +634,111 @@ mod tests {
         title_memory_remapped(view, 2 * BLOCK);
     }
 
-    /// A range that begins on an unmapped region before a mapped view is still
-    /// recognized as containing a mapped view and guarded instead of returning
-    /// `None`.
+    /// A range that begins on an unmapped reserved hole before a mapped view
+    /// is still guarded, whereas a range starting in committed private memory
+    /// before a mapped view is rejected so private pages are never
+    /// read-protected.
     #[test]
-    fn guard_handles_range_starting_before_mapped_view() {
+    fn guard_handles_unmapped_prefix_and_rejects_committed_private_prefix() {
         use windows_sys::Win32::System::Memory::{
-            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFileEx,
+            PAGE_NOACCESS, UnmapViewOfFile,
         };
-        // SAFETY: a pagefile section of one block, mapped read-write.
-        let view = unsafe {
-            let section = CreateFileMappingW(
+        // SAFETY: create a 1-block pagefile section.
+        let section = unsafe {
+            CreateFileMappingW(
                 -1isize as _,
                 std::ptr::null(),
                 PAGE_READWRITE,
                 0,
                 BLOCK as u32,
                 std::ptr::null(),
-            );
-            assert!(!section.is_null());
-            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize
-        };
-        assert_ne!(view, 0);
-        // Start one block earlier (only when that preceding block is not
-        // itself a mapped view) and span into the mapped view.
-        let start = view - BLOCK;
-        if !mapped(start) {
-            assert!(
-                guard(start, view + BLOCK).is_some(),
-                "range spanning an unmapped prefix into a mapped view must stay guarded"
-            );
-            // A subsequent write inside the mapped view must be observed.
-            // SAFETY: inside our mapped read-write view.
-            unsafe { (view as *mut u8).write(42) };
-            let written = guard(start, view + BLOCK).expect("still guarded");
-            assert!(written.contains(&(view / PAGE)));
-        }
-        // SAFETY: our view.
-        unsafe {
-            UnmapViewOfFile(
-                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: view as *mut _,
-                },
             )
         };
+        assert!(!section.is_null());
+
+        // Deterministically place an unmapped reserved block immediately before
+        // a mapped view: reserve 2 blocks, release, then re-reserve block 0 and
+        // map the view at block 1.
+        let mut pair = None;
+        for _ in 0..16 {
+            // SAFETY: probe for a free 2-block-aligned address range.
+            let probe =
+                unsafe { VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE, PAGE_NOACCESS) }
+                    as usize;
+            assert_ne!(probe, 0);
+            // SAFETY: freeing the probe we just reserved.
+            assert_ne!(unsafe { VirtualFree(probe as *mut _, 0, MEM_RELEASE) }, 0);
+            // SAFETY: reserve block 0 as an unmapped placeholder.
+            let prefix =
+                unsafe { VirtualAlloc(probe as *const _, BLOCK, MEM_RESERVE, PAGE_NOACCESS) }
+                    as usize;
+            if prefix != probe {
+                if prefix != 0 {
+                    // SAFETY: freeing our reservation.
+                    unsafe { VirtualFree(prefix as *mut _, 0, MEM_RELEASE) };
+                }
+                continue;
+            }
+            // SAFETY: map the 1-block section immediately after the reserved prefix.
+            let view = unsafe {
+                MapViewOfFileEx(
+                    section,
+                    FILE_MAP_WRITE,
+                    0,
+                    0,
+                    BLOCK,
+                    (probe + BLOCK) as *const _,
+                )
+                .Value as usize
+            };
+            if view == probe + BLOCK {
+                pair = Some((prefix, view));
+                break;
+            }
+            if view != 0 {
+                // SAFETY: unmapping our view.
+                unsafe {
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: view as *mut _,
+                    });
+                }
+            }
+            // SAFETY: freeing our prefix reservation.
+            unsafe { VirtualFree(prefix as *mut _, 0, MEM_RELEASE) };
+        }
+        let (prefix, view) = pair.expect("reserve prefix block immediately before mapped view");
+
+        // 1. Unmapped reserved prefix + mapped view: must stay guarded.
+        assert!(!mapped(prefix));
+        assert!(
+            guard(prefix, view + BLOCK).is_some(),
+            "range spanning an unmapped reserved prefix into a mapped view must stay guarded"
+        );
+        // SAFETY: writing inside our mapped read-write view.
+        unsafe { (view as *mut u8).write(42) };
+        let written = guard(prefix, view + BLOCK).expect("still guarded");
+        assert!(written.contains(&(view / PAGE)));
+
+        // 2. Committed private prefix + mapped view: must NOT read-protect private memory.
+        // SAFETY: committing our reserved prefix block as private read-write memory.
+        let committed =
+            unsafe { VirtualAlloc(prefix as *const _, BLOCK, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!committed.is_null());
+        assert!(
+            guard(prefix, view + BLOCK).is_none(),
+            "range containing committed private memory must not be read-protected by guard"
+        );
+        // SAFETY: writing to the committed private block must still succeed without faulting.
+        unsafe { (prefix as *mut u8).write(99) };
+
+        // SAFETY: clean up our view and prefix reservation.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            });
+            VirtualFree(prefix as *mut _, 0, MEM_RELEASE);
+        }
         title_memory_remapped(view, BLOCK);
     }
 
