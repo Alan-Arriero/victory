@@ -1163,8 +1163,15 @@ impl<'a> Tracer<'a> {
         };
         match &inst.fields {
             Fields::Sop { src, .. } => src.iter().all(uniform_op),
+            // DPP picks lanes of its own (row and bank masks, shifts that
+            // give boundary lanes zero or their old value) and SDWA can keep
+            // part of the old register: neither result follows from its
+            // operands alone.
             Fields::Valu(f) if UNIFORM_VALU.contains(&inst.name()) => {
-                f.src.iter().all(uniform_op) && self.writes_every_lane(v)
+                f.dpp.is_none()
+                    && f.sdwa.is_none()
+                    && f.src.iter().all(uniform_op)
+                    && self.writes_every_lane(v)
             }
             _ => false,
         }
@@ -2749,6 +2756,43 @@ pub(crate) mod tests {
         // s_getpc_b64 is the first instruction: its next one is at 4.
         assert_eq!(a.offset, 4 + 0xDDC);
         assert!(a.dynamic.is_some(), "the index stays a computed term");
+    }
+
+    /// [`CODE_TABLE_FIRST_LANE`] with the index moved through a DPP row
+    /// shift into a VGPR that held a per-lane value: each row's first lane
+    /// keeps that value, so the first lane's address is not the table's.
+    #[test]
+    fn a_first_lane_read_through_a_dpp_shift_is_refused() {
+        let words = [
+            0xBE80_1F00, // s_getpc_b64 s[0:1]
+            0x8000_FF00,
+            0x0000_0DDC, // s_add_u32 s0, s0, 0xddc
+            0x8201_8001, // s_addc_u32 s1, s1, 0
+            0x7E00_0283, // v_mov_b32 v0, 3
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0x7E06_02FA,
+            0xFF01_1101, // v_mov_b32_dpp v3, v1 row_shr:1 row_mask:0xf bank_mask:0xf
+            0xD70F_6A01,
+            0x0000_0103, // v_add_co_u32 v1, vcc_lo, v3, s0
+            0xD528_6A02,
+            0x01A9_0001, // v_add_co_ci_u32 v2, vcc_lo, s1, 0, vcc_lo
+            0x7E04_0501, // v_readfirstlane_b32 s2, v1
+            0x7E06_0502, // v_readfirstlane_b32 s3, v2
+            0xF400_0181,
+            0xFA00_0000, // s_load_dword s6, s[2:3], null
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[], HwStage::Cs, lanes(&p).as_ref()).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                // the s_load_dword, at byte 56
+                offset: 56,
+                what: "an address read from the first lane of a per-lane value"
+            }
+        );
     }
 
     /// The code table's address written to the VGPRs under a narrower EXEC
