@@ -9406,7 +9406,7 @@ mod wave_size_tests {
         ] {
             let words = wave64_sum_cs_words(setup_2d, &[], &[]);
             let (shader, wave_bounds) = compile_wave64_cs(&words, threads, rsrc2_extra);
-            let _ = &shader;
+            let _ = (&shader, expected_sum);
             assert_eq!(wave_bounds, (32, 32), "threads={threads:?}");
             #[cfg(windows)]
             {
