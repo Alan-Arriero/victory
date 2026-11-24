@@ -3176,9 +3176,9 @@ impl<'a> Lower<'a> {
                 // taken from the two dword-aligned words around it. Reading
                 // at the byte address itself would promise the host an
                 // alignment the console does not have, and a host that
-                // believes it can hand back zeros (`notes/vtx.md`: a
-                // position fetched at an odd byte offset collapsing every
-                // vertex to the origin).
+                // believes it can hand back zeros (a position fetched at
+                // an odd byte offset collapsed every vertex to the
+                // origin).
                 #[cfg(test)]
                 {
                     self.s.unaligned_typed_loads += 1;
@@ -7340,7 +7340,6 @@ mod tests {
         assert_eq!(bytes(56), 4, "8_8_8_8_UNORM");
     }
 
-
     #[test]
     fn a_typed_fetch_inside_a_dword_reads_the_pair_around_it() {
         // `tbuffer_load_format_xyz` at byte offset 33: the console reads
@@ -7378,7 +7377,6 @@ mod tests {
             "{err:?}"
         );
     }
-
 
     /// Tables of 2D textures at s0 and samplers at s1.
     fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
