@@ -170,6 +170,7 @@ impl Convolver {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn reset(&mut self) {
         for channel in &mut self.history {
             for spectrum in channel {
@@ -200,13 +201,13 @@ impl Convolver {
         }
         for channel in 0..self.channels {
             let mut spectrum = vec![Complex::default(); self.fft_len];
-            for frame in 0..self.block {
+            for (frame, slot) in spectrum.iter_mut().enumerate().take(self.block) {
                 let index = if deinterleaved_input {
                     channel * self.block + frame
                 } else {
                     frame * self.channels + channel
                 };
-                spectrum[frame] = Complex::new(input[index], 0.0);
+                *slot = Complex::new(input[index], 0.0);
             }
             fft(&mut spectrum, false);
             let history = &mut self.history[channel];
@@ -243,6 +244,7 @@ impl Convolver {
 
 /// Builds the console's frequency-domain IR from a time-domain filter, for
 /// tests and for tools. `block` complex pairs are stored per filter block.
+#[cfg(test)]
 pub(crate) fn encode_ir(time: &[f32], block: usize) -> Vec<f32> {
     let blocks = time.len() / block;
     let mut out = Vec::with_capacity(blocks * block * 2);
@@ -253,9 +255,9 @@ pub(crate) fn encode_ir(time: &[f32], block: usize) -> Vec<f32> {
             spectrum[i] = Complex::new(sample, 0.0);
         }
         fft(&mut spectrum, false);
-        for bin in 0..block {
-            out.push(spectrum[bin].re);
-            out.push(spectrum[bin].im);
+        for bin in &spectrum[..block] {
+            out.push(bin.re);
+            out.push(bin.im);
         }
     }
     out
@@ -325,7 +327,7 @@ mod tests {
     fn matches_direct_convolution_over_several_blocks() {
         const BLOCK: usize = 512;
         let input: Vec<f32> = (0..BLOCK * 4)
-            .map(|i| ((i as f32 * 0.07).sin() * 0.6) as f32)
+            .map(|i| (i as f32 * 0.07).sin() * 0.6)
             .collect();
         let ir: Vec<f32> = (0..BLOCK * 2)
             .map(|i| (-(i as f32) / 300.0).exp() * (i as f32 * 0.11).sin() * 0.2)

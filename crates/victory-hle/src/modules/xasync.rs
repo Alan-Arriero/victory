@@ -1472,7 +1472,7 @@ mod tests {
         );
         assert_eq!((value, used), (0x1234, 8));
         assert!(
-            call((&raw mut block)).is_none(),
+            call(&raw mut block).is_none(),
             "the call ends with its result"
         );
         XTaskQueueCloseHandle(q);

@@ -1299,6 +1299,73 @@ fn readable(
     }
 }
 
+/// A view in a few words (diagnostics builds).
+#[cfg(feature = "diagnostics")]
+fn describe(view: Option<&View>) -> String {
+    let texture = |r: This| {
+        crate::resource::host_resource(r).map(|t| {
+            // SAFETY: a live resource.
+            let d = unsafe { t.GetDesc() };
+            format!(
+                "{}x{} f{} flags {:#x}",
+                d.Width, d.Height, d.Format.0, d.Flags.0
+            )
+        })
+    };
+    match view {
+        None => "no view".into(),
+        Some(v @ View::Shader(r, _)) => texture(*r as This)
+            .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
+        Some(View::Unordered(r, ..)) => format!("uav {:?}", texture(*r as This)),
+        Some(View::Placed(u, r, d)) => format!(
+            "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}",
+            r[0],
+            u64::from(r[4]) | u64::from(r[5]) << 32,
+            r[6],
+            r[8],
+            r[11],
+            u64::from(d[10]) | u64::from(d[11]) << 32
+        ),
+        // The first four values, as a colour rectangle's constants are.
+        Some(View::Constant(address, size))
+            if *size >= 16 && crate::texture::committed(*address as *const u8, 16) =>
+        {
+            // SAFETY: 16 committed bytes of title memory.
+            let v = unsafe { (*address as *const [f32; 4]).read_unaligned() };
+            format!("Constant({address:#x}, {size}) {v:?}")
+        }
+        Some(v) => format!("{v:?}").chars().take(60).collect(),
+    }
+}
+
+/// The console's own primitive topologies.
+const TRIANGLE_FAN: u32 = 6;
+const RECTANGLES: u32 = 17;
+const LINE_LOOP: u32 = 18;
+const QUADS: u32 = 19;
+const QUAD_STRIP: u32 = 20;
+
+/// Fixed-function state, straight onto the host list.
+pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+    // SAFETY: an open list.
+    unsafe { list.list.RSSetViewports(viewports) };
+}
+
+pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
+    // SAFETY: an open list.
+    unsafe { list.list.RSSetScissorRects(rects) };
+}
+
+pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
+    // SAFETY: an open list.
+    unsafe { list.list.OMSetBlendFactor(factor) };
+}
+
+pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
+    // SAFETY: an open list.
+    unsafe { list.list.OMSetStencilRef(reference) };
+}
+
 #[cfg(test)]
 mod depth_tests {
     use super::*;
@@ -1454,73 +1521,6 @@ mod depth_tests {
         assert_eq!(release(views), 0);
         assert_eq!(release(depth), 0);
     }
-}
-
-/// A view in a few words (diagnostics builds).
-#[cfg(feature = "diagnostics")]
-fn describe(view: Option<&View>) -> String {
-    let texture = |r: This| {
-        crate::resource::host_resource(r).map(|t| {
-            // SAFETY: a live resource.
-            let d = unsafe { t.GetDesc() };
-            format!(
-                "{}x{} f{} flags {:#x}",
-                d.Width, d.Height, d.Format.0, d.Flags.0
-            )
-        })
-    };
-    match view {
-        None => "no view".into(),
-        Some(v @ View::Shader(r, _)) => texture(*r as This)
-            .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
-        Some(View::Unordered(r, ..)) => format!("uav {:?}", texture(*r as This)),
-        Some(View::Placed(u, r, d)) => format!(
-            "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}",
-            r[0],
-            u64::from(r[4]) | u64::from(r[5]) << 32,
-            r[6],
-            r[8],
-            r[11],
-            u64::from(d[10]) | u64::from(d[11]) << 32
-        ),
-        // The first four values, as a colour rectangle's constants are.
-        Some(View::Constant(address, size))
-            if *size >= 16 && crate::texture::committed(*address as *const u8, 16) =>
-        {
-            // SAFETY: 16 committed bytes of title memory.
-            let v = unsafe { (*address as *const [f32; 4]).read_unaligned() };
-            format!("Constant({address:#x}, {size}) {v:?}")
-        }
-        Some(v) => format!("{v:?}").chars().take(60).collect(),
-    }
-}
-
-/// The console's own primitive topologies.
-const TRIANGLE_FAN: u32 = 6;
-const RECTANGLES: u32 = 17;
-const LINE_LOOP: u32 = 18;
-const QUADS: u32 = 19;
-const QUAD_STRIP: u32 = 20;
-
-/// Fixed-function state, straight onto the host list.
-pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
-    // SAFETY: an open list.
-    unsafe { list.list.RSSetViewports(viewports) };
-}
-
-pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
-    // SAFETY: an open list.
-    unsafe { list.list.RSSetScissorRects(rects) };
-}
-
-pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
-    // SAFETY: an open list.
-    unsafe { list.list.OMSetBlendFactor(factor) };
-}
-
-pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
-    // SAFETY: an open list.
-    unsafe { list.list.OMSetStencilRef(reference) };
 }
 
 #[cfg(all(test, feature = "diagnostics"))]

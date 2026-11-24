@@ -447,7 +447,7 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
 /// Decodes (when the connection decodes) and resamples one command's input
 /// into float PCM at the pitch the title asked for.
 fn process_convert(
-    mut decoder: Option<&mut OpusDecoder>,
+    decoder: Option<&mut OpusDecoder>,
     resampler: &mut Resampler,
     max_frames: u32,
     options: u32,
@@ -467,7 +467,7 @@ fn process_convert(
     // SAFETY: the title's buffer in its connection memory.
     let bytes = unsafe { std::slice::from_raw_parts(input, input_length as usize) };
     let pcm;
-    if let Some(decoder) = decoder.as_deref_mut() {
+    if let Some(decoder) = decoder {
         let mut decoded = vec![0f32; MAX_FRAMES * channels];
         let n = match decoder.decode(bytes, MAX_FRAMES, &mut decoded) {
             Ok(n) => n,
@@ -486,14 +486,16 @@ fn process_convert(
         let multiple = if channels == 2 { 8 } else { 4 };
         if frames < minimum
             || frames > 960
-            || frames % multiple != 0
+            || !frames.is_multiple_of(multiple)
             || input_length as usize != frames * channels * 4
         {
             result.error = E_INVALIDARG;
             return;
         }
         let samples: Vec<f32> = bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         pcm = if options & DEINTERLEAVED_INPUT != 0 && channels == 2 {
