@@ -111,11 +111,13 @@ struct FreshTableKey {
     records_hash: u64,
 }
 
-#[derive(Clone, Copy)]
 struct FreshTableEntry {
     table: u64,
     start_slot: u32,
     first: u32,
+    /// Sorted offsets `k - start_slot` that held a tagged stale (released) view
+    /// compiled as null, so unchanged stale slots reuse the rebuilt range.
+    dead_slots: Vec<u32>,
 }
 
 /// What one title list has set, and what its host list was last given.
@@ -1142,7 +1144,11 @@ impl State {
                     let at = table + u64::from(k) * step_bytes;
                     // SAFETY: views are 32 bytes and samplers are 16 bytes, so `[u32; 3]`
                     // (12 bytes) fits safely inside every in-bounds slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    let raw = unsafe { (at as *const [u32; 3]).read_unaligned() };
+                    let dead = raw[0] == crate::descriptor::VIEW_TAG
+                        && crate::descriptor::view(at).is_none();
+                    raw.hash(&mut h);
+                    dead.hash(&mut h);
                 }
                 for alias in &table_aliases {
                     (alias.entry - start_slot, alias.stride).hash(&mut h);
@@ -1160,12 +1166,8 @@ impl State {
                     .checked_sub(start_slot)
                     .and_then(|base| base.checked_mul(step_bytes as u32))
             };
-            if let Some(&FreshTableEntry {
-                table: prev_table,
-                start_slot: prev_start,
-                first,
-            }) = self.fresh_tables.get(&key)
-            {
+            if let Some(entry) = self.fresh_tables.get(&key) {
+                let (prev_table, prev_start, first) = (entry.table, entry.start_slot, entry.first);
                 let mut reuse_ok = true;
                 for i in 0..n {
                     let at = table + u64::from(start_slot + i) * step_bytes;
@@ -1181,12 +1183,12 @@ impl State {
                             break;
                         }
                     }
-                    // If a resource was released via `descriptor::forget`, its raw
-                    // handle words stay in title memory while `view(at)` becomes
-                    // `None`; treat that as a miss so a fresh range is built.
-                    if raw[0] == crate::descriptor::VIEW_TAG
-                        && crate::descriptor::view(at).is_none()
-                    {
+                    // Compare view liveness against what was compiled into `first`:
+                    // a newly released view misses and rebuilds a null slot, while
+                    // an unchanged stale slot already compiled as null reuses it.
+                    let dead = raw[0] == crate::descriptor::VIEW_TAG
+                        && crate::descriptor::view(at).is_none();
+                    if dead != entry.dead_slots.binary_search(&i).is_ok() {
                         reuse_ok = false;
                         break;
                     }
@@ -1237,6 +1239,7 @@ impl State {
             // arrays), and a transient `list.scratch` failure must not leave a
             // partial range cached for subsequent draws.
             let mut complete = true;
+            let mut dead_slots = Vec::new();
             for k in start_slot..=max_slot {
                 let index = first + (k - start_slot);
                 let at = table + u64::from(k) * step_bytes;
@@ -1259,6 +1262,12 @@ impl State {
                     }
                     None => {
                         host.make_null(index);
+                        // SAFETY: verified in-bounds of `heap` above.
+                        if unsafe { (at as *const u32).read_unaligned() }
+                            == crate::descriptor::VIEW_TAG
+                        {
+                            dead_slots.push(k - start_slot);
+                        }
                         if entries
                             .iter()
                             .any(|u| u.table_offset_dwords / step_dwords == k)
@@ -1295,6 +1304,7 @@ impl State {
                     table,
                     start_slot,
                     first,
+                    dead_slots,
                 },
             );
             self.dynamic.push((heap_ptr, first, n));
@@ -2261,7 +2271,20 @@ mod depth_tests {
         state.host_pipeline = 0x1234;
         state.host_roots = [0x11, 0x22];
         state.host_heaps = [0x33, 0x44];
-        state.fresh_tables.insert((0xdead, 0xbeef), 1);
+        state.fresh_tables.insert(
+            FreshTableKey {
+                heap: 0xdead,
+                copy_gen: 0,
+                slots: 1,
+                records_hash: 0xbeef,
+            },
+            FreshTableEntry {
+                table: 0,
+                start_slot: 0,
+                first: 1,
+                dead_slots: Vec::new(),
+            },
+        );
         state
             .dynamic
             .push((std::ptr::from_ref(title_heap) as usize, dyn_slot, 200));
@@ -3068,6 +3091,17 @@ mod table_tests {
         assert_ne!(first2, first1);
         assert_eq!(made2, vec![(0, first2 * 32)]);
 
+        // Subsequent identical draws with the same unchanged stale slot must
+        // reuse the rebuilt null range rather than leaking new dynamic slots.
+        let made3 = state.tables(&list, &used, false, &[]);
+        assert!(!state.table_failed);
+        assert_eq!(
+            state.dynamic.len(),
+            2,
+            "unchanged stale slot must reuse its rebuilt null range"
+        );
+        assert_eq!(made3, made2);
+
         list.close();
         host.execute(&[&list]);
     }
@@ -3164,6 +3198,16 @@ mod table_tests {
         assert!(!state.table_failed);
         assert_eq!(state.dynamic.len(), 2);
         assert_eq!(made4, vec![(0, first2 * 32)]);
+
+        // An intervening `defer` (e.g. `CopyMemoryToMemoryX` writing title
+        // memory) must also bump `copy_gen` and allocate a fresh CBV snapshot.
+        list.defer(|| {});
+        let made5 = state.tables(&list, &used, false, &[]);
+        assert!(!state.table_failed);
+        assert_eq!(state.dynamic.len(), 3);
+        let first3 = state.dynamic[2].1;
+        assert_ne!(first3, first2);
+        assert_eq!(made5, vec![(0, first3 * 32)]);
 
         list.close();
         host.execute(&[&list]);
