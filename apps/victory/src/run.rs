@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+#[cfg(windows)]
+use anyhow::Context;
+use anyhow::Result;
 
 use crate::{Console, Unimplemented};
 
@@ -380,6 +382,11 @@ impl LoaderLock {
     }
 }
 
+#[cfg(not(windows))]
+pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
+    anyhow::bail!("running titles requires Windows")
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -448,9 +455,4 @@ mod cpu_check_tests {
     fn skip_env_var_bypasses_missing_avx2() {
         assert!(check_cpu_features_with(false, Some("1")).is_ok());
     }
-}
-
-#[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
-    anyhow::bail!("running titles requires Windows")
 }
