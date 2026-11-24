@@ -58,6 +58,11 @@ shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 [docs/linux-proton.md](docs/linux-proton.md) for which crates build and test
 natively today, cross-building `victory.exe` and running it under Proton.
 
+Under Wine or Proton, indirect execution also needs DXC's `dxcompiler.dll` (with
+its `dxil.dll`): Wine's `d3dcompiler_47` cannot compile the indirect-argument
+clamp. It is looked for in `VICTORY_DXC` (the DLL or its folder), beside the
+`dxil.dll` that shader validation finds, then the executable's folder and System32.
+
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
