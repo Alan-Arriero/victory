@@ -164,6 +164,11 @@ impl Bools {
         (v != TERMINAL).then(|| (self.atoms[v as usize], lo, hi))
     }
 
+    /// The atom's variable index: nodes test lower indices nearer the top.
+    pub(crate) fn order(&self, atom: Atom) -> Option<u32> {
+        self.ids.get(&atom).copied()
+    }
+
     /// The atoms `b` depends on, in variable order.
     pub fn support(&self, b: Bool) -> Vec<Atom> {
         let mut vars = self.vars(b);
@@ -436,6 +441,26 @@ impl Structured {
             None => self.masks.get(&low),
         }
         .copied()
+    }
+}
+
+/// Building blocks for tests outside this module.
+#[cfg(test)]
+impl Bools {
+    pub(crate) fn for_tests() -> Self {
+        Self::new()
+    }
+
+    pub(crate) fn test_atom(&mut self, atom: Atom, born: usize) -> Bool {
+        self.atom(atom, born)
+    }
+
+    pub(crate) fn test_and(&mut self, a: Bool, b: Bool) -> Bool {
+        self.and(a, b)
+    }
+
+    pub(crate) fn test_or(&mut self, a: Bool, b: Bool) -> Bool {
+        self.or(a, b)
     }
 }
 

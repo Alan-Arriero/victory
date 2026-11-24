@@ -1167,14 +1167,60 @@ impl<'a> Tracer<'a> {
             // give boundary lanes zero or their old value) and SDWA can keep
             // part of the old register: neither result follows from its
             // operands alone.
+            // A carry-in is a lane mask: each lane adds its own bit, so the
+            // mask's bits must agree, not only its value.
             Fields::Valu(f) if UNIFORM_VALU.contains(&inst.name()) => {
+                let carry_in = inst.name().ends_with("_co_ci_u32");
                 f.dpp.is_none()
                     && f.sdwa.is_none()
-                    && f.src.iter().all(uniform_op)
+                    && f.src.iter().enumerate().all(|(i, op)| {
+                        if carry_in && i == 2 {
+                            self.same_bit_in_every_lane(inst, op)
+                        } else {
+                            uniform_op(op)
+                        }
+                    })
                     && self.writes_every_lane(v)
             }
             _ => false,
         }
+    }
+
+    /// Whether lane mask `op` of `inst` has the same bit in every lane: an
+    /// inline 0 or -1, or the carry-out of a VALU add or subtract whose own
+    /// result is uniform (every lane then carries the same).
+    fn same_bit_in_every_lane(&self, inst: &Inst, op: &Operand) -> bool {
+        let Operand::Scalar { code, dwords } = *op else {
+            return matches!(*op, Operand::Const(128 | 193));
+        };
+        if code == NULL {
+            return true;
+        }
+        let dwords: Vec<Value> = match (0..dwords).map(|k| inst.read(Reg::S(code + k))).collect() {
+            Some(d) => d,
+            None => return false,
+        };
+        let Some(writer) = dwords.first().and_then(|&d| self.def(d)) else {
+            return false;
+        };
+        let Fields::Valu(f) = &writer.fields else {
+            return false;
+        };
+        let (Some(Operand::Scalar { code: out, .. }), Some(Operand::Vector { reg, .. })) =
+            (f.carry, f.dst)
+        else {
+            return false;
+        };
+        let carried = dwords
+            .iter()
+            .enumerate()
+            .all(|(k, &d)| writer.write(Reg::S(out + k as u8)) == Some(d));
+        carried
+            && matches!(
+                writer.name(),
+                "v_add_co_u32" | "v_sub_co_u32" | "v_add_co_ci_u32"
+            )
+            && writer.write(Reg::V(reg)).is_some_and(|r| self.uniform(r))
     }
 
     /// Whether the instruction writing `v` writes it in every lane that
@@ -1607,6 +1653,17 @@ impl<'a> Tracer<'a> {
             "f64" => (false, true),
             _ => return None,
         };
+        // An inline float is a half in an f16 compare (1.0 is 0x3c00), but
+        // the same constant moved to a VGPR is the f32's bits: a key from
+        // `inline` would treat the two as equal. Such compares get no key.
+        let half_float = ty == "f16";
+        if half_float
+            && f.src[..2]
+                .iter()
+                .any(|s| matches!(*s, Operand::Const(240..=248)))
+        {
+            return None;
+        }
         let lhs = self.cmp_operand(inst, &f.src[0], 0, f, is_64)?;
         let rhs = self.cmp_operand(inst, &f.src[1], 1, f, is_64)?;
         let (op, mut lhs, mut rhs, negated) = match op {
@@ -2348,35 +2405,14 @@ pub(crate) fn inline(code: u8) -> Option<u32> {
     }
 }
 
-/// Assigns each BDD atom reachable from `all` a rank consistent with the
-/// BDD's variable order (`rank[parent] < rank[child]` for every node edge).
+/// Ranks each BDD atom reachable from `all` by the BDD's own variable
+/// order: a node's atom always ranks below its children's. A walk's
+/// finishing order is not enough, since one atom's nodes can be met at
+/// different depths.
 fn bdd_ranks(bools: &Bools, all: &[(Bool, bool)]) -> HashMap<Atom, usize> {
-    let mut visited = Vec::new();
-    let mut postorder = Vec::new();
-    let mut stack: Vec<(Bool, bool)> = all.iter().map(|&(b, _)| (b, false)).collect();
-    while let Some((b, done)) = stack.pop() {
-        let Some((atom, lo, hi)) = bools.node(b) else {
-            continue;
-        };
-        if done {
-            if !postorder.contains(&atom) {
-                postorder.push(atom);
-            }
-            continue;
-        }
-        if visited.contains(&b) {
-            continue;
-        }
-        visited.push(b);
-        stack.push((b, true));
-        stack.push((hi, false));
-        stack.push((lo, false));
-    }
-    postorder
-        .into_iter()
-        .rev()
-        .enumerate()
-        .map(|(i, a)| (a, i))
+    all.iter()
+        .flat_map(|&(b, _)| bools.support(b))
+        .filter_map(|a| Some((a, bools.order(a)? as usize)))
         .collect()
 }
 
@@ -2758,6 +2794,30 @@ pub(crate) mod tests {
         assert!(a.dynamic.is_some(), "the index stays a computed term");
     }
 
+    /// [`CODE_TABLE_FIRST_LANE`] with the low dword's add taking a carry-in
+    /// from an SGPR holding 1: only lane 0 adds it, so the address differs
+    /// between lanes and the first-lane read must not be dropped.
+    #[test]
+    fn a_first_lane_read_through_a_per_lane_carry_is_refused() {
+        let mut words = CODE_TABLE_FIRST_LANE.to_vec();
+        // v_add_co_ci_u32 v1, vcc_lo, v1, s0, s4 (was v_add_co_u32 v1, vcc_lo, v1, s0)
+        let lo = words.iter().position(|&w| w == 0xD70F_6A01).unwrap();
+        words[lo] = 0xD528_6A01;
+        words[lo + 1] = 0x0010_0101;
+        words.insert(0, 0xBE84_0381); // s_mov_b32 s4, 1
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[], HwStage::Cs, lanes(&p).as_ref()).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                // the s_load_dword, at byte 52
+                offset: 52,
+                what: "an address read from the first lane of a per-lane value"
+            }
+        );
+    }
+
     /// [`CODE_TABLE_FIRST_LANE`] with the index moved through a DPP row
     /// shift into a VGPR that held a per-lane value: each row's first lane
     /// keeps that value, so the first lane's address is not the table's.
@@ -2793,6 +2853,54 @@ pub(crate) mod tests {
                 what: "an address read from the first lane of a per-lane value"
             }
         );
+    }
+
+    /// With `A < B < C < D` and `C` the same as `D`, `!D`, `!B`, `A` and
+    /// `A && (B || C)` cannot all hold. The search must branch on the BDD's
+    /// own order to see it: ranked by a walk's finishing order, `B` came
+    /// first and was assigned twice, once each way.
+    #[test]
+    fn the_equivalence_search_follows_the_bdd_order() {
+        let mut b = Bools::for_tests();
+        let [a, bb, c, d] =
+            [1, 2, 3, 4].map(|n| b.test_atom(Atom::Lane(crate::ir::Value(n)), n as usize));
+        let either = b.test_or(bb, c);
+        let f = b.test_and(a, either);
+        let all = [(d, false), (bb, false), (f, true), (a, true)];
+        let lane = |n| Atom::Lane(crate::ir::Value(n));
+        let equiv: HashMap<Atom, (usize, bool)> =
+            [(lane(3), (0, false)), (lane(4), (0, false))].into();
+        let rank = bdd_ranks(&b, &all);
+        let mut assigned = vec![None; 1];
+        let mut budget = MAX_MEET;
+        assert!(!meet_equiv(
+            &b,
+            all.to_vec(),
+            &rank,
+            &equiv,
+            &mut assigned,
+            &mut budget
+        ));
+    }
+
+    /// An f16 compare with an inline float has no compare key (the constant
+    /// is a half there, not the f32 bits `inline` gives); the same compare
+    /// in f32 has one.
+    #[test]
+    fn half_compares_with_inline_floats_are_not_keyed() {
+        let key = |word: u32| {
+            let code: Vec<u8> = [word, S_ENDPGM]
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            let l = lanes(&p);
+            let t = Tracer::new(&p, &[], HwStage::Cs, l.as_ref()).unwrap();
+            let v = p.blocks[0].insts[0].write(Reg::S(106)).unwrap();
+            t.compare_key(v).is_some()
+        };
+        assert!(!key(0x7D94_02F2), "v_cmp_eq_f16 vcc_lo, 1.0, v1");
+        assert!(key(0x7C04_02F2), "v_cmp_eq_f32 vcc_lo, 1.0, v1");
     }
 
     /// The code table's address written to the VGPRs under a narrower EXEC
