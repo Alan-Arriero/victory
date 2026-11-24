@@ -547,8 +547,8 @@ impl HostPipeline {
                     vs_bytes = code_bytes(&code(0)).len(),
                     ps_bytes = code_bytes(&code(1)).len(),
                     num_rt = g.targets.NumRenderTargets,
-                    rtv0 = g.targets.RTFormats[0].0 as i32,
-                    dsv = g.depth_format.0 as i32,
+                    rtv0 = g.targets.RTFormats[0].0,
+                    dsv = g.depth_format.0,
                     samples = g.samples.Count,
                     inputs = g.inputs.len(),
                     cull = g.rasterizer.CullMode.0,
@@ -558,7 +558,7 @@ impl HostPipeline {
                     blend_op = g.blend.RenderTarget[0].BlendOp.0,
                     src_blend = g.blend.RenderTarget[0].SrcBlend.0,
                     dst_blend = g.blend.RenderTarget[0].DestBlend.0,
-                    topo = g.topology.0 as i32,
+                    topo = g.topology.0,
                     "host pipeline refused"
                 );
                 host.log_messages();

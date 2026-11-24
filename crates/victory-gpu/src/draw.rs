@@ -629,7 +629,7 @@ impl State {
             crate::queue::presented() + 1,
             self.pipeline,
             self.topology,
-            self.depth
+            self.depth.map_or(0, |d| d.resource)
         );
     }
 
@@ -1679,7 +1679,7 @@ mod depth_tests {
 }
 
 #[cfg(all(test, feature = "diagnostics"))]
-mod tests {
+mod diagnostics_tests {
     use super::*;
 
     #[test]
