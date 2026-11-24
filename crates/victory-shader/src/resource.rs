@@ -1159,9 +1159,25 @@ impl<'a> Tracer<'a> {
         };
         match &inst.fields {
             Fields::Sop { src, .. } => src.iter().all(uniform_op),
-            Fields::Valu(f) if UNIFORM_VALU.contains(&inst.name()) => f.src.iter().all(uniform_op),
+            Fields::Valu(f) if UNIFORM_VALU.contains(&inst.name()) => {
+                f.src.iter().all(uniform_op) && self.writes_every_lane(v)
+            }
             _ => false,
         }
+    }
+
+    /// Whether the instruction writing `v` writes it in every lane that
+    /// reaches its block. Lanes a narrower EXEC skips keep the register's
+    /// old value, so uniform operands then give no uniform result (as in
+    /// [`Tracer::runs`]).
+    fn writes_every_lane(&self, v: Value) -> bool {
+        let (Some(lanes), Some(site)) = (self.lanes, self.defs[v.0 as usize]) else {
+            return true;
+        };
+        let Some(&Some(guard)) = lanes.guards.get(site.0).and_then(|g| g.get(site.1)) else {
+            return true;
+        };
+        !self.lanes_meet(&[(lanes.reach[site.0], true), (guard, false)])
     }
 
     /// The `v_readfirstlane_b32` results the descriptor operand `op` of
@@ -2565,6 +2581,44 @@ pub(crate) mod tests {
         // s_getpc_b64 is the first instruction: its next one is at 4.
         assert_eq!(a.offset, 4 + 0xDDC);
         assert!(a.dynamic.is_some(), "the index stays a computed term");
+    }
+
+    /// The code table's address written to the VGPRs under a narrower EXEC
+    /// (lanes below v0's 16) after a per-lane value filled them, then read
+    /// from the first lane once EXEC is back: lanes the write skipped keep
+    /// the per-lane value, so the first lane's is not known to be the
+    /// table's.
+    #[test]
+    fn a_first_lane_read_of_an_address_written_in_some_lanes_is_refused() {
+        let words = [
+            0xBE80_1F00, // s_getpc_b64 s[0:1]
+            0x8000_FF00,
+            0x0000_0DDC, // s_add_u32 s0, s0, 0xddc
+            0x8201_8001, // s_addc_u32 s1, s1, 0
+            0x7E02_0300, // v_mov_b32 v1, v0
+            0x7E04_0300, // v_mov_b32 v2, v0
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE84_3C6A, // s_and_saveexec_b32 s4, vcc_lo
+            0x7E02_0200, // v_mov_b32 v1, s0
+            0x7E04_0201, // v_mov_b32 v2, s1
+            0xBEFE_0304, // s_mov_b32 exec_lo, s4
+            0x7E04_0501, // v_readfirstlane_b32 s2, v1
+            0x7E06_0502, // v_readfirstlane_b32 s3, v2
+            0xF400_0181,
+            0xFA00_0000, // s_load_dword s6, s[2:3], null
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[], HwStage::Cs, lanes(&p).as_ref()).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                // the s_load_dword, at byte 52
+                offset: 52,
+                what: "an address read from the first lane of a per-lane value"
+            }
+        );
     }
 
     #[test]
