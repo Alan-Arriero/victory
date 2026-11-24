@@ -384,7 +384,9 @@ mod tests {
             xasync::E_NOT_SUFFICIENT_BUFFER
         );
         assert_eq!(buffer, [0xaa; 4], "nothing is written on failure");
-        assert_eq!(used, 0xdead_beef, "and no size is reported");
+        // The required size (text and NUL) is still reported, so the
+        // size-query call a title makes first can be used.
+        assert_eq!(used, 4, "the required size is reported");
     }
 
     #[test]
