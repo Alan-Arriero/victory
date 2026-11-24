@@ -8756,55 +8756,62 @@ mod select_tests {
             0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
             0xbf81_0000, // s_endpgm
         ];
-        let native = NativeProgram {
-            stage: HwStage::Cs,
-            wave64: false,
-            vgprs: 4,
-            layout: vec![RootParam {
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                sgprs: 1,
-                base_register: 0,
-                user_data: 0,
-                slot: 0,
-            }],
-            used: vec![
-                UsedResource {
-                    kind: ResourceType::Srv,
+        // The shader for an SRV of `stride` bytes per element.
+        let lowered = |stride: u32| {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![RootParam {
                     root: RootType::Table,
                     table_offset_dwords: 0,
-                    lower_bound: 0,
-                    stride: 24,
-                    dwords: 4,
+                    sgprs: 1,
+                    base_register: 0,
                     user_data: 0,
                     slot: 0,
-                },
-                UsedResource {
-                    kind: ResourceType::Uav,
-                    root: RootType::Table,
-                    table_offset_dwords: 4,
-                    lower_bound: 0,
-                    stride: 0,
-                    dwords: 4,
-                    user_data: 0,
-                    slot: 0,
-                },
-            ],
-            io: crate::native::StageIo::Cs(ComputeIo {
-                rsrc2: 2,
-                threads: [32, 1, 1],
-            }),
-            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+                }],
+                used: vec![
+                    UsedResource {
+                        kind: ResourceType::Srv,
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        lower_bound: 0,
+                        stride,
+                        dwords: 4,
+                        user_data: 0,
+                        slot: 0,
+                    },
+                    UsedResource {
+                        kind: ResourceType::Uav,
+                        root: RootType::Table,
+                        table_offset_dwords: 4,
+                        lower_bound: 0,
+                        stride: 0,
+                        dwords: 4,
+                        user_data: 0,
+                        slot: 0,
+                    },
+                ],
+                io: crate::native::StageIo::Cs(ComputeIo {
+                    rsrc2: 2,
+                    threads: [32, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let container = crate::dxbc::build(&[]);
+            let c = Container::parse(&container).unwrap();
+            let p = crate::ir::build(&native.code, false, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            emit(&c, &native, &p, &st, &io, &res).unwrap()
         };
-        let container = crate::dxbc::build(&[]);
-        let c = Container::parse(&container).unwrap();
-        let p = crate::ir::build(&native.code, false, native.vgprs).unwrap();
-        let st = crate::structure::structure(&p).unwrap();
-        let io = crate::io::raise(&p, &native).unwrap();
-        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         #[cfg_attr(not(windows), allow(unused_mut))]
-        let mut shader = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let mut shader = lowered(24);
         assert!(!shader.dxil.is_empty());
+        // The stride is what makes the load a structured one: the same
+        // program over an SRV without one (a raw buffer) lowers differently.
+        assert_ne!(shader.dxil, lowered(0).dxil);
         #[cfg(windows)]
         if let Ok(mut v) = crate::emit::validator::Validator::load(None) {
             v.validate(&mut shader.dxil)
