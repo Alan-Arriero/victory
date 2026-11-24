@@ -43,10 +43,7 @@
 
 use std::sync::Arc;
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
 
 use crate::draw::VertexView;
 use crate::host::{HostList, host, transition};
@@ -486,56 +483,10 @@ fn shaders() -> Option<&'static Shaders> {
         .as_ref()
 }
 
-fn compile_blob(
-    name: windows::core::PCSTR,
-    source: &str,
-) -> Result<ID3DBlob, (windows::core::Error, String)> {
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers are ours.
-    let compiled = unsafe {
-        D3DCompile(
-            source.as_ptr().cast(),
-            source.len(),
-            name,
-            None,
-            None,
-            s!("main"),
-            s!("cs_5_1"),
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
-    if let Err(e) = compiled {
-        let mut msg = String::new();
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe {
-                std::slice::from_raw_parts(
-                    errors.GetBufferPointer().cast::<u8>(),
-                    errors.GetBufferSize(),
-                )
-            };
-            msg = String::from_utf8_lossy(text).into_owned();
-            tracing::warn!("rectangle expander: {msg}");
-        }
-        return Err((e, msg));
-    }
-    code.ok_or_else(|| (windows::core::Error::empty(), String::new()))
-}
-
-fn compile_pass(
-    device: &ID3D12Device,
-    name: windows::core::PCSTR,
-    source: &str,
-) -> windows::core::Result<Pass> {
-    let code = compile_blob(name, source).map_err(|(e, _)| e)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+fn compile_pass(device: &ID3D12Device, name: &str, source: &str) -> windows::core::Result<Pass> {
+    let bytes = &crate::hlsl::compile_compute(name, source)?[..];
+    // SAFETY: plain object creation; the root signature is inside the shader.
     unsafe {
-        let bytes =
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
@@ -551,8 +502,8 @@ fn compile_pass(
 
 fn make() -> windows::core::Result<Shaders> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    let rewrite = compile_pass(device, s!("rect_rewrite"), REWRITE_SOURCE)?;
-    let expand = compile_pass(device, s!("rect_expand"), EXPAND_SOURCE)?;
+    let rewrite = compile_pass(device, "rect_rewrite", REWRITE_SOURCE)?;
+    let expand = compile_pass(device, "rect_expand", EXPAND_SOURCE)?;
     Ok(Shaders { rewrite, expand })
 }
 
@@ -932,8 +883,8 @@ mod tests {
         assert!(u64::from(x) * u64::from(y) >= 65536);
     }
 
-    /// Both rectangle-expansion compute shaders compile with the system's
-    /// compiler and the host device accepts them.
+    /// Both rectangle-expansion compute shaders compile (system compiler or
+    /// DXC) and the host device accepts them.
     #[test]
     fn rectangle_expander_builds() {
         if host().is_none() {
@@ -942,24 +893,34 @@ mod tests {
         assert!(shaders().is_some());
     }
 
-    /// Both HLSL shaders compile with `D3DCompile` when the host compiler
-    /// supports `cs_5_1` raw buffers (`RWByteAddressBuffer::Load`).
+    /// Both HLSL shaders compile with the system's compiler when it supports
+    /// `cs_5_1` raw buffers (`RWByteAddressBuffer::Load`), and with DXC when
+    /// that is present.
     #[test]
     fn hlsl_compiles() {
+        use crate::hlsl::{dxc_compile, system_compile};
         let probe = r#"
             RWByteAddressBuffer b : register(u0);
             [RootSignature("UAV(u0)")]
             [numthreads(1, 1, 1)]
             void main() { b.Store(0, b.Load(0)); }
         "#;
-        if compile_blob(s!("probe"), probe).is_err() {
-            return; // compiler here (e.g. Wine's vkd3d-shader) lacks RWByteAddressBuffer::Load
-        }
-        if let Err((e, msg)) = compile_blob(s!("rect_rewrite"), REWRITE_SOURCE) {
-            panic!("rect_rewrite HLSL failed ({e}): {msg}");
-        }
-        if let Err((e, msg)) = compile_blob(s!("rect_expand"), EXPAND_SOURCE) {
-            panic!("rect_expand HLSL failed ({e}): {msg}");
+        for (name, source) in [
+            ("rect_rewrite", REWRITE_SOURCE),
+            ("rect_expand", EXPAND_SOURCE),
+        ] {
+            // A compiler that lacks raw buffer loads (Wine's vkd3d-shader)
+            // or a missing DXC is skipped.
+            if system_compile("probe", probe).is_ok()
+                && let Err((e, msg)) = system_compile(name, source)
+            {
+                panic!("{name} HLSL failed ({e}): {msg}");
+            }
+            if dxc_compile("probe", probe).is_ok()
+                && let Err(e) = dxc_compile(name, source)
+            {
+                panic!("{name} HLSL failed with DXC ({e})");
+            }
         }
     }
 
