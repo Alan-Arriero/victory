@@ -1337,7 +1337,10 @@ mod tests {
         );
         assert_eq!(query(at(1)).host.State, MEM_RESERVE);
         assert_eq!(query(at(2)).host.State, MEM_RESERVE);
-        assert_eq!(XMemMapPhysicalPagesScatter([at(0)].as_ptr(), 1, std::ptr::null()), 1);
+        assert_eq!(
+            XMemMapPhysicalPagesScatter([at(0)].as_ptr(), 1, std::ptr::null()),
+            1
+        );
         assert_eq!(query(at(0)).host.State, MEM_RESERVE);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
