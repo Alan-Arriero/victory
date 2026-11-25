@@ -42,6 +42,9 @@ pub(crate) struct Lowered {
     pub has_isnan_op: bool,
     #[cfg(test)]
     pub has_fcmp_uno: bool,
+    /// Whether the program reads the pixel coverage mask.
+    #[cfg(test)]
+    pub has_coverage_op: bool,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -1193,6 +1196,8 @@ impl<'a> Lower<'a> {
         let has_isnan_op = self.s.m.has_dx_op("dx.op.isSpecialFloat.f32", 8);
         #[cfg(test)]
         let has_fcmp_uno = self.s.m.has_cmp(pred::UNO);
+        #[cfg(test)]
+        let has_coverage_op = self.s.m.has_dx_op("dx.op.coverage.i32", 91);
         Ok(Lowered {
             #[cfg(test)]
             #[cfg(test)]
@@ -1218,6 +1223,8 @@ impl<'a> Lower<'a> {
             has_isnan_op,
             #[cfg(test)]
             has_fcmp_uno,
+            #[cfg(test)]
+            has_coverage_op,
         })
     }
 
@@ -1314,6 +1321,19 @@ impl<'a> Lower<'a> {
                 let w = self.s.m.bin(self.s.entry, Bin::LShr, f, shift);
                 let k24 = self.s.m.i32(24);
                 return Val::I32(self.s.m.bin(self.s.entry, Bin::Shl, w, k24));
+            }
+            // DXIL has no signature element for the coverage mask of a pixel
+            // input: it is the intrinsic's result.
+            Input::SampleCoverage => {
+                let entry = self.s.entry;
+                return Val::I32(self.s.op(
+                    entry,
+                    "coverage.i32",
+                    Attr::ReadNone,
+                    self.s.t.i32,
+                    91,
+                    &[],
+                ));
             }
             _ => return Val::Missing("a pixel system input"),
         };
@@ -8959,6 +8979,66 @@ mod tests {
             !lowered.has_fcmp_uno,
             "v_med3_f32 must not emit fcmp uno (folded away by some drivers)"
         );
+    }
+
+    /// A pixel shader that exports `v0` as a render-target colour, with
+    /// `input_addr` enabling its input VGPRs.
+    fn lower_ps(input_addr: u32) -> Result<Lowered, crate::ShaderError> {
+        use super::super::container::SigElement;
+        // exp mrt0 v0, v0, v0, v0 (done); s_endpgm
+        let words = [0xF800_180Fu32, 0, S_ENDPGM];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 1,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 5,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![target],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+    }
+
+    #[test]
+    fn pixel_sample_coverage_input_reads_dx_op_coverage() {
+        let with = lower_ps(1 << 14).unwrap();
+        assert!(
+            with.has_coverage_op,
+            "SampleCoverage must lower to dx.op.coverage.i32 (opcode 91)"
+        );
+        let without = lower_ps(0).unwrap();
+        assert!(!without.has_coverage_op);
     }
 
     #[test]

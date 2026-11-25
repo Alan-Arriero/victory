@@ -852,6 +852,48 @@ mod tests {
         }
     }
 
+    /// `SPI_PS_INPUT_ADDR` bit 14 delivers the coverage mask in a VGPR. DXIL
+    /// reads it with `dx.op.coverage.i32`, and `SV_Coverage` is not a pixel
+    /// input there, so a console signature that lists it loses the element.
+    #[test]
+    fn pixel_sample_coverage_input_lowers_to_the_coverage_intrinsic() {
+        let mut coverage = varying("SV_Coverage", 0, 0);
+        coverage.kind = 14;
+        coverage.comp = 5;
+        coverage.row = None;
+        coverage.cols = 1;
+        let mut target = varying("SV_Target", 0, 3);
+        target.kind = 16;
+        let inputs = container::signature(&[coverage], true);
+        let outputs = container::signature(&[target], false);
+        let source = crate::dxbc::build(&[(FourCC::ISG1, &inputs), (FourCC::OSG1, &outputs)]);
+        let c = Container::parse(&source).unwrap();
+        // exp mrt0 v0, v0, v0, v0 (done); s_endpgm
+        let words = [0xF800_180Fu32, 0, 0xBF81_0000];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 1,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 1 << 14,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        };
+        let host = translate_native(&c, &native, true, None, None).unwrap();
+        let c = Container::parse(&host.dxil).unwrap();
+        let inputs = signature_part(&c, FourCC::ISG1).unwrap();
+        assert!(inputs.iter().all(|e| e.kind != 14), "{inputs:?}");
+        #[cfg(windows)]
+        if let Some(mut v) = validator::Validator::for_test() {
+            v.validate(&mut host.dxil.clone()).unwrap();
+        }
+    }
+
     #[test]
     fn oversized_mesh_keeps_only_exports_needed_by_its_pixel_shader() {
         use crate::native::{MeshIo, Usage, VsOutput};
