@@ -10,10 +10,10 @@
 //! which cannot be watched, a content hash of the whole memory at every
 //! submission that samples it.
 //!
-//! shortcut: a change detiles the whole texture, not the pages written.
+//! shortcut: a change detiles every mip covered by the upload.
 //! Only textures read through descriptor tables are brought up to date
 //! (directly indexed views are not known per draw); plane 0 is uploaded
-//! (every mip and array slice), depth and stencil planes are not.
+//! (from the first mip of a placed 2D view, otherwise every mip and array slice).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -35,13 +35,15 @@ macro_rules! once {
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
-    /// Its bytes.
-    #[cfg(feature = "diagnostics")]
+    /// Bytes in the host mapping.
     size: u64,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
+    /// First host subresource and bytes read from the title allocation.
+    first: u32,
+    tiled_bytes: usize,
     /// Mips per array slice.
     mips: u32,
     memory: *const u8,
@@ -211,7 +213,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
-    let first = list.first_use(placed as usize);
+    let first = list.use_texture(placed as usize, 0);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -314,11 +316,16 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
     unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
 }
 
-/// Records, once per list, the copy of `resource`'s staging buffer into
+/// Records the full-chain copy of `resource`'s staging buffer into
 /// its host copy, and the detiling that refreshes the staging buffer at
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+    upload_from(list, resource, texture, 0);
+}
+
+/// Uploads the levels the placed view can sample, starting at `first`.
+pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resource, first: u32) {
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -326,27 +333,31 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         .is_some_and(|set| set.contains(&(resource as usize)));
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) {
+    if host_written || list.covers_texture(resource as usize, first) {
         return;
     }
-    let Some(staging) = staging(resource, texture) else {
+    let Some(staging) = staging(resource, texture, first) else {
         return;
     };
+    if !list.use_texture(resource as usize, staging.first) {
+        return;
+    }
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {
+        let subresource = staging.first + i as u32;
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
             // SAFETY: live resources.
             let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
-            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
+            let len = staging.footprint_bytes(i) as u64;
             list.note_read(
                 || {
                     format!(
-                        "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
+                        "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {subresource} from {} levels from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
                         d.Width,
                         d.Height,
                         d.DepthOrArraySize,
@@ -369,7 +380,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             pResource: unsafe { std::mem::transmute_copy(texture) },
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: i as u32,
+                SubresourceIndex: subresource,
             },
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
@@ -401,7 +412,7 @@ impl Staging {
 
     /// Returns the bytes of title memory read.
     fn refresh_now(&self) -> usize {
-        let size = self.layout.size as usize;
+        let size = self.tiled_bytes;
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
@@ -454,6 +465,15 @@ impl Staging {
         size
     }
 
+    // D3D12 may omit the padding after the final row of the final footprint.
+    fn footprint_bytes(&self, i: usize) -> usize {
+        let fp = self.footprints[i];
+        let padded = u64::from(fp.Footprint.RowPitch)
+            * u64::from(self.rows[i])
+            * u64::from(fp.Footprint.Depth);
+        padded.min(self.size - fp.Offset) as usize
+    }
+
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         #[cfg(feature = "diagnostics")]
@@ -465,10 +485,11 @@ impl Staging {
             );
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let sub = self.first + i as u32;
+            let (mip, slice) = (sub % self.mips, sub / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
+            let len = self.footprint_bytes(i);
             // SAFETY: the subresource's part of the mapped staging buffer.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
@@ -518,10 +539,19 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 }
 
 /// The staging state of a title texture, made on first use.
-fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize)) {
+fn staging(resource: This, texture: &ID3D12Resource, requested: u32) -> Option<Arc<Staging>> {
+    let mut cache = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = cache.get_or_insert_with(HashMap::new);
+    let first_mip = |layout: &victory_formats::texture::Layout, mips| {
+        if requested < mips && layout.bytes_from(requested) < layout.size {
+            requested
+        } else {
+            0
+        }
+    };
+    if let Some(s) = map.get(&(resource as usize))
+        && s.first == first_mip(&s.layout, s.mips)
+    {
         return Some(s.clone());
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
@@ -540,11 +570,13 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    let first = first_mip(&layout, u32::from(d.MipLevels));
+    let tiled_bytes = layout.bytes_from(first) as usize;
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
         u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize)
-    };
+    } - first;
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
     let mut total = 0;
@@ -552,7 +584,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     unsafe {
         host.device.GetCopyableFootprints(
             &d,
-            0,
+            first,
             count,
             0,
             Some(footprints.as_mut_ptr()),
@@ -571,8 +603,9 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let s = Arc::new(Staging {
         buffer,
-        #[cfg(feature = "diagnostics")]
         size: total,
+        first,
+        tiled_bytes,
         data,
         footprints,
         rows,
@@ -581,7 +614,11 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         memory,
         last: Mutex::default(),
     });
-    map.insert(resource as usize, s.clone());
+    let previous = map.insert(resource as usize, s.clone());
+    drop(cache);
+    if let Some(old) = previous {
+        crate::host::retire(old);
+    }
     Some(s)
 }
 
@@ -643,7 +680,7 @@ mod tests {
         assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
     }
 
-    fn test_texture() -> (This, &'static ID3D12Resource) {
+    fn test_texture(width: u32, mips: u16) -> (This, &'static ID3D12Resource) {
         use windows::Win32::Graphics::Dxgi::Common::{
             DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
         };
@@ -656,10 +693,10 @@ mod tests {
         };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-            Width: 4,
-            Height: 4,
+            Width: u64::from(width),
+            Height: width,
             DepthOrArraySize: 1,
-            MipLevels: 1,
+            MipLevels: mips,
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
@@ -687,14 +724,81 @@ mod tests {
     }
 
     #[test]
+    fn placed_texture_upload_reads_the_resident_span_and_copies_to_the_requested_mip() {
+        let Some(host) = host() else {
+            eprintln!("skipping texture readback: no D3D12 device");
+            return;
+        };
+        let (resource, texture) = test_texture(256, 9);
+        let mut words = [0; 16];
+        words[1] = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
+        words[4] = 8;
+        words[5] = 1;
+        let view = crate::descriptor::View::Placed(false, [0; 14], words);
+        let first = crate::descriptor::host::placed_first_mip(&view);
+        assert_eq!(first, 8);
+
+        let list = host.new_list().unwrap();
+        upload_from(&list, resource, texture, first);
+        let tail = staging(resource, texture, first).unwrap();
+        assert_eq!(tail.first, 8);
+        assert_eq!(tail.footprints.len(), 1);
+        assert_eq!(tail.tiled_bytes as u64, tail.layout.bytes_from(first));
+        assert!((tail.tiled_bytes as u64) < tail.layout.size);
+        // SAFETY: our committed resource owns the full layout, including this span.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(tail.memory.cast_mut(), tail.tiled_bytes) };
+        let pixel = [0xa3, 0xb5, 0xc7, 0xd9];
+        tail.layout.tile(bytes, first, 0, &pixel, 4, 4).unwrap();
+        assert_eq!(tail.refresh_now(), tail.tiled_bytes);
+        crate::list::ensure_state(&list, resource, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        let (back, mapped) = host.readback_buffer(tail.size).unwrap();
+        let dest = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: the readback buffer lives through execution.
+            pResource: unsafe { std::mem::transmute_copy(&back) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: tail.footprints[0],
+            },
+        };
+        let src = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: the host texture lives through execution.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: first,
+            },
+        };
+        // SAFETY: both locations describe the same 1x1 mip in the copy states.
+        unsafe { list.list.CopyTextureRegion(&dest, 0, 0, 0, &src, None) };
+        // A second list requests a broader range while the tail copy is still pending.
+        let other = host.new_list().unwrap();
+        upload_from(&other, resource, texture, 2);
+        assert!(other.covers_texture(resource as usize, 2));
+        assert!(!list.covers_texture(resource as usize, 2));
+        upload_from(&list, resource, texture, 2);
+        assert!(list.covers_texture(resource as usize, 2));
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: execution waited for the readback of our one RGBA8 texel.
+        assert_eq!(unsafe { mapped.cast::<[u8; 4]>().read_unaligned() }, pixel);
+        other.close();
+        other.reset();
+        list.reset();
+        assert!(!list.covers_texture(resource as usize, first));
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(resource, 0x10);
+        assert_eq!(release(resource), 0);
+    }
+
+    #[test]
     fn forget_drops_staging_immediately_when_idle() {
         let _retire = crate::host::isolated_retire_scope();
         if host().is_none() {
             return;
         }
-        let (tex, host_tex) = test_texture();
+        let (tex, host_tex) = test_texture(4, 1);
         let weak = {
-            let s = staging(tex, host_tex).expect("staging");
+            let s = staging(tex, host_tex, 0).expect("staging");
             Arc::downgrade(&s)
         };
         assert_eq!(weak.strong_count(), 1);
@@ -710,12 +814,12 @@ mod tests {
         let Some(host) = host() else {
             return;
         };
-        let (tex, host_tex) = test_texture();
+        let (tex, host_tex) = test_texture(4, 1);
         let list = host.new_list().expect("host list");
         list.mark_work();
 
         let weak = {
-            let s = staging(tex, host_tex).expect("staging");
+            let s = staging(tex, host_tex, 0).expect("staging");
             Arc::downgrade(&s)
         };
         assert_eq!(weak.strong_count(), 1);

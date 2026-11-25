@@ -1843,6 +1843,20 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     }
 }
 
+/// First mip sampled by a shader view the title placed over a single 2D texture.
+pub(crate) fn placed_first_mip(view: &View) -> u32 {
+    let View::Placed(false, _, words) = view else {
+        return 0;
+    };
+    let desc = srv_desc(words[..10].try_into().unwrap());
+    if desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D {
+        // SAFETY: the dimension selects the Texture2D union member.
+        unsafe { desc.Anonymous.Texture2D.MostDetailedMip }
+    } else {
+        0
+    }
+}
+
 /// A shader view of a texture the title placed in memory itself, as a view
 /// of the resource made for that memory (on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
