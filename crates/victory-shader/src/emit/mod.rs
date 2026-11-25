@@ -90,6 +90,8 @@ mod lane_mask_tests;
 mod lds_tests;
 mod lower;
 #[cfg(test)]
+mod memory_tests;
+#[cfg(test)]
 mod mtbuf_tests;
 mod rect;
 #[cfg(test)]
