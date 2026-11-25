@@ -3571,10 +3571,7 @@ impl<'a> Lower<'a> {
         if buffer_view || srv.is_some() {
             // A listed structured SRV in a table is read element by element;
             // a heap view of no listed kind is read as raw bytes.
-            let stride = srv
-                .filter(|u| u.root == RootType::Table && u.stride > 4 && u.stride.is_multiple_of(4))
-                .map(|u| u.stride)
-                .or_else(|| self.bound_structured_stride(src, false, false));
+            let stride = self.scalar_srv_stride(src, srv);
             let h = match stride {
                 Some(stride) => self.handle(site, src, false, (12, stride))?,
                 None => self.handle(site, src, false, (11, 0))?,
@@ -3727,6 +3724,13 @@ impl<'a> Lower<'a> {
         matches!((first_lane_of(x), first_lane_of(y)), (Some(a), Some(b)) if a == b)
     }
 
+    /// The element stride used by scalar data loads through this SRV.
+    fn scalar_srv_stride(&self, src: &Source, srv: Option<&UsedResource>) -> Option<u32> {
+        srv.filter(|u| u.root == RootType::Table && u.stride > 4 && u.stride.is_multiple_of(4))
+            .map(|u| u.stride)
+            .or_else(|| self.bound_structured_stride(src, false, false))
+    }
+
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         if self.atomic_descriptor_loads.contains(&site) {
             return Ok(());
@@ -3801,6 +3805,19 @@ impl<'a> Lower<'a> {
                         return Err("a constant buffer's descriptor read as data");
                     }
                     (props, None)
+                }
+                Fields::Smem { .. }
+                    if un.starts_with("s_buffer_load_dword")
+                        && used.is_some_and(|u| {
+                            u.kind == ResourceType::Srv && u.root == RootType::Table
+                        }) =>
+                {
+                    // Word 2 counts elements in a structured view. Query the
+                    // same view type and stride as its scalar data load.
+                    let stride = self
+                        .scalar_srv_stride(&src, used)
+                        .ok_or("a scalar memory read as data")?;
+                    ((12, stride), None)
                 }
                 _ => return Err("a scalar memory read as data"),
             };
