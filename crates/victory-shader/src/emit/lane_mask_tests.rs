@@ -289,6 +289,28 @@ fn a_number_before_a_branch_that_writes_a_mask_is_refused() {
     assert!(e.to_string().contains("lane mask"), "{e}");
 }
 
+/// Exit mask of a loop its lanes leave at different iterations, counted
+/// after the loop: every lane is in the mask. Per lane each lane would
+/// count only its own bit (1). Issue #465.
+#[test]
+fn loop_exit_mask_counted_after_the_loop() {
+    let body = [
+        0x4A02_0081,     // v_add_nc_u32 v1, 1, v0  (lane i loops i + 1 times)
+        0xBE8A_0380,     // s_mov_b32 s10, 0
+        0x4E02_0281,     // loop: v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280,     // v_cmp_eq_u32 vcc_lo, 0, v1
+        0x880A_0A6A,     // s_or_b32 s10, vcc_lo, s10
+        0x8A7E_0A7E,     // s_andn2_b32 exec_lo, exec_lo, s10
+        0xBF89_FFFB,     // s_cbranch_execnz loop
+        0x887E_0A7E,     // s_or_b32 exec_lo, exec_lo, s10
+        0xBE89_0F0A,     // s_bcnt1_i32_b32 s9, s10
+        v_mov_b32(1, 9), // v1 = s9 (program stores v1)
+    ];
+    let words = program(&body);
+    let shader = build(&words);
+    check(&shader, &[32; LANES]);
+}
+
 /// Both arms of an if/else write s20: the wave leaves through the else
 /// arm, so on the console the lanes of the then arm read its compare
 /// (clear in them), not their own.
