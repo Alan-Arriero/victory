@@ -380,10 +380,10 @@ fn create() -> windows::core::Result<Host> {
                     chosen = Some(desc);
                 }
                 Err(e) if filter.is_some() => return Err(e),
-                Err(_) => {
+                Err(e) => {
                     tracing::warn!(
-                        "no hardware adapter reaches D3D12 feature level 12_0; \
-                         trying the system default adapter"
+                        error = %e,
+                        "hardware adapter selection failed; trying the system default adapter"
                     );
                     D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
                 }
