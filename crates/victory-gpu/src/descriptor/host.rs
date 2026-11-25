@@ -2222,8 +2222,8 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         // shortcut: the title's null SRV at heap slot 0 is one of these
         // (resource 0 with a texture desc). Slot 0 is also read as a CBV
         // through a computed heap index; a single host descriptor cannot be
-        // both an SRV and a CBV, so translated shaders skip CBV loads at
-        // index 0 instead of asking for a null CBV here (#485).
+        // both an SRV and a CBV, so the translator skips heap-direct CBV
+        // loads at index 0 rather than asking for a null CBV here (#485).
         View::Shader(_, Some(desc)) => return null_like(desc, at),
         View::Placed(false, _, desc) => {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);

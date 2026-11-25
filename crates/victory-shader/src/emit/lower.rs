@@ -3743,12 +3743,15 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let h = self.handle(site, src, false, (13, 0x1_0000))?;
-        // A CBV handle over the title's null SRV at heap slot 0 removes the
-        // device on WARP (#485). On the console a constant-buffer read
-        // through a null descriptor returns zeros; skip the load when a
-        // heap-direct index is 0. Slot 0 is also read as an SRV, so the host
-        // cannot put a null CBV there instead.
-        let live = if self.is_heap_direct(src) {
+        // shortcut: untyped heap-direct scalar CBV loads skip index 0. This
+        // title parks a null *texture* SRV at heap slot 0 that shaders also
+        // sample as an SRV; a single host descriptor cannot be both kinds,
+        // and a raw-buffer handle would still mismatch that texture null
+        // (#485). On the console a CBV read through that null returns zeros.
+        // Listed ResourceHeap CBVs (used-resource metadata) keep a live load
+        // at index 0. Table CBVs and heap slots that vector buffer loads
+        // already classify as SRVs are unchanged (paths above).
+        let live = if kind.is_none() && self.is_heap_direct(src) {
             let index = self
                 .uniform_heap_index(src, false)
                 .or_else(|_| self.lane_heap_index(src, false))?;
@@ -9979,8 +9982,8 @@ mod tests {
         // load must not read it through a constant buffer handle (a
         // descriptor of the wrong type). A store makes it a UAV, which a
         // read-only view would not match either: that case is unchanged.
-        // Heap-direct scalar loads alone still use a CBV handle, but skip
-        // the load when the index is 0 (the title's null SRV; #485).
+        // Heap-direct scalar loads alone still use a CBV handle; index 0 is
+        // skipped (shortcut: this title's dual-read null texture SRV; #485).
         #[derive(Clone, Copy)]
         enum Also {
             Nothing,
@@ -10034,10 +10037,28 @@ mod tests {
         assert_eq!(cbuffers(Also::Nothing), 1, "no other use: a CBV");
         assert_eq!(cbuffers(Also::Load), 0, "buffer_load: an SRV");
         assert_eq!(cbuffers(Also::Store), 1, "buffer_store: unchanged");
-        // The null-slot guard (#485) must not refuse the heap-direct CBV path.
+        // Untyped heap-direct (#485 null-slot skip) must still lower.
         assert!(
             lower_with(&program(Also::Nothing), layout(), vec![]).is_ok(),
-            "heap-direct scalar CBV with null-slot guard"
+            "heap-direct scalar CBV with null-slot skip"
+        );
+        // A listed ResourceHeap CBV keeps a live load at index 0 (no skip).
+        let listed = vec![UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::ResourceHeap,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 0,
+            user_data: 0,
+            slot: 0,
+        }];
+        assert_eq!(
+            lower_with(&program(Also::Nothing), layout(), listed)
+                .unwrap()
+                .cbuffer_handles,
+            1,
+            "listed ResourceHeap CBV at slot 0 stays a CBV"
         );
     }
 
