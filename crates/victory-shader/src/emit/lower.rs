@@ -1362,6 +1362,15 @@ impl<'a> Lower<'a> {
                     &[],
                 ));
             }
+            // M0 for `v_interp`, which takes the primitive's parameters from
+            // the signature here, so no lowering reads the value. A phi can
+            // still join it with the register's reuse on another path and
+            // needs a value then.
+            Input::PrimMask => return Val::I32(self.s.m.i32(0)),
+            // shortcut: bit 31 clear says the wave overlaps no earlier one,
+            // so a POPS program skips its own wait (see `pops`) and its UAV
+            // accesses are not ordered between overlapping pixels.
+            Input::CollisionWaveId => return Val::I32(self.s.m.i32(0)),
             _ => return Val::Missing("a pixel system input"),
         };
         let free = self
@@ -1639,12 +1648,21 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            // `src_pops_exiting_wave_id`: only compared with the fields of
+            // the collision wave id, which reads as overlapping no wave.
+            Operand::Const(239) if self.pops() => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
             Operand::Literal(x) => Ok(self.s.m.i32(x)),
             Operand::Attr { .. } => Err("an attribute operand"),
         }
+    }
+
+    /// Whether this is a pixel program that loads the POPS collision wave id.
+    fn pops(&self) -> bool {
+        matches!(&self.x.native.io, StageIo::Ps { rsrc2, .. }
+            if rsrc2.collision_wave_id_sgpr().is_some())
     }
 
     /// GFX10 puts an inline f16 constant in the low half of the operand.
@@ -9517,6 +9535,7 @@ mod tests {
             io: StageIo::Ps {
                 inputs: vec![],
                 input_addr,
+                rsrc2: Default::default(),
                 db_shader_control: 0,
                 patches: vec![],
             },
@@ -9638,6 +9657,7 @@ mod tests {
             io: StageIo::Ps {
                 inputs: vec![],
                 input_addr: 0,
+                rsrc2: Default::default(),
                 db_shader_control: 0,
                 patches: vec![],
             },
