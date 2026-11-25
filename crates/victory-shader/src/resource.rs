@@ -123,6 +123,25 @@ pub struct Resources {
     /// dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
     pub waterfall: Waterfall,
+    /// Every `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`: where
+    /// its nodes are.
+    pub bvh: Vec<(Site, BvhNodes)>,
+}
+
+/// Where a ray-tracing node test ([`crate::bvh`]) reads its nodes. Its
+/// descriptor operand names a range of memory, not a texture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BvhNodes {
+    /// A buffer of the host: the descriptor is loaded from a table (it is
+    /// among [`Resources::descriptors`]), and node pointers count from the
+    /// buffer's start. Its flags are not known to the shader: boxes are
+    /// sorted and triangles return barycentrics, as every descriptor
+    /// the title builds asks.
+    Resource,
+    /// Title memory by address: the code makes the descriptor from numbers
+    /// (the title: the whole address space, or one structure's address in
+    /// dword 0). Dwords 1 and 3, which hold its flags.
+    Memory { word1: u32, word3: u32 },
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -211,6 +230,32 @@ pub fn track(
                 Ok(())
             };
             match &inst.fields {
+                Fields::Image { rsrc, .. } if inst.name().starts_with("image_bvh") => {
+                    // The ray and node test names no texture. A descriptor
+                    // whose flag dwords the code sets as numbers and whose
+                    // type is a ray-tracing structure is a range of title
+                    // memory (the title: all of it, or from one structure's
+                    // address on), and the node's address is among the
+                    // operands; any other descriptor must be a resource of
+                    // the host.
+                    let word = |k: u8| match *rsrc {
+                        Operand::Scalar { code, dwords } if k < dwords => {
+                            inst.read(Reg::S(code + k)).map(|v| t.origin(v))
+                        }
+                        _ => None,
+                    };
+                    match (word(1), word(3)) {
+                        (Some(Term::Const(word1)), Some(Term::Const(word3)))
+                            if word3 >> 28 == crate::bvh::DESCRIPTOR_TYPE =>
+                        {
+                            out.bvh.push((site, BvhNodes::Memory { word1, word3 }));
+                        }
+                        _ => {
+                            descriptor(rsrc, Role::Resource)?;
+                            out.bvh.push((site, BvhNodes::Resource));
+                        }
+                    }
+                }
                 Fields::Image { rsrc, sampler, .. } => {
                     descriptor(rsrc, Role::Resource)?;
                     if let Some(s) = sampler {

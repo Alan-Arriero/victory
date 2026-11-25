@@ -83,6 +83,8 @@ mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
+mod intersect_tests;
+#[cfg(all(test, windows))]
 mod lane_mask_tests;
 #[cfg(test)]
 mod lds_tests;
@@ -111,7 +113,10 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{
+    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY,
+    USER_DATA_SPACE, USER_MEMORY_BASE,
+};
 
 /// Resource heap indices at or past this go to slot 0 in translated
 /// shaders (a negative or garbage index must not reach past the heap's

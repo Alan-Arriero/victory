@@ -20,6 +20,11 @@ use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usa
 use crate::resource::{Address, CODE, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
+/// The ray-tracing node test (`image_bvh_intersect_ray`), a child module so
+/// its arithmetic sits apart from the general emitter.
+#[path = "intersect.rs"]
+pub(super) mod intersect;
+
 type Why = &'static str;
 
 #[derive(Debug, Clone, Copy)]
@@ -1476,6 +1481,49 @@ impl<'a> Lower<'a> {
                 dword,
             },
         );
+        Val::I32(self.user_at(index))
+    }
+
+    /// A user-data dword no register of the console's holds: one the host
+    /// computes when it binds (`root` says what, an `Other` code of
+    /// `shader.rs`), placed after the layout's own dwords.
+    fn host_word(&mut self, root: RootType, slot: u8, dword: u32) -> V {
+        let known = self
+            .user_reads
+            .values()
+            .find(|u| u.root == root && u.slot == slot && u.dword == dword)
+            .map(|u| u.index);
+        let index = match known {
+            Some(index) => index,
+            None => {
+                let mut index = self
+                    .x
+                    .native
+                    .layout
+                    .iter()
+                    .map(|e| u32::from(e.user_data) + e.sgprs)
+                    .max()
+                    .unwrap_or(0);
+                while self.user_reads.contains_key(&index) {
+                    index += 1;
+                }
+                self.user_reads.insert(
+                    index,
+                    UserData {
+                        index,
+                        slot,
+                        root,
+                        dword,
+                    },
+                );
+                index
+            }
+        };
+        self.user_at(index)
+    }
+
+    /// User-data dword `index`, loaded in the entry block.
+    fn user_at(&mut self, index: u32) -> V {
         self.s.user_data = self.s.user_data.max(index + 1);
         let h = match self.user_data {
             Some(h) => h,
@@ -1495,7 +1543,112 @@ impl<'a> Lower<'a> {
             59,
             &[h, row],
         );
-        Val::I32(self.s.m.extract(entry, r, index % 4))
+        self.s.m.extract(entry, r, index % 4)
+    }
+
+    /// `lo`, `hi` plus the instruction's byte offset `off`, with the carry.
+    fn address_plus(&mut self, lo: V, hi: V, off: i32) -> (V, V) {
+        if off == 0 {
+            return (lo, hi);
+        }
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let k = self.s.m.i32(off as u32);
+        let sum = self.s.m.bin(c, Bin::Add, lo, k);
+        // Up: a carry when the sum wrapped below `lo`. Down: a borrow when
+        // it wrapped above.
+        let wrapped = self
+            .s
+            .m
+            .cmp(c, if off > 0 { pred::IULT } else { pred::IUGT }, sum, lo);
+        let one = self.s.m.cast(c, Cast::ZExt, wrapped, i32t);
+        let hi = self
+            .s
+            .m
+            .bin(c, if off > 0 { Bin::Add } else { Bin::Sub }, hi, one);
+        (sum, hi)
+    }
+
+    /// Title memory at the 40-bit address `lo`, `hi` (`shader.rs`
+    /// `SLOT_MEMORY`): the handle of the raw view of the host copy holding
+    /// it and the byte in that view. A page without a copy reads zeros
+    /// (and drops writes) through the null view at the first slot, and its
+    /// number is left for the host, for lanes that run (`guard`).
+    fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
+        use super::shader::{
+            MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE,
+        };
+        let c = self.cur;
+        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (k16, k8) = (k(self, 16), k(self, 0xFF));
+        let low = self.s.m.bin(c, Bin::LShr, lo, k16);
+        let high = self.s.m.bin(c, Bin::And, hi, k8);
+        let high = self.s.m.bin(c, Bin::Shl, high, k16);
+        let page = self.s.m.bin(c, Bin::Or, low, high);
+        // Inside the directory whatever the address (lanes that do not run
+        // compute one too); its last entry is never filled.
+        let last = k(self, MEMORY_PAGES - 1);
+        let page = self
+            .s
+            .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[page, last]);
+        let k3 = k(self, 3);
+        let at = self.s.m.bin(c, Bin::Shl, page, k3);
+        let directory = self.s.root_srv_handle(SLOT_MEMORY);
+        let (iu, both, align) = (self.s.m.undef(i32t), self.s.m.i8(3), k(self, 4));
+        let entry = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            res,
+            139,
+            &[directory, at, iu, both, align],
+        );
+        let (copy, start) = (self.s.m.extract(c, entry, 0), self.s.m.extract(c, entry, 1));
+        let (copy, start) = (self.as_int(copy), self.as_int(start));
+        // A page without a copy: its number, at a place by the number, or
+        // at the sink for lanes that do not run and pages that have one.
+        let zero = k(self, 0);
+        let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
+        if let Some(g) = guard {
+            missing = self.s.m.bin(c, Bin::And, missing, g);
+        }
+        let places = k(self, MEMORY_FAULTS - 1);
+        let place = self.s.m.bin(c, Bin::URem, page, places);
+        let one = k(self, 1);
+        let place = self.s.m.bin(c, Bin::Add, place, one);
+        let k2 = k(self, 2);
+        let place = self.s.m.bin(c, Bin::Shl, place, k2);
+        let place = self.s.m.select(c, missing, place, zero);
+        let faults = self.s.root_uav_handle(SLOT_FAULTS);
+        let void = self.s.t.void;
+        let mask = self.s.m.i8(1);
+        self.s.op(
+            c,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            void,
+            140,
+            &[faults, place, iu, page, iu, iu, iu, mask, align],
+        );
+        let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
+        let slot = self.s.m.bin(c, Bin::Add, base, copy);
+        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
+        let k64k = k(self, 0xFFFF);
+        let within = self.s.m.bin(c, Bin::And, lo, k64k);
+        let byte = self.s.m.bin(c, Bin::Add, start, within);
+        (h, byte)
+    }
+
+    /// Whether an f32 value is NaN, tested in integer arithmetic so host
+    /// drivers (such as NVIDIA) do not fold `fcmp uno` away under fast-math.
+    fn is_nan_f32(&mut self, f: V) -> V {
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let mask = self.s.m.i32(0x7FFF_FFFF);
+        let abs = self.s.m.bin(c, Bin::And, bits, mask);
+        let inf = self.s.m.i32(0x7F80_0000);
+        self.s.m.cmp(c, pred::IUGT, abs, inf)
     }
 
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
@@ -2914,6 +3067,12 @@ impl<'a> Lower<'a> {
             Fields::Valu(_) if name.starts_with("v_interp_") => self.interp(inst, (b, i)),
             Fields::Valu(_) => self.valu(inst, b, i),
             Fields::Vintrp { .. } => self.interp(inst, (b, i)),
+            // The ray and node test. A failure is a refusal at once: an
+            // instruction without a side effect otherwise only stops the
+            // program where its results are needed.
+            Fields::Image { .. } if name.starts_with("image_bvh") => {
+                return self.bvh(inst, b, i).map_err(|why| unsupported(offset, why));
+            }
             Fields::Image { .. } => self.image(inst, b, i),
             Fields::Buffer { .. } => self.buffer(inst, b, i),
             Fields::Exp { .. } => self.export(b, i),
@@ -3769,6 +3928,8 @@ impl<'a> Lower<'a> {
                 || used.is_some_and(|u| u.kind == ResourceType::Uav);
             let u = if uav { 0x1000 } else { 0 };
             let (props, image) = match &ui.fields {
+                // A ray-tracing structure in a buffer of the host: read raw.
+                Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
                 Fields::Image { dim, .. } => {
                     let kind = match dim {
                         0 => 1,

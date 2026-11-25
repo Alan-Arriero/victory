@@ -14,6 +14,33 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
 
+/// Title memory by address: console code reads and writes through raw 40-bit
+/// addresses it takes from root constants, descriptors and other memory (the
+/// ray-tracing structure builder and the programs that walk its structures).
+/// The host keeps copies of the title memory shaders use; a shader with such
+/// an access finds the copy by the address:
+///
+/// - the root SRV `t<SLOT_MEMORY>` in [`ROOT_CBV_SPACE`] is a directory of
+///   [`MEMORY_PAGES`] entries of two dwords, one per 64 KiB of title
+///   address space: the number of the host copy holding that page (0: none
+///   yet) and the page's byte offset in that copy;
+/// - copy `n` is the raw buffer view at view-heap slot `base + n`, `base`
+///   the user-data dword of kind [`USER_MEMORY_BASE`]; slot `base` itself
+///   reads zeros and drops writes;
+/// - the root UAV `u<SLOT_FAULTS>` takes the page numbers of accesses that
+///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 a sink), which the
+///   host reads afterwards to make those copies for the frames to come.
+pub const SLOT_MEMORY: u8 = 254;
+/// See [`SLOT_MEMORY`].
+pub const SLOT_FAULTS: u8 = 253;
+/// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
+pub const MEMORY_PAGES: u32 = 1 << 21;
+/// Dwords of the [`SLOT_FAULTS`] buffer.
+pub const MEMORY_FAULTS: u32 = 4096;
+/// `RootType::Other` code of a user-data dword the host computes: the view
+/// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
+pub const USER_MEMORY_BASE: u32 = 0x100;
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
