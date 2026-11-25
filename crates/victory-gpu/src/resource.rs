@@ -1000,8 +1000,10 @@ fn host_texture(
         let mut trial = d;
         trial.flags = flags;
         let initial = crate::host::legal_for(flags, wanted);
-        // A clear value is only legal on render targets and depth.
-        let try_clear = clear_value.filter(|_| keep_clear && flags & (RENDER_TARGET | DEPTH) != 0);
+        // A clear value is only legal on render targets and depth
+        // (VIC-BT-022): a non-null pOptimizedClearValue with neither flag
+        // is E_INVALIDARG on PC D3D12.
+        let try_clear = optimized_clear(flags, keep_clear, clear_value);
         // Permissions that leave the description unchanged are not asked twice.
         if tried.contains(&(flags, initial, try_clear)) {
             continue;
@@ -1075,19 +1077,31 @@ fn host_texture(
     Some((texture, initial))
 }
 
+/// PC D3D12 accepts `pOptimizedClearValue` only when the resource may be a
+/// render target or a depth stencil. Passing a non-null clear with neither
+/// flag (or for a buffer) fails with `E_INVALIDARG`; console titles can
+/// still name a clear on resources whose host flags lose those bits.
+#[cfg(any(windows, test))]
+fn optimized_clear(flags: u32, keep: bool, clear: Option<[u32; 5]>) -> Option<[u32; 5]> {
+    const RENDER_TARGET: u32 = 1;
+    const DEPTH: u32 = 2;
+    clear.filter(|_| keep && flags & (RENDER_TARGET | DEPTH) != 0)
+}
+
 /// The (flags, state, whether the clear value is kept) triples to try for a
 /// host texture, most faithful first: what the title asked for, then in the
 /// common state, then without the clear value, then without the permissions
 /// the host may refuse. A texture the host cannot make as asked still exists
 /// for the draws that read it; the log names what was lost. Nothing is
-/// tried twice, permissions only go down, and a depth target keeps its
-/// depth permission.
+/// tried twice, permissions only go down, a depth target keeps its depth
+/// permission, and `keep_clear` is false when the flags cannot take a clear.
 #[cfg(any(windows, test))]
 fn attempts(flags: u32, state: u32) -> Vec<(u32, u32, bool)> {
     const UNORDERED: u32 = 4;
     const RENDER_TARGET: u32 = 1;
+    const DEPTH: u32 = 2;
     let mut out: Vec<(u32, u32, bool)> = Vec::with_capacity(7);
-    for triple in [
+    for (f, s, keep) in [
         (flags, state, true),
         (flags, 0, true),
         (flags, state, false),
@@ -1096,6 +1110,8 @@ fn attempts(flags: u32, state: u32) -> Vec<(u32, u32, bool)> {
         (flags & !UNORDERED, 0, false),
         (flags & !UNORDERED & !RENDER_TARGET, 0, false),
     ] {
+        // Never advertise a clear the host would refuse (VIC-BT-022).
+        let triple = (f, s, keep && f & (RENDER_TARGET | DEPTH) != 0);
         if !out.contains(&triple) {
             out.push(triple);
         }
@@ -1764,7 +1780,8 @@ mod tests {
 
     #[test]
     fn nothing_is_tried_twice() {
-        assert_eq!(attempts(0, 0), [(0, 0, true), (0, 0, false)]);
+        // Flags with neither RT nor DS never keep a clear (VIC-BT-022).
+        assert_eq!(attempts(0, 0), [(0, 0, false)]);
         for flags in 0..16 {
             for state in [0, 4, 0x10] {
                 let tries = attempts(flags, state);
@@ -1779,6 +1796,34 @@ mod tests {
     fn a_depth_target_keeps_its_depth_permission() {
         for flags in [2, 3, 6, 7, 10] {
             assert!(attempts(flags, 0x10).iter().all(|&(f, _, _)| f & 2 != 0));
+        }
+    }
+
+    /// VIC-BT-022: PC CreateCommittedResource rejects a non-null optimized
+    /// clear unless ALLOW_RENDER_TARGET or ALLOW_DEPTH_STENCIL is set.
+    #[test]
+    fn optimized_clear_needs_render_target_or_depth() {
+        let clear = Some([28u32, 0, 0, 0, 0]); // DXGI_FORMAT_R8G8B8A8_UNORM
+        assert!(optimized_clear(0, true, clear).is_none());
+        assert!(optimized_clear(4, true, clear).is_none()); // UAV only
+        assert!(optimized_clear(8, true, clear).is_none()); // deny shader
+        assert!(optimized_clear(1, true, clear).is_some()); // RT
+        assert!(optimized_clear(2, true, clear).is_some()); // depth
+        assert!(optimized_clear(3, true, clear).is_some()); // RT|depth
+        assert!(optimized_clear(5, true, clear).is_some()); // RT|UAV
+        assert!(optimized_clear(1, false, clear).is_none());
+        assert!(optimized_clear(1, true, None).is_none());
+        // Ladder steps without RT/DS must not advertise a kept clear.
+        for &(f, _, keep) in &attempts(4, 0) {
+            assert!(
+                !keep || f & 3 != 0,
+                "UAV-only ladder kept clear at flags {f:#x}"
+            );
+            assert!(optimized_clear(f, keep, clear).is_none() || f & 3 != 0);
+        }
+        for &(f, _, keep) in &attempts(0, 4) {
+            assert!(!keep);
+            assert!(optimized_clear(f, keep, clear).is_none());
         }
     }
 
