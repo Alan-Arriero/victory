@@ -690,8 +690,7 @@ mod tests {
         type Unregister = extern "system" fn(This, *const c_void, u64, bool) -> bool;
         let unregister = method::<Unregister>(&OBJECT, 0x50);
         assert_eq!(
-            unregister as *const () as usize,
-            unregister_progress as *const () as usize,
+            unregister as *const () as usize, unregister_progress as *const () as usize,
             "slot 0x50 must be unregister_progress, not missing::<10>"
         );
         assert_ne!(
