@@ -1817,6 +1817,36 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// `fma(a, b, c)` in binary32 with a round-to-odd sticky bit when the
+    /// fused result is not exact, so a following nearest-even narrow to
+    /// binary16 matches a single round of the exact `a*b + c` (RDNA2
+    /// `v_fma_mixlo_f16` / `v_fma_mixhi_f16`). Without this, an exact value
+    /// just above a half-ulp midpoint can round to the midpoint in f32 and
+    /// then tie-to-even the wrong way in f16.
+    fn fmad_round_to_odd(&mut self, a: V, b: V, c: V) -> V {
+        let cur = self.cur;
+        let r = self.fmad(a, b, c);
+        // Residual of the f32 FMA: nonzero ⇒ the exact value was not `r`.
+        let z = self.s.m.f32(0x8000_0000);
+        let neg_r = self.s.m.bin(cur, Bin::Sub, z, r);
+        let err = self.fmad(a, b, neg_r);
+        let err = self.s.m.bin(cur, Bin::Add, err, c);
+        let bits = self.as_int(r);
+        let err_bits = self.as_int(err);
+        let abs_mask = self.s.m.i32(0x7FFF_FFFF);
+        let abs = self.s.m.bin(cur, Bin::And, bits, abs_mask);
+        let err_abs = self.s.m.bin(cur, Bin::And, err_bits, abs_mask);
+        let zero = self.s.m.i32(0);
+        let sticky = self.s.m.cmp(cur, pred::NE, err_abs, zero);
+        let inf = self.s.m.i32(0x7F80_0000);
+        let finite = self.s.m.cmp(cur, pred::IULT, abs, inf);
+        let adjust = self.s.m.bin(cur, Bin::And, sticky, finite);
+        let one = self.s.m.i32(1);
+        let odd = self.s.m.bin(cur, Bin::Or, bits, one);
+        let out = self.s.m.select(cur, adjust, odd, bits);
+        self.as_float(out)
+    }
+
     /// `f` as an f16 in the low bits, rounded to nearest even as the
     /// console does (MODE's default): a tie goes to the even half, a finite
     /// value from 65520 up becomes infinity, results below 2^-14 stay
@@ -5457,10 +5487,12 @@ impl<'a> Lower<'a> {
                     }
                     xs.push(x);
                 }
-                let mut r = self.fmad(xs[0], xs[1], xs[2]);
                 if name == "v_fma_mix_f32" {
+                    let r = self.fmad(xs[0], xs[1], xs[2]);
                     return float(self, r);
                 }
+                // Single-round to f16: round-to-odd in f32, then nearest-even.
+                let mut r = self.fmad_round_to_odd(xs[0], xs[1], xs[2]);
                 if v.clamp {
                     r = self.unary(7, r);
                 }
@@ -11176,6 +11208,134 @@ mod tests {
         })
         .expect("degenerate Branch arms must lower without PHI/edge map errors");
         assert!(!lowered.dxil.is_empty());
+    }
+
+    /// Binary32 FMA with a round-to-odd sticky bit when the fused result is
+    /// not exact — the same sequence `fmad_round_to_odd` emits in IR.
+    fn f32_fma_round_to_odd(a: f32, b: f32, c: f32) -> f32 {
+        let r = a.mul_add(b, c);
+        let err = a.mul_add(b, -r) + c;
+        let mut bits = r.to_bits();
+        let sticky = err.to_bits() & 0x7FFF_FFFF != 0;
+        if sticky && bits & 0x7FFF_FFFF < 0x7F80_0000 {
+            bits |= 1;
+        }
+        f32::from_bits(bits)
+    }
+
+    /// Nearest-even binary16 of an f64, by search over the half values so it
+    /// does not share the lowering's bit arithmetic.
+    fn f16_nearest_f64(x: f64) -> u16 {
+        if x.is_nan() {
+            return 0x7E00;
+        }
+        let sign = if x.is_sign_negative() { 0x8000 } else { 0 };
+        let a = x.abs();
+        if a >= 65520.0 {
+            return sign | 0x7C00;
+        }
+        let f16_to_f64 = |h: u16| -> f64 {
+            let exp = (h >> 10) & 0x1F;
+            let mant = h & 0x3FF;
+            match exp {
+                0 => {
+                    if mant == 0 {
+                        0.0
+                    } else {
+                        (mant as f64) * f64::from(2f32.powi(-24))
+                    }
+                }
+                31 => f64::INFINITY,
+                e => (1.0 + (mant as f64) / 1024.0) * 2f64.powi(e as i32 - 15),
+            }
+        };
+        let (mut lo, mut hi) = (0u16, 0x7BFF);
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if f16_to_f64(mid) <= a {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let below = f16_to_f64(lo);
+        let above = if lo == 0x7BFF {
+            65536.0
+        } else {
+            f16_to_f64(lo + 1)
+        };
+        let pick = if a - below < above - a || (a - below == above - a && lo % 2 == 0) {
+            lo
+        } else {
+            lo + 1
+        };
+        sign | pick
+    }
+
+    /// Single-round `a*b + c` to binary16 (f64 FMA is exact enough here:
+    /// every finite f32 product fits in f64, and the addend is f32).
+    fn fma_f16_single_round(a: f32, b: f32, c: f32) -> u16 {
+        let exact = f64::from(a).mul_add(f64::from(b), f64::from(c));
+        f16_nearest_f64(exact)
+    }
+
+    /// Nearest-even binary16 of an f32 (via f64, which is exact for f32).
+    fn f16_nearest_f32(x: f32) -> u16 {
+        f16_nearest_f64(f64::from(x))
+    }
+
+    #[test]
+    fn fma_mix_f16_round_to_odd_matches_single_round() {
+        // Midpoint ties where f32 FMA alone then f16 RNE double-rounds the
+        // wrong way (VIC-BT-041): exact is just above 1 + 2^-11.
+        let mid_cases = [
+            (1.0f32, 1.0f32, f32::from_bits(0x3A00_0001)),
+            (1.0, 1.0, 2.0f32.powi(-11) + 2.0f32.powi(-30)),
+            (-1.0, 1.0, -(2.0f32.powi(-11) + 2.0f32.powi(-30))),
+            (2.0, 0.5, f32::from_bits(0x3A00_0001)),
+        ];
+        for (a, b, c) in mid_cases {
+            let want = fma_f16_single_round(a, b, c);
+            let got = f16_nearest_f32(f32_fma_round_to_odd(a, b, c));
+            let double = f16_nearest_f32(a.mul_add(b, c));
+            assert_ne!(
+                double, want,
+                "case should exercise double-rounding: {a:?}*{b:?}+{c:?}"
+            );
+            assert_eq!(
+                got, want,
+                "RTO path {a:?}*{b:?}+{c:?} = {got:#06x}, want {want:#06x} (double-round {double:#06x})"
+            );
+        }
+        // Exact and ordinary results still match single-round.
+        let ordinary = [
+            (2.0f32, 3.0f32, 1.0f32),
+            (1.0, 1.0, 1.0),
+            (0.0, 5.0, 1.5),
+            (-2.0, 3.0, 0.25),
+            (1.0, 1.0, 0.0),
+        ];
+        for (a, b, c) in ordinary {
+            let want = fma_f16_single_round(a, b, c);
+            let got = f16_nearest_f32(f32_fma_round_to_odd(a, b, c));
+            assert_eq!(got, want, "ordinary {a:?}*{b:?}+{c:?}");
+        }
+    }
+
+    #[test]
+    fn fma_mix_f16_lowers() {
+        // VOP3P v_fma_mixlo_f16 / v_fma_mixhi_f16 v0, v1, v2, v3 (all f32).
+        let src0 = 256 + 1u32;
+        let src1 = 256 + 2u32;
+        let src2 = 256 + 3u32;
+        for op in [0x021u32, 0x022] {
+            let words = [
+                0x33 << 26 | (op << 16),
+                src0 | (src1 << 9) | (src2 << 18),
+                S_ENDPGM,
+            ];
+            lowers(&words, 0).unwrap_or_else(|e| panic!("op {op:#x}: {e}"));
+        }
     }
 }
 
