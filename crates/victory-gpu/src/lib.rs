@@ -45,6 +45,7 @@ mod hlsl;
 mod host;
 #[cfg(windows)]
 mod indirect;
+mod indirect_budget;
 pub mod list;
 pub mod object;
 pub mod pipeline;
