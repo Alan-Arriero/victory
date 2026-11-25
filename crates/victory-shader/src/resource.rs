@@ -240,6 +240,7 @@ pub fn track(
                 } if !inst.name().starts_with("s_buffer_")
                     && (inst.name().contains("_load_") || inst.name().contains("_store_")) =>
                 {
+                    t.clamped.set(false);
                     let address = match t.smem_address(inst, base, *offset, soffset) {
                         Ok(a) => a,
                         Err("an address read from the first lane of a per-lane value") => {
@@ -261,6 +262,7 @@ pub fn track(
                     offset,
                     ..
                 } if inst.name().starts_with("global_") => {
+                    t.clamped.set(false);
                     let address = t
                         .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
                         .or_else(|why| t.by_address(why))
@@ -531,6 +533,10 @@ struct Tracer<'a> {
     rpo: Vec<usize>,
     /// Memo of [`Tracer::uniform`] per value.
     uniform_memo: std::cell::RefCell<Vec<Option<bool>>>,
+    /// A clamped VALU addition was met while tracing the current address:
+    /// its result saturates, so the sum must not be folded (and a non-root
+    /// address is not taken as title memory either).
+    clamped: std::cell::Cell<bool>,
 }
 
 /// VALU operations whose result is uniform when their operands are: the
@@ -649,6 +655,7 @@ impl<'a> Tracer<'a> {
             lanes,
             rpo,
             uniform_memo: std::cell::RefCell::new(vec![None; n]),
+            clamped: std::cell::Cell::new(false),
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -1072,7 +1079,7 @@ impl<'a> Tracer<'a> {
         if inst.write(Reg::V(reg)) != Some(v)
             || f.abs != 0
             || f.neg != 0
-            || f.clamp
+            || f.clamp && { self.clamped.set(true); true }
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -1106,7 +1113,7 @@ impl<'a> Tracer<'a> {
             || inst.write(Reg::V(reg)) != Some(v)
             || f.abs != 0
             || f.neg != 0
-            || f.clamp
+            || f.clamp && { self.clamped.set(true); true }
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -1151,7 +1158,7 @@ impl<'a> Tracer<'a> {
             || inst.write(Reg::V(reg)) != Some(v)
             || f.abs != 0
             || f.neg != 0
-            || f.clamp
+            || f.clamp && { self.clamped.set(true); true }
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -1186,7 +1193,7 @@ impl<'a> Tracer<'a> {
             })) != Some(v)
             || f.abs != 0
             || f.neg != 0
-            || f.clamp
+            || f.clamp && { self.clamped.set(true); true }
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -1333,6 +1340,9 @@ impl<'a> Tracer<'a> {
     /// says how it failed): title memory at the address as it stands, in a
     /// compute program.
     fn by_address(&self, why: &'static str) -> Result<Address, &'static str> {
+        if self.clamped.get() {
+            return Err(why);
+        }
         if self.stage == HwStage::Cs && RAW.contains(&why) {
             Ok(Address {
                 param: MEMORY,

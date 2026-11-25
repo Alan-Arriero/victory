@@ -11885,6 +11885,7 @@ mod tests {
                 input_addr: 0,
                 db_shader_control: 0,
                 patches: vec![],
+                rsrc2: Default::default(),
             },
             code,
         };

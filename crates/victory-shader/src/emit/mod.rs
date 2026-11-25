@@ -91,6 +91,7 @@ mod half_src_tests;
 pub mod host;
 #[cfg(all(test, windows))]
 mod image_tests;
+#[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(test, windows))]
 mod lane_mask_tests;
