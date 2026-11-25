@@ -9611,8 +9611,9 @@ mod tests {
             ]);
             lowers_lds(&words).unwrap();
         };
+        // VOP2-as-VOP3: opcode + 0x100 (bare 0x025 is VOPC v_cmp_lg_f64).
         // v_add_nc_u32 / v_sub_nc_u32 / v_subrev_nc_u32 with clamp.
-        for op in [0x025u16, 0x026, 0x027] {
+        for op in [0x125u16, 0x126, 0x127] {
             store([0x35 << 26 | (op as u32) << 16 | 1 << 15, v1 | v2 << 9]);
         }
         // v_add_co_u32 / v_sub_co_u32 / v_subrev_co_u32 with clamp (carry → s16).

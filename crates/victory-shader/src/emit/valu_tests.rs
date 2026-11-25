@@ -1657,10 +1657,11 @@ fn v_mad_f32_flushes_subnormals_around_omod() {
 /// (VIC-BT-010). Without the fix these refuse to lower, or wrap.
 #[test]
 fn integer_vop3_clamp_saturates_add_and_sub() {
+    // VOP2 ops in VOP3 encoding use opcode + 0x100 (0x025 alone is VOPC).
     // v_add_nc_u32 / v_sub_nc_u32 / v_subrev_nc_u32 with clamp.
-    let add_nc = build_valu_cs(&vop3_clamp(0x025, 0, vgpr(1), vgpr(2), 0));
-    let sub_nc = build_valu_cs(&vop3_clamp(0x026, 0, vgpr(1), vgpr(2), 0));
-    let subrev_nc = build_valu_cs(&vop3_clamp(0x027, 0, vgpr(1), vgpr(2), 0));
+    let add_nc = build_valu_cs(&vop3_clamp(0x125, 0, vgpr(1), vgpr(2), 0));
+    let sub_nc = build_valu_cs(&vop3_clamp(0x126, 0, vgpr(1), vgpr(2), 0));
+    let subrev_nc = build_valu_cs(&vop3_clamp(0x127, 0, vgpr(1), vgpr(2), 0));
     // v_add_co_u32 / v_sub_co_u32 with clamp (carry → s16, unused).
     let add_co = build_valu_cs(&vop3b_clamp(0x30f, 0, 16, vgpr(1), vgpr(2), 0));
     let sub_co = build_valu_cs(&vop3b_clamp(0x310, 0, 16, vgpr(1), vgpr(2), 0));
