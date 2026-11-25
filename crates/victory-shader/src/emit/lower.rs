@@ -2017,6 +2017,34 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, z, zero, m)
     }
 
+    /// Flush an f32 subnormal to a signed zero (sign bit kept). Zeros, normals,
+    /// infinities and NaNs pass through. Used for `v_mad_f32` / `v_mac_f32`,
+    /// which flush regardless of `MODE.denorm32`.
+    fn flush_f32_subnormal(&mut self, f: V) -> V {
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let abs_mask = self.s.m.i32(0x7FFF_FFFF);
+        let min_normal = self.s.m.i32(0x0080_0000);
+        let sign_mask = self.s.m.i32(0x8000_0000);
+        let abs = self.s.m.bin(c, Bin::And, bits, abs_mask);
+        let is_sub = self.s.m.cmp(c, pred::IULT, abs, min_normal);
+        let sign = self.s.m.bin(c, Bin::And, bits, sign_mask);
+        let zero = self.as_float(sign);
+        self.s.m.select(c, is_sub, zero, f)
+    }
+
+    /// `a × b + c` with subnormal inputs, product and sum flushed (RDNA
+    /// `v_mad_f32`, independent of `MODE.denorm32`).
+    fn mad_f32(&mut self, a: V, b: V, c: V) -> V {
+        let a = self.flush_f32_subnormal(a);
+        let b = self.flush_f32_subnormal(b);
+        let c = self.flush_f32_subnormal(c);
+        let m = self.s.m.bin(self.cur, Bin::Mul, a, b);
+        let m = self.flush_f32_subnormal(m);
+        let r = self.s.m.bin(self.cur, Bin::Add, m, c);
+        self.flush_f32_subnormal(r)
+    }
+
     /// `a × b + addend` fused, with `0 × anything = 0` as in D3D9
     /// (`v_fma_legacy_f32`).
     fn fma_legacy(&mut self, a: V, b: V, addend: V) -> V {
@@ -2303,16 +2331,39 @@ impl<'a> Lower<'a> {
     }
 
     fn write_f(&mut self, inst: &Inst, f: V, guard: Option<V>) -> Result<(), Why> {
+        self.write_f_inner(inst, f, guard, false)
+    }
+
+    /// Like [`Self::write_f`], but flushes f32 subnormals to signed zero before
+    /// and after `omod` (`v_mad_f32` / `v_mac_f32` on RDNA).
+    fn write_f_flush_denorms(&mut self, inst: &Inst, f: V, guard: Option<V>) -> Result<(), Why> {
+        self.write_f_inner(inst, f, guard, true)
+    }
+
+    fn write_f_inner(
+        &mut self,
+        inst: &Inst,
+        f: V,
+        guard: Option<V>,
+        flush_denorms: bool,
+    ) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let mut f = f;
+        let mut f = if flush_denorms {
+            self.flush_f32_subnormal(f)
+        } else {
+            f
+        };
         match v.omod {
             0 => {}
             k => {
                 let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(k)];
                 let c = self.s.m.f32(factor.to_bits());
                 f = self.s.m.bin(self.cur, Bin::Mul, f, c);
+                if flush_denorms {
+                    f = self.flush_f32_subnormal(f);
+                }
             }
         }
         if v.clamp {
@@ -5192,13 +5243,15 @@ impl<'a> Lower<'a> {
                 };
                 let r = match name {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
-                    "v_mac_f32" => {
-                        let m = self.s.m.bin(c, Bin::Mul, a, bb);
-                        self.s.m.bin(c, Bin::Add, m, acc)
-                    }
+                    "v_mac_f32" => self.mad_f32(a, bb, acc),
                     _ => self.fma_legacy(a, bb, acc),
                 };
-                float(self, r)
+                // `v_mac_f32` flushes subnormals around omod; fused forms do not.
+                if name == "v_mac_f32" {
+                    self.write_f_flush_denorms(inst, r, guard)
+                } else {
+                    float(self, r)
+                }
             }
             "v_fma_legacy_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
@@ -5207,9 +5260,8 @@ impl<'a> Lower<'a> {
             }
             "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
-                let m = self.s.m.bin(c, Bin::Mul, a, bb);
-                let r = self.s.m.bin(c, Bin::Add, m, cc);
-                float(self, r)
+                let r = self.mad_f32(a, bb, cc);
+                self.write_f_flush_denorms(inst, r, guard)
             }
             "v_max3_f32" | "v_min3_f32" | "v_med3_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);

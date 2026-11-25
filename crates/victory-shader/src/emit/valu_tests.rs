@@ -49,6 +49,17 @@ const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
     ]
 }
 
+/// VOP3 with output modifier (`omod`: 0 none, 1 mul:2, 2 mul:4, 3 div:2).
+const fn vop3_omod(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16, omod: u8) -> [u32; 2] {
+    let [w0, w1] = vop3(op, vdst, src0, src1, src2);
+    [w0, w1 | (omod as u32 & 3) << 27]
+}
+
+/// VOP2 `op vdst, src0, vsrc1`.
+const fn vop2(op: u8, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+    (op as u32 & 0x3F) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+}
+
 /// MUBUF `buffer_store_dword vdata, off, s[srsrc:srsrc+3], 0 offset:byte_off`.
 const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
     [
@@ -1524,5 +1535,60 @@ fn cmp16_sdwa_preserves_word_selects() {
                 );
             });
         }
+    }
+}
+
+/// `v_mad_f32` / `v_mac_f32` flush subnormals before and after `omod`
+/// regardless of `MODE.denorm32` (VIC-BT-043 / #440).
+#[test]
+fn v_mad_f32_flushes_subnormals_around_omod() {
+    let flt_min = 0x0080_0000u32;
+    let f = f32::to_bits;
+    // v_mad_f32 v0, v1, v2, v3
+    let mad = build_valu_cs(&vop3(0x141, 0, vgpr(1), vgpr(2), vgpr(3)));
+    // v_mad_f32 v0, v1, v2, v3 mul:2
+    let mad_mul2 = build_valu_cs(&vop3_omod(0x141, 0, vgpr(1), vgpr(2), vgpr(3), 1));
+    // v_mad_f32 v0, v1, v2, v3 div:2
+    let mad_div2 = build_valu_cs(&vop3_omod(0x141, 0, vgpr(1), vgpr(2), vgpr(3), 3));
+    // v_mov_b32 v0, v4 then v_mac_f32 v0, v1, v2 (acc in v0 from s3/v4)
+    let mac = build_valu_cs(&[vop1(0x001, 0, vgpr(4)), vop2(0x1f, 0, vgpr(1), 2)]);
+
+    let mad_cases: &[([u32; 4], u32)] = &[
+        ([f(2.0), f(3.0), f(1.0), 0], f(7.0)),
+        // 1.5*FLT_MIN - FLT_MIN = 0.5*FLT_MIN (subnormal) → +0
+        ([f(1.5), flt_min, flt_min ^ 0x8000_0000, 0], 0),
+        // Smallest subnormal input is flushed before the mul.
+        ([0x0000_0001, f(4.0), 0, 0], 0),
+    ];
+    let mad_mul2_cases: &[([u32; 4], u32)] = &[
+        // Same sum flushed to 0 before mul:2 → +0 (not FLT_MIN).
+        ([f(1.5), flt_min, flt_min ^ 0x8000_0000, 0], 0),
+        ([f(2.0), f(3.0), f(1.0), 0], f(14.0)),
+    ];
+    let mad_div2_cases: &[([u32; 4], u32)] = &[
+        // FLT_MIN / 2 is subnormal; flush after omod → +0.
+        ([f(1.0), flt_min, 0, 0], 0),
+        ([f(2.0), f(4.0), 0, 0], f(4.0)),
+    ];
+    // mac: v0 += v1*v2 with initial v0 from inputs[3]
+    let mac_cases: &[([u32; 4], u32)] = &[
+        ([f(2.0), f(3.0), 0, f(1.0)], f(7.0)),
+        ([f(1.5), flt_min, 0, flt_min ^ 0x8000_0000], 0),
+    ];
+
+    for (shader, cases, what) in [
+        (&mad, mad_cases, "v_mad_f32"),
+        (&mad_mul2, mad_mul2_cases, "v_mad_f32 mul:2"),
+        (&mad_div2, mad_div2_cases, "v_mad_f32 div:2"),
+        (&mac, mac_cases, "v_mac_f32"),
+    ] {
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+        run_cases(shader, &inputs, |backend, i, _, got| {
+            let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend}: {what} case {i}: {got:#010x}, want {want:#010x}"
+            );
+        });
     }
 }
