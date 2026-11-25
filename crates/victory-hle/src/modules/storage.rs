@@ -244,6 +244,21 @@ mod tests {
         assert_eq!(method::<Space>(&OBJECT, 0x28)(this, &mut info), S_OK);
         assert_eq!((info.used, info.total_free, info.total), (100, 900, 1000));
 
+        // A symlink into an outside tree must not inflate used bytes.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("big.bin"), [0u8; 500]).unwrap();
+        let link = dir.path().join("outside.link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), &link).unwrap();
+        assert_eq!(method::<Space>(&OBJECT, 0x28)(this, &mut info), S_OK);
+        assert_eq!(
+            (info.used, info.total_free, info.total),
+            (100, 900, 1000),
+            "symlink target must be ignored"
+        );
+
         let prompt = method::<Prompt>(&OBJECT, 0x30);
         let result = method::<Result>(&OBJECT, 0x38);
         for (bytes, expect) in [(900, S_OK), (901, E_ABORT)] {
