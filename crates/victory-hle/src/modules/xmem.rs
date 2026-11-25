@@ -1537,26 +1537,56 @@ mod tests {
 
     /// Streaming allocate/free must reuse page numbers. Without a free list,
     /// `next_page` would climb by `n * FRAMES` each round and eventually pack
-    /// past the title's 21-bit `number >> 4` field.
+    /// past the title's 21-bit `number >> 4` field. Uses a private `Physical`
+    /// so parallel suite tests cannot steal freed numbers or bump `next_page`.
     #[test]
     fn allocate_reuses_freed_page_numbers_without_growing_next_page() {
-        let pages = allocate(2);
-        let ceiling = physical().next_page;
-        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        let section = || {
+            let size = 2 * PAGE;
+            // SAFETY: plain pagefile-backed section, same as the public allocate path.
+            let handle = unsafe {
+                CreateFileMappingW(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null(),
+                    PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+                    0,
+                    size as u32,
+                    std::ptr::null(),
+                )
+            };
+            assert!(!handle.is_null());
+            Arc::new(Section(handle))
+        };
+        let mut table = Physical {
+            next_page: FIRST_PAGE_NUMBER,
+            ..Physical::default()
+        };
+        let mut slots = [MaybeUninit::new(0); 2];
+        assert!(table.allocate(section(), &mut slots));
+        // SAFETY: both slots were filled by allocate.
+        let pages = unsafe { [slots[0].assume_init(), slots[1].assume_init()] };
+        let ceiling = table.next_page;
+        for &p in &pages {
+            table.free(p);
+        }
         for _ in 0..1024 {
-            let again = allocate(2);
-            assert_eq!(physical().next_page, ceiling);
+            assert!(table.allocate(section(), &mut slots));
+            assert_eq!(table.next_page, ceiling);
+            // SAFETY: both slots were filled by allocate.
+            let again = unsafe { [slots[0].assume_init(), slots[1].assume_init()] };
             for &p in &again {
                 assert!(p >> 4 < 1 << 21, "{p:#x}");
                 assert!(p > 0);
             }
             // Same numbers we freed (LIFO may reverse them within the batch).
-            let mut got = again.clone();
+            let mut got = again;
             got.sort_unstable();
-            let mut want = pages.clone();
+            let mut want = pages;
             want.sort_unstable();
             assert_eq!(got, want);
-            assert_eq!(XMemFreePhysicalPages(2, again.as_ptr()), 1);
+            for &p in &again {
+                table.free(p);
+            }
         }
     }
 
