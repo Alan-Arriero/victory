@@ -4140,6 +4140,18 @@ mod tests {
     }
 
     #[test]
+    fn empty_execute_does_not_submit() {
+        // D3D12 forbids ExecuteCommandLists with NumCommandLists == 0.
+        let Some(host) = host() else {
+            return;
+        };
+        let before = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        host.execute(&[]);
+        let after = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(before, after, "empty execute must not bump the fence");
+    }
+
+    #[test]
     fn active_execution_epoch_pins_objects_retired_during_execute() {
         let _retire = isolated_retire_scope();
         let Some(host) = host() else {
