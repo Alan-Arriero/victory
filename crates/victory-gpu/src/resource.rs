@@ -881,6 +881,10 @@ pub(crate) struct Twin {
     /// the bits of a 24-bit depth plane, so the two are not copied: a pass
     /// draws the twin into the plane.
     pub(crate) plane: Option<std::sync::Arc<HostTexture>>,
+    /// Immutable shader-visible views of this plane's subresources. The lists
+    /// referencing these descriptors keep the twin alive until they are reset.
+    pub(crate) plane_views:
+        std::sync::OnceLock<Option<windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap>>,
 }
 
 #[cfg(windows)]
@@ -1108,6 +1112,7 @@ fn twin_texture(
         behind: std::sync::atomic::AtomicU32::new(0),
         through,
         plane,
+        plane_views: Default::default(),
     }))
 }
 

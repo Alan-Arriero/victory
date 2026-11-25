@@ -833,20 +833,9 @@ float plane(float4 p : SV_Position) : SV_Depth {
 }
 "#;
 
-/// Views of twins the pass reads, in a heap of ours used as a ring.
-/// shortcut: a view must last until its list has run; with one or two
-/// passes a frame the ring is far from coming round.
-const PLANE_VIEWS: u32 = 256;
-
-/// What the pass draws with: the heap of its views of twins, and per kind
-/// of twin (16-bit steps or floats) and depth format the root signature
+/// Per kind of twin (16-bit steps or floats) and depth format the root signature
 /// and pipeline, made when first needed (`None`: the host refused).
 struct PlanePass {
-    views: ID3D12DescriptorHeap,
-    cpu: usize,
-    gpu: u64,
-    step: u32,
-    next: AtomicU32,
     made: Mutex<Vec<(bool, i32, Option<PlanePipeline>)>>,
 }
 
@@ -858,35 +847,6 @@ type PlanePipeline = (ID3D12RootSignature, ID3D12PipelineState);
 unsafe impl Send for PlanePass {}
 // SAFETY: as above.
 unsafe impl Sync for PlanePass {}
-
-fn plane_pass() -> Option<&'static PlanePass> {
-    static PASS: OnceLock<Option<PlanePass>> = OnceLock::new();
-    PASS.get_or_init(|| {
-        let host = host()?;
-        let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        // SAFETY: plain heap creation and queries.
-        unsafe {
-            let views: ID3D12DescriptorHeap = host
-                .device
-                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: kind,
-                    NumDescriptors: PLANE_VIEWS,
-                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                    NodeMask: 0,
-                })
-                .ok()?;
-            Some(PlanePass {
-                cpu: views.GetCPUDescriptorHandleForHeapStart().ptr,
-                gpu: views.GetGPUDescriptorHandleForHeapStart().ptr,
-                step: host.device.GetDescriptorHandleIncrementSize(kind),
-                views,
-                next: AtomicU32::new(0),
-                made: Mutex::default(),
-            })
-        }
-    })
-    .as_ref()
-}
 
 impl PlanePass {
     /// The root signature and pipeline for a twin of 16-bit steps (`steps`)
@@ -971,10 +931,12 @@ fn record_plane_pass(
     list: &ID3D12GraphicsCommandList,
     depth: &ID3D12Resource,
     plane: &ID3D12Resource,
+    plane_views: &OnceLock<Option<ID3D12DescriptorHeap>>,
 ) {
-    let (Some(host), Some(pass)) = (host(), plane_pass()) else {
-        return;
+    static PASS: PlanePass = PlanePass {
+        made: Mutex::new(Vec::new()),
     };
+    let Some(host) = host() else { return };
     // SAFETY: live resources.
     let (of, twin) = unsafe { (depth.GetDesc(), plane.GetDesc()) };
     // An R16 typeless twin (53) holds steps, read as R16_UINT (57); an R32
@@ -986,26 +948,61 @@ fn record_plane_pass(
         19 => 20,
         typed => typed,
     });
-    let Some((root, pipeline)) = pass.pipeline(steps, format) else {
+    let Some((root, pipeline)) = PASS.pipeline(steps, format) else {
         return;
     };
-    for slice in 0..u32::from(of.DepthOrArraySize) {
-        for mip in 0..u32::from(of.MipLevels) {
-            let slot = pass.next.fetch_add(1, Ordering::Relaxed) % PLANE_VIEWS;
-            let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                Format: DXGI_FORMAT(if steps { 57 } else { 41 }),
-                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
-                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                    Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
-                        MostDetailedMip: mip,
-                        MipLevels: 1,
-                        FirstArraySlice: slice,
-                        ArraySize: 1,
-                        ..Default::default()
+    let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    // SAFETY: an immutable property of our live device.
+    let step = unsafe { host.device.GetDescriptorHandleIncrementSize(kind) };
+    let mips = u32::from(of.MipLevels);
+    let slices = u32::from(of.DepthOrArraySize);
+    let Some(views) = plane_views.get_or_init(|| {
+        let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: kind,
+            NumDescriptors: mips * slices,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        };
+        // SAFETY: desc lives through creation and its count covers the entire texture.
+        let views: ID3D12DescriptorHeap = unsafe { host.device.CreateDescriptorHeap(&desc) }
+            .inspect_err(
+                |e| tracing::warn!(error = %e, "no descriptor heap for a depth plane twin"),
+            )
+            .ok()?;
+        // SAFETY: live, initialized heap.
+        let mut cpu = unsafe { views.GetCPUDescriptorHandleForHeapStart() };
+        for slice in 0..slices {
+            for mip in 0..mips {
+                let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT(if steps { 57 } else { 41 }),
+                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                            MostDetailedMip: mip,
+                            MipLevels: 1,
+                            FirstArraySlice: slice,
+                            ArraySize: 1,
+                            ..Default::default()
+                        },
                     },
-                },
-            };
+                };
+                // SAFETY: exactly one slot for every subresource; the heap is not published yet.
+                unsafe {
+                    host.device
+                        .CreateShaderResourceView(plane, Some(&view), cpu)
+                };
+                cpu.ptr += step as usize;
+            }
+        }
+        Some(views)
+    }) else {
+        return;
+    };
+    // SAFETY: this initialized, immutable heap remains live through the recording's execution.
+    let mut gpu = unsafe { views.GetGPUDescriptorHandleForHeapStart() };
+    for slice in 0..slices {
+        for mip in 0..mips {
             let target = D3D12_DEPTH_STENCIL_VIEW_DESC {
                 Format: format,
                 ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2DARRAY,
@@ -1020,18 +1017,10 @@ fn record_plane_pass(
             };
             let target = host.dsv(depth, Some(&target));
             let (width, height) = ((of.Width >> mip).max(1) as u32, (of.Height >> mip).max(1));
-            let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
-                ptr: pass.cpu + (slot * pass.step) as usize,
-            };
-            let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
-                ptr: pass.gpu + u64::from(slot * pass.step),
-            };
             // SAFETY: an open list; a slot of our heap; live resources and
             // objects (the pass's own live as long as the process).
             unsafe {
-                host.device
-                    .CreateShaderResourceView(plane, Some(&view), cpu);
-                list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
+                list.SetDescriptorHeaps(&[Some(views.clone())]);
                 list.SetGraphicsRootSignature(&root);
                 list.SetPipelineState(&pipeline);
                 list.SetGraphicsRootDescriptorTable(0, gpu);
@@ -1055,6 +1044,7 @@ fn record_plane_pass(
                 );
                 list.DrawInstanced(3, 1, 0, 0);
             }
+            gpu.ptr += u64::from(step);
             crate::resource::PLANES[0].fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -2307,7 +2297,12 @@ impl HostList {
         let Some(plane) = &twin.plane else { return };
         self.settle(depth, DEPTH_WRITE);
         self.settle(plane, PIXEL_SHADER_RESOURCE);
-        record_plane_pass(&self.list, &depth.texture, &plane.texture);
+        record_plane_pass(
+            &self.list,
+            &depth.texture,
+            &plane.texture,
+            &twin.plane_views,
+        );
         self.settle(plane, UNORDERED_ACCESS);
     }
 
@@ -4854,26 +4849,153 @@ mod plane_shaders {
             ("plane", super::PLANE_STEPS, "ps_5_1"),
             ("plane", super::PLANE_FLOATS, "ps_5_1"),
         ];
-        let mut any = false;
         for (entry, source, target) in stages {
-            match crate::hlsl::compile_stage("depth plane probe", source, entry, target) {
-                Ok(bytes) => {
-                    any = true;
-                    assert_eq!(&bytes[..4], b"DXBC", "{entry}");
-                    let container = Container::parse(&bytes).unwrap();
-                    // The pixel shader carries the pass's root signature
-                    // (DXC writes it as RTS0, the system's compiler as
-                    // RDAT); the vertex shader needs none.
-                    let signature = [FourCC::RTS0, FourCC(*b"RDAT")]
+            let bytes = crate::hlsl::compile_stage("depth plane probe", source, entry, target)
+                .unwrap_or_else(|e| panic!("{entry} ({target}): {e}"));
+            let container = Container::parse(&bytes).unwrap();
+            if entry == "plane" {
+                assert!(
+                    [FourCC::RTS0, FourCC(*b"RDAT")]
                         .iter()
-                        .any(|&part| container.part(part).is_some());
-                    if entry == "plane" {
-                        assert!(signature, "{entry}: no root signature in the shader");
-                    }
-                }
-                Err(e) => eprintln!("{entry} not compiled here: {e}"),
+                        .any(|&part| container.part(part).is_some()),
+                    "{entry}: no root signature in the shader"
+                );
             }
         }
-        assert!(any, "neither compiler present for the depth plane pass");
+    }
+
+    #[test]
+    fn depth_plane_draw_preserves_first_and_last_array_slices() {
+        use super::*;
+        let Some(host) = host() else {
+            eprintln!("Skipping depth plane array readback: no D3D12 device");
+            return;
+        };
+        const SLICES: u16 = 257;
+        let list = host.new_list().unwrap();
+        let texture = |format, flags, state| {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 1,
+                Height: 1,
+                DepthOrArraySize: SLICES,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: flags,
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: the descriptors live through the call and the output slot is ours.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        state,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap()
+            };
+            texture.unwrap()
+        };
+        let plane = texture(
+            DXGI_FORMAT_R32_TYPELESS,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+        let depth = texture(
+            DXGI_FORMAT_R32G8X24_TYPELESS,
+            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        );
+        let (upload, input) = host.upload_buffer(1024).unwrap();
+        let (readback, output) = host.readback_buffer(1024).unwrap();
+        let subresource = |resource: &ID3D12Resource, index| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: the resources remain live through submission; these descriptors borrow them.
+            pResource: unsafe { std::mem::transmute_copy(resource) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: index,
+            },
+        };
+        let location = |resource: &ID3D12Resource, texture: &ID3D12Resource, index, offset| {
+            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            // SAFETY: the texture is live; index is in range, and one footprint is requested.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &texture.GetDesc(),
+                    index,
+                    1,
+                    offset,
+                    Some(&mut footprint),
+                    None,
+                    None,
+                    None,
+                )
+            };
+            D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as for the subresource locations above.
+                pResource: unsafe { std::mem::transmute_copy(resource) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: footprint,
+                },
+            }
+        };
+        let samples = [(0, 0, 0.25_f32), (u32::from(SLICES) - 1, 512, 0.75_f32)];
+        for (index, offset, expected) in samples {
+            // SAFETY: an aligned f32 fits inside the 1024-byte upload buffer at both offsets.
+            unsafe { input.add(offset).cast::<f32>().write(expected) };
+            let src = location(&upload, &plane, index, offset as u64);
+            // SAFETY: both resources are in copy states and the locations cover one full texel.
+            unsafe {
+                list.list
+                    .CopyTextureRegion(&subresource(&plane, index), 0, 0, 0, &src, None)
+            };
+        }
+        // SAFETY: the plane was created in COPY_DEST and the list has not changed that state.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(
+                &plane,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            )])
+        };
+        let plane_views = OnceLock::new();
+        record_plane_pass(&list.list, &depth, &plane, &plane_views);
+        // SAFETY: depth was created in DEPTH_WRITE and the pass leaves it in that state.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(
+                &depth,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )])
+        };
+        for (index, offset, _) in samples {
+            let dst = location(&readback, &depth, index, offset as u64);
+            // SAFETY: both locations are live, in their copy states and cover one full depth texel.
+            unsafe {
+                list.list
+                    .CopyTextureRegion(&dst, 0, 0, 0, &subresource(&depth, index), None)
+            };
+        }
+        list.mark_work();
+        list.close();
+        host.execute(&[&list]);
+        for (index, offset, expected) in samples {
+            // SAFETY: execute waited for the readback and both offsets are aligned within the mapping.
+            let actual = unsafe { output.add(offset).cast::<f32>().read() };
+            assert_eq!(actual, expected, "depth slice {index}");
+        }
     }
 }
