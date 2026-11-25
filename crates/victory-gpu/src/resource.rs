@@ -1077,6 +1077,7 @@ impl Resource {
                 Some(std::sync::Arc::new(HostTexture {
                     texture,
                     state: state.into(),
+                    born_seq: crate::host::birth_seq(),
                     dropped,
                 }))
             })
@@ -1085,10 +1086,10 @@ impl Resource {
 
     /// The colour twin, made now if this is its first use: only a depth
     /// texture the title also writes as unordered access has one.
-    fn twin(&self) -> Option<&std::sync::Arc<Twin>> {
+    fn twin(&self, this: This) -> Option<&std::sync::Arc<Twin>> {
         self.twin
             .get_or_init(|| {
-                let depth = self.host()?;
+                let depth = self.host(this)?;
                 twin_texture(&self.desc, &depth.texture)
             })
             .as_ref()
@@ -1105,6 +1106,7 @@ impl Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    pub(crate) born_seq: u64,
     /// Top mip levels of the title's texture the host copy does not have
     /// (host memory pressure, see [`create_texture_with_auto_mip_drop`]):
     /// its subresource `i` is the title's `i + dropped`, per layer.
@@ -1156,6 +1158,9 @@ impl HostTexture {
         Self {
             texture,
             state: state.into(),
+            born_seq: crate::host::birth_seq(),
+            // Twins and planes are made from the title's own description.
+            dropped: 0,
         }
     }
 }
@@ -1190,7 +1195,7 @@ pub(crate) fn twin(this: This) -> Option<std::sync::Arc<Twin>> {
     if this.is_null() {
         return None;
     }
-    resource(this).twin().cloned()
+    resource(this).twin(this).cloned()
 }
 
 /// The twin's texture, for the unordered access views of `this`.
@@ -1204,7 +1209,7 @@ pub(crate) fn twin_resource<'a>(
     // SAFETY: the twin lives as long as the host copy, which lives as long
     // as the resource.
     resource(this)
-        .twin()
+        .twin(this)
         .map(|t| unsafe { &*std::ptr::from_ref(&t.colour.texture) })
 }
 
@@ -1217,7 +1222,7 @@ pub(crate) fn twin_plane_resource<'a>(
     if this.is_null() {
         return None;
     }
-    let twin = resource(this).twin()?;
+    let twin = resource(this).twin(this)?;
     // SAFETY: as in `twin_resource`.
     twin.plane
         .as_ref()
@@ -1799,10 +1804,9 @@ impl Drop for Resource {
                 );
             }
         }
-        // A running submission may still read the host copy.
-        if let Some(host) = self.host.take().flatten() {
-            crate::host::retire(host);
-        }
+        // Forget descriptor/staging/target entries before retiring the host
+        // copy so no concurrent bindless sweep can observe it after retirement
+        // snapshots active epochs.
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension != BUFFER && host_writes(&self.desc) {
@@ -1817,6 +1821,12 @@ impl Drop for Resource {
                 std::ptr::from_ref::<Resource>(self) as usize,
                 self.data() as u64,
             );
+        }
+        // A running submission or list that recorded work after this host copy
+        // was created may still read it.
+        if let Some(host) = self.host.take().flatten() {
+            let born = host.born_seq;
+            crate::host::retire_born(host, born);
         }
     }
 }
