@@ -45,6 +45,10 @@ pub(crate) struct Lowered {
     /// Whether the program reads the pixel coverage mask.
     #[cfg(test)]
     pub has_coverage_op: bool,
+    /// Test builds: the `dx.op` calls before optimization, see
+    /// [`Module::dx_op_calls`].
+    #[cfg(test)]
+    pub dx_ops: Vec<(String, Vec<Option<i32>>)>,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -346,7 +350,7 @@ const LANE_MASK: Why = "a lane mask read as data";
 /// Clamp and offset tokens (`_cl`, `_o`) keep that; explicit LOD, gradients,
 /// and comparison forms do not.
 fn implicit_derivatives(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix("image_sample") else {
+let Some(rest) = name.strip_prefix("image_sample") else {
         return false;
     };
     !rest
@@ -1218,6 +1222,8 @@ impl<'a> Lower<'a> {
         let has_fcmp_uno = self.s.m.has_cmp(pred::UNO);
         #[cfg(test)]
         let has_coverage_op = self.s.m.has_dx_op("dx.op.coverage.i32", 91);
+        #[cfg(test)]
+        let dx_ops = self.s.m.dx_op_calls();
         Ok(Lowered {
             #[cfg(test)]
             unaligned_typed_loads: self.s.unaligned_typed_loads,
@@ -1252,6 +1258,8 @@ impl<'a> Lower<'a> {
             has_fcmp_uno,
             #[cfg(test)]
             has_coverage_op,
+            #[cfg(test)]
+            dx_ops,
         })
     }
 
@@ -7470,19 +7478,24 @@ impl<'a> Lower<'a> {
         };
         let (op, sample) = match base_name {
             "image_sample" | "image_sample_cl" | "image_sample_o" => (60, true),
-            "image_sample_lz" | "image_sample_l" | "image_sample_lz_o" => (62, true),
+            "image_sample_lz" | "image_sample_l" | "image_sample_lz_o" | "image_sample_l_o" => {
+                (62, true)
+            }
             "image_sample_b" | "image_sample_b_cl" | "image_sample_b_o" | "image_sample_b_cl_o" => {
                 (61, true)
             }
-            "image_sample_c_lz" => (65, true),
+            "image_sample_c_lz" | "image_sample_c_lz_o" => (65, true),
             "image_sample_d" | "image_sample_d_cl" | "image_sample_d_o" | "image_sample_d_cl_o" => {
                 (63, true)
             }
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
-            "image_sample_c" | "image_sample_c_cl" if self.s.pixel => (64, true),
+            "image_sample_c" | "image_sample_c_cl" | "image_sample_c_o" if self.s.pixel => {
+                (64, true)
+            }
             "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" | "image_gather4_l"
             | "image_gather4_l_o" => (73, true),
+            "image_gather4_c_lz" | "image_gather4_c_lz_o" => (74, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -7538,15 +7551,23 @@ impl<'a> Lower<'a> {
                 .ok_or("an untracked sampler")?;
             // Comparison: the reference value is the first address after
             // the bias, and the sampler is a comparison sampler.
-            let cmp = matches!(op, 64 | 65);
+            let cmp = matches!(op, 64 | 65 | 74);
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
             let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
-            // signed (programmable offsets: gathers only). Offset, bias and
-            // z-compare are always full 32-bit VGPRs even with a16.
+            // z in 16-21, signed (programmable offsets: gathers only).
+            // Offset, bias and z-compare are always full 32-bit VGPRs even
+            // with a16. Token split (not ends_with) so `_o_g16` / `_cl_o` work.
             let offset_word = base_name.split('_').any(|t| t == "o");
+            let gather = matches!(op, 73 | 74);
+            if offset_word && kind == 5 {
+                return Err("a texel offset on a cube");
+            }
+            if gather && !matches!(kind, 2 | 5 | 7) {
+                return Err("a gather of a view other than 2D or cube");
+            }
             let has_cl = base_name.split('_').any(|t| t == "cl");
             let first = usize::from(offset_word) + usize::from(op == 61) + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
@@ -7571,6 +7592,7 @@ impl<'a> Lower<'a> {
                 }
             };
             // Bias is a whole VGPR even with a16; only its low half is the f16.
+            // The bias follows the offset word.
             let bias_float = |l: &mut Self| -> Result<V, Why> {
                 let bias = addr_u32(l, usize::from(offset_word))?;
                 if *a16 {
@@ -7654,7 +7676,7 @@ impl<'a> Lower<'a> {
             } else {
                 fu
             };
-            if matches!(op, 60 | 61 | 63) && offset_word {
+            if offset_word && !gather {
                 // DXIL takes immediate offsets in -8..=7; the console's are
                 // 6-bit and may be computed.
                 let w = addr_u32(self, 0)?;
@@ -7763,7 +7785,7 @@ impl<'a> Lower<'a> {
                         .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
                 }
                 62 => {
-                    let lod = if name == "image_sample_l" {
+                    let lod = if matches!(name, "image_sample_l" | "image_sample_l_o") {
                         let x = addr_packed(self, coord_base, coords)?;
                         to_float(self, x)
                     } else {
@@ -7780,7 +7802,8 @@ impl<'a> Lower<'a> {
                         &args,
                     )
                 }
-                _ if name.starts_with("image_gather4_l")
+                _ if op == 73
+                    && name.starts_with("image_gather4_l")
                     && !name.starts_with("image_gather4_lz") =>
                 {
                     if *unorm || *d16 {
@@ -7822,14 +7845,27 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os[..2]);
                     args.push(self.s.m.i32(dmask.trailing_zeros()));
-                    self.s.op(
-                        c,
-                        "textureGather.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        73,
-                        &args,
-                    )
+                    if op == 74 {
+                        let reference = addr_u32(self, first - 1)?;
+                        args.push(self.as_float(reference));
+                        self.s.op(
+                            c,
+                            "textureGatherCmp.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            74,
+                            &args,
+                        )
+                    } else {
+                        self.s.op(
+                            c,
+                            "textureGather.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            73,
+                            &args,
+                        )
+                    }
                 }
             }
         } else {
@@ -7951,7 +7987,7 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
         };
-        let channels: Vec<u32> = if op == 73 {
+        let channels: Vec<u32> = if matches!(op, 73 | 74) {
             vec![0, 1, 2, 3]
         } else {
             (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
@@ -10636,6 +10672,7 @@ mod tests {
         }
     }
 
+
     /// VIC-BT-009: the same immediate sampler words used non-comparison first
     /// then comparison (or the reverse) allocate two static slots so each
     /// annotateHandle matches `dx.resources` sampler kind.
@@ -10881,6 +10918,313 @@ mod tests {
                     .expect("DXIL validation failed");
             }
         }
+    }
+
+    /// A compute program that loads the table of views at s0, sets the
+    /// listed VGPRs to literals, runs one MIMG instruction on the first view
+    /// (2D unless `dim` says otherwise) with the sampler `0x92` and stores
+    /// the first result dword. The address starts at v2.
+    fn image_words(op: u32, dmask: u32, dim: u32, a16: bool, addr: &[u32]) -> Vec<u32> {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0xBE88_03FF,
+            0x0000_0092, // s_mov_b32 s8, 0x92 (an immediate sampler)
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+        ];
+        for (k, &value) in addr.iter().enumerate() {
+            // v_mov_b32 v(2 + k), literal
+            words.extend([0x7E00_02FF | (2 + k as u32) << 17, value]);
+        }
+        words.extend([
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF000_0000 | op << 18 | dmask << 8 | dim << 3,
+            0x0043_0C02 | u32::from(a16) << 30, // v[12:15], v[2:], s[12:19], s[8:11]
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ]);
+        words
+    }
+
+    /// [`image_words`] lowered; on Windows with `dxil.dll`, also validated.
+    fn lower_image(words: &[u32]) -> Result<Lowered, crate::ShaderError> {
+        let (_, mut used) = texture_and_uav_tables();
+        used.retain(|u| u.user_data == 0);
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let l = lower_with(words, layout, used)?;
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut l.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+        Ok(l)
+    }
+
+    /// The integer-constant arguments of each call of `dx.op.<function>`.
+    fn calls<'a>(l: &'a Lowered, function: &str) -> Vec<&'a [Option<i32>]> {
+        let name = format!("dx.op.{function}");
+        l.dx_ops
+            .iter()
+            .filter(|(n, _)| *n == name)
+            .map(|(_, args)| args.as_slice())
+            .collect()
+    }
+
+    fn called(l: &Lowered, function: &str) -> bool {
+        !calls(l, function).is_empty()
+    }
+
+    fn refused(words: &[u32]) -> String {
+        match lower_image(words) {
+            Err(crate::ShaderError::Unsupported { what, .. }) => what.to_string(),
+            Err(e) => panic!("{e}"),
+            Ok(_) => panic!("lowered"),
+        }
+    }
+
+    const F_HALF: u32 = 0x3F00_0000;
+    const F_ONE: u32 = 0x3F80_0000;
+
+    #[test]
+    fn comparison_gathers_lower_to_gather_cmp() {
+        // image_gather4_c_lz: the reference, then the coordinates.
+        let words = image_words(0x4F, 0x1, 1, false, &[F_ONE, F_HALF, F_HALF]);
+        let l = lower_image(&words).unwrap();
+        assert!(called(&l, "textureGatherCmp.f32"));
+        assert!(!called(&l, "textureGather.f32"));
+        // Any one channel, through the same instruction.
+        for dmask in [0x2, 0x4, 0x8] {
+            let words = image_words(0x4F, dmask, 1, false, &[F_ONE, F_HALF, F_HALF]);
+            assert!(called(
+                &lower_image(&words).unwrap(),
+                "textureGatherCmp.f32"
+            ));
+        }
+        // 2D array: the slice is a third coordinate.
+        let words = image_words(0x4F, 0x1, 5, false, &[F_ONE, F_HALF, F_HALF, 0]);
+        assert!(called(
+            &lower_image(&words).unwrap(),
+            "textureGatherCmp.f32"
+        ));
+    }
+
+    #[test]
+    fn comparison_gathers_take_programmable_offsets_after_the_offset_word() {
+        // image_gather4_c_lz_o: offsets x 2, y -1, then the reference.
+        let words = image_words(0x5F, 0x1, 1, false, &[0x3F02, F_ONE, F_HALF, F_HALF]);
+        let l = lower_image(&words).unwrap();
+        assert!(called(&l, "textureGatherCmp.f32"));
+        // Any other offset word lowers the same way, in range or not
+        // (the host takes -8..7 and the title's are 6-bit).
+        let words = image_words(0x5F, 0x2, 1, false, &[0x3F3F, F_ONE, F_HALF, F_HALF]);
+        assert!(called(
+            &lower_image(&words).unwrap(),
+            "textureGatherCmp.f32"
+        ));
+    }
+
+    #[test]
+    fn comparison_gathers_of_unsupported_forms_are_refused() {
+        // Several channels, a cube with an offset and a 3D view.
+        let words = image_words(0x4F, 0x3, 1, false, &[F_ONE, F_HALF, F_HALF]);
+        assert_eq!(
+            refused(&words),
+            "a comparison sample of 16-bit coordinates or several channels"
+        );
+        let words = image_words(
+            0x5F,
+            0x1,
+            3,
+            false,
+            &[0x3F02, F_ONE, F_HALF, F_HALF, F_HALF],
+        );
+        assert_eq!(refused(&words), "a texel offset on a cube");
+        let words = image_words(0x4F, 0x1, 2, false, &[F_ONE, F_HALF, F_HALF, F_HALF]);
+        assert_eq!(refused(&words), "a gather of a view other than 2D or cube");
+    }
+
+    #[test]
+    fn sample_offset_variants_lower_with_the_offset_word_first() {
+        // Offset words (x 1, y -1) lead every address.
+        let off = 0x3F01;
+        let cases: [(u32, u32, &str, &[u32], &str); 5] = [
+            // image_sample_l_o: offset, coordinates, level.
+            (
+                0x34,
+                0xF,
+                "l_o",
+                &[off, F_HALF, F_HALF, F_ONE],
+                "sampleLevel.f32",
+            ),
+            // image_sample_c_lz_o: offset, reference, coordinates.
+            (
+                0x3F,
+                0x1,
+                "c_lz_o",
+                &[off, F_ONE, F_HALF, F_HALF],
+                "sampleCmpLevelZero.f32",
+            ),
+            // image_sample_lz_o: offset, coordinates.
+            (0x37, 0xF, "lz_o", &[off, F_HALF, F_HALF], "sampleLevel.f32"),
+            // image_sample_d_o: offset, x gradients, y gradients, coordinates.
+            (
+                0x32,
+                0xF,
+                "d_o",
+                &[off, 0, 0, 0, 0, F_HALF, F_HALF],
+                "sampleGrad.f32",
+            ),
+            // image_sample_o: offset, coordinates (the level from the quad).
+            (0x30, 0xF, "o", &[off, F_HALF, F_HALF], "sampleGrad.f32"),
+        ];
+        for (op, dmask, label, addr, function) in cases {
+            let words = image_words(op, dmask, 1, false, addr);
+            let l = lower_image(&words).unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert!(called(&l, function), "{label}");
+        }
+    }
+
+    #[test]
+    fn a16_leaves_the_offset_and_gradients_whole_and_packs_the_coordinates() {
+        // image_sample_d_o with a16: offset, four f32 gradients, then one
+        // dword of two f16 coordinates.
+        let packed = 0x3800_3800; // (0.5, 0.5) as f16
+        let words = image_words(0x32, 0xF, 1, true, &[0x3F01, 0, 0, 0, 0, packed]);
+        let l = lower_image(&words).unwrap();
+        assert_eq!(calls(&l, "sampleGrad.f32")[0][7..9], [Some(1), Some(-1)]);
+        // image_sample_l_o: offset, then coordinates and level packed in
+        // pairs, so three f16 values take two dwords.
+        let words = image_words(0x34, 0xF, 1, true, &[0x3F01, packed, 0x3C00]);
+        let l = lower_image(&words).unwrap();
+        assert_eq!(calls(&l, "sampleLevel.f32")[0][7..9], [Some(1), Some(-1)]);
+    }
+
+    #[test]
+    fn sample_offsets_must_be_constants_in_the_dxil_range() {
+        let at = |offset: u32| image_words(0x37, 0xF, 1, false, &[offset, F_HALF, F_HALF]);
+        for (offset, ok) in [
+            (0x0007, true),
+            (0x3F38, true),
+            (0x0008, false),
+            (0x3F37, false),
+        ] {
+            let r = lower_image(&at(offset));
+            assert_eq!(r.is_ok(), ok, "{offset:#x}");
+        }
+        // x from the thread id: not a constant.
+        let mut words = at(0);
+        let at_mov = words.iter().position(|&w| w == 0x7E04_02FF).unwrap();
+        words.splice(at_mov..at_mov + 2, [0x7E04_0300]); // v_mov_b32 v2, v0
+        assert_eq!(refused(&words), "a sample offset that is not constant");
+        // No texel offsets on cube samples.
+        let words = image_words(0x37, 0xF, 3, false, &[0x0001, F_HALF, F_HALF, F_HALF]);
+        assert_eq!(refused(&words), "a texel offset on a cube");
+    }
+
+    /// A pixel program: the view table at s0, literals in v2 on, one MIMG
+    /// instruction, and the result exported to the target.
+    fn lower_pixel_image(op: u32, dmask: u32, addr: &[u32]) -> Result<Lowered, crate::ShaderError> {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0xBE88_03FF,
+            0x0000_0092, // s_mov_b32 s8, 0x92 (an immediate sampler)
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+        ];
+        for (k, &value) in addr.iter().enumerate() {
+            words.extend([0x7E00_02FF | (2 + k as u32) << 17, value]);
+        }
+        words.extend([
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF000_0000 | op << 18 | dmask << 8 | 1 << 3,
+            0x0043_0C02, // v[12:15], v[2:], s[12:19], s[8:11]
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xF800_080F,
+            0x0F0E_0D0C, // exp mrt0 v12, v13, v14, v15 done
+            S_ENDPGM,
+        ]);
+        let (_, mut used) = texture_and_uav_tables();
+        used.retain(|u| u.user_data == 0);
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 32,
+            layout,
+            used,
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code,
+        };
+        let p = ir::build(&native.code, false, 32).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native).unwrap();
+        let target = crate::emit::container::SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let l = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![target],
+            prims: vec![],
+            mesh_stride: 0,
+        })?;
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut l.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+        Ok(l)
+    }
+
+    #[test]
+    fn implicit_level_sample_offsets_lower_in_pixel_shaders() {
+        let off = 0x3F01;
+        // image_sample_b_o: offset, bias, coordinates.
+        let l = lower_pixel_image(0x35, 0xF, &[off, 0, F_HALF, F_HALF]).unwrap();
+        assert!(called(&l, "sampleBias.f32"));
+        assert_eq!(calls(&l, "sampleBias.f32")[0][7..9], [Some(1), Some(-1)]);
+        // image_sample_c_o: offset, reference, coordinates.
+        let l = lower_pixel_image(0x38, 0x1, &[off, F_ONE, F_HALF, F_HALF]).unwrap();
+        assert!(called(&l, "sampleCmp.f32"));
+        // image_sample_o: offset, coordinates.
+        let l = lower_pixel_image(0x30, 0xF, &[off, F_HALF, F_HALF]).unwrap();
+        assert!(called(&l, "sample.f32"));
     }
 
     #[test]
