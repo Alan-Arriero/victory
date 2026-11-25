@@ -7057,6 +7057,51 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Saturate a 32-bit unsigned channel to 16 bits (RDNA2 `image_load` d16).
+    fn saturate_u16(&mut self, x: V) -> V {
+        let c = self.cur;
+        let m = self.s.m.i32(0xFFFF);
+        let lt = self.s.m.cmp(c, pred::IULT, x, m);
+        self.s.m.select(c, lt, x, m)
+    }
+
+    /// Saturate a 32-bit signed channel to 16 bits (RDNA2 `image_load` d16).
+    fn saturate_i16(&mut self, x: V) -> V {
+        let c = self.cur;
+        let (lo, hi, m) = (
+            self.s.m.i32((-32768i32) as u32),
+            self.s.m.i32(32767),
+            self.s.m.i32(0xFFFF),
+        );
+        let below = self.s.m.cmp(c, pred::SLT, x, lo);
+        let x = self.s.m.select(c, below, lo, x);
+        let above = self.s.m.cmp(c, pred::SGT, x, hi);
+        let x = self.s.m.select(c, above, hi, x);
+        self.s.m.bin(c, Bin::And, x, m)
+    }
+
+    /// Whether GFX10 `IMG_FORMAT` / buffer format `fmt` is UINT or SINT
+    /// (the families in [`buffer_format`]).
+    fn format_is_uint_sint(&mut self, fmt: V) -> (V, V) {
+        let c = self.cur;
+        // Numbers from `buffer_format`'s UINT / SINT slots (1..=77).
+        const UINTS: &[u32] = &[5, 11, 18, 20, 27, 34, 41, 48, 54, 60, 62, 69, 72, 75];
+        const SINTS: &[u32] = &[6, 12, 19, 21, 28, 35, 42, 49, 55, 61, 63, 70, 73, 76];
+        let mut is_uint = self.s.m.int_const(self.s.t.i1, 0);
+        for &n in UINTS {
+            let lit = self.s.m.i32(n);
+            let eq = self.s.m.cmp(c, pred::EQ, fmt, lit);
+            is_uint = self.s.m.bin(c, Bin::Or, is_uint, eq);
+        }
+        let mut is_sint = self.s.m.int_const(self.s.t.i1, 0);
+        for &n in SINTS {
+            let lit = self.s.m.i32(n);
+            let eq = self.s.m.cmp(c, pred::EQ, fmt, lit);
+            is_sint = self.s.m.bin(c, Bin::Or, is_sint, eq);
+        }
+        (is_uint, is_sint)
+    }
+
     /// `x` (an f16 in the low bits) as the low half of VGPR `reg`: 16-bit
     /// results keep the register's high half (GFX10).
     fn low_half(&mut self, inst: &Inst, reg: u8, x: V) -> V {
@@ -7136,6 +7181,7 @@ impl<'a> Lower<'a> {
         let Fields::Image {
             data,
             addr,
+            rsrc,
             dmask,
             dim,
             unorm,
@@ -7758,6 +7804,96 @@ impl<'a> Lower<'a> {
             } else {
                 self.s.m.i32(0)
             };
+            // VIC-BT-017: d16 image_load packs two channels per VGPR and must
+            // keep an odd trailing high half; UINT/SINT texels saturate to 16
+            // bits via textureLoad.i32 rather than going through f16.
+            if *d16 {
+                let Operand::Vector { reg, .. } = *data else {
+                    return Err("an image result");
+                };
+                let channels: Vec<u32> = (0..4).filter(|ch| dmask >> ch & 1 != 0).collect();
+                let mut args = vec![h, mip];
+                args.extend(&cs);
+                args.extend([iu, iu, iu]);
+                let r_f = self.s.op(
+                    c,
+                    "textureLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    66,
+                    &args,
+                );
+                // U32 component type, four channels (matches 0x409 for F32).
+                let h_i = self.handle(site, src, false, (props.0, 0x405))?;
+                let i32t = self.s.t.i32;
+                let res_i = self
+                    .s
+                    .m
+                    .named_struct("dx.types.ResRet.i32", vec![i32t, i32t, i32t, i32t, i32t]);
+                let mut args_i = vec![h_i, mip];
+                args_i.extend(&cs);
+                args_i.extend([iu, iu, iu]);
+                let r_i = self
+                    .s
+                    .op(c, "textureLoad.i32", Attr::ReadOnly, res_i, 66, &args_i);
+                // SQ_IMG_RSRC_WORD1.FORMAT at bits 20..28 (GFX10).
+                let (is_uint, is_sint) = match rsrc {
+                    Operand::Scalar { code, dwords } if *dwords >= 2 => {
+                        let w1 = inst
+                            .read(Reg::S(code + 1))
+                            .ok_or("an unread image descriptor")?;
+                        let w1 = self.i32_of(w1)?;
+                        let sh = self.s.m.i32(20);
+                        let mask = self.s.m.i32(0x1FF);
+                        let fmt = self.s.m.bin(c, Bin::LShr, w1, sh);
+                        let fmt = self.s.m.bin(c, Bin::And, fmt, mask);
+                        self.format_is_uint_sint(fmt)
+                    }
+                    _ => (
+                        self.s.m.int_const(self.s.t.i1, 0),
+                        self.s.m.int_const(self.s.t.i1, 0),
+                    ),
+                };
+                let mut halves = Vec::new();
+                for ch in channels {
+                    let f = self.s.m.extract(c, r_f, ch);
+                    let f16 = self.f16_nearest(f);
+                    let i = self.s.m.extract(c, r_i, ch);
+                    let u = self.saturate_u16(i);
+                    let s = self.saturate_i16(i);
+                    let int = self.s.m.select(c, is_sint, s, u);
+                    let is_int = self.s.m.bin(c, Bin::Or, is_uint, is_sint);
+                    halves.push(self.s.m.select(c, is_int, int, f16));
+                }
+                let k16 = self.s.m.i32(16);
+                let n = halves.len();
+                let mut xs = Vec::new();
+                for (k, pair) in halves.chunks(2).enumerate() {
+                    let packed = match *pair {
+                        [lo, hi] => {
+                            let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                            self.s.m.bin(c, Bin::Or, lo, hi)
+                        }
+                        [lo] => lo,
+                        _ => unreachable!("chunks of one or two"),
+                    };
+                    let reg = reg + k as u8;
+                    let x = if k * 2 + 1 == n {
+                        #[cfg(test)]
+                        {
+                            self.s.d16_kept_high_halves += 1;
+                        }
+                        self.low_half(inst, reg, packed)
+                    } else {
+                        packed
+                    };
+                    xs.push((reg, x));
+                }
+                for (reg, x) in xs {
+                    self.write(inst, Reg::V(reg), x, guard);
+                }
+                return Ok(());
+            }
             let mut args = vec![h, mip];
             args.extend(&cs);
             args.extend([iu, iu, iu]);
@@ -7781,27 +7917,7 @@ impl<'a> Lower<'a> {
         let mut xs = Vec::new();
         for ch in channels {
             let x = self.s.m.extract(c, r, ch);
-            xs.push(if *d16 {
-                // shortcut: d16 results are taken as floats (rounded to
-                // nearest even); integer formats would keep 16 bits.
-                self.f16_nearest(x)
-            } else {
-                self.as_int(x)
-            });
-        }
-        if *d16 {
-            // Two channels per VGPR, low half first (an odd last high half 0).
-            let k16 = self.s.m.i32(16);
-            xs = xs
-                .chunks(2)
-                .map(|p| match *p {
-                    [lo, hi] => {
-                        let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
-                        self.s.m.bin(c, Bin::Or, lo, hi)
-                    }
-                    _ => p[0],
-                })
-                .collect();
+            xs.push(self.as_int(x));
         }
         for (k, x) in xs.into_iter().enumerate() {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
@@ -10160,6 +10276,62 @@ mod tests {
                 l.d16_kept_high_halves, 1,
                 "format {format}: odd d16 channel keeps the high half"
             );
+        }
+    }
+
+    /// `image_load` with `dmask` and optional `d16` into `v[vdata]`, address in
+    /// `v[vaddr]`, resource `s[srsrc:srsrc+7]`.
+    fn image_load(dmask: u8, d16: bool, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+        let dim = 1u32; // SQ_RSRC_IMG_2D
+        [
+            0xF000_0000 | u32::from(dmask) << 8 | dim << 3,
+            u32::from(d16) << 31
+                | (u32::from(srsrc) >> 2 & 0x1F) << 16
+                | u32::from(vdata) << 8
+                | u32::from(vaddr),
+        ]
+    }
+
+    /// Seeds `v[reg]` then `image_load` d16 with `dmask` into it; writes the
+    /// packed result to LDS so it stays live.
+    fn d16_image_load_program(dmask: u8, reg: u8, seed: u32) -> Vec<u32> {
+        let channels = dmask.count_ones().div_ceil(2);
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0
+        ];
+        // v_mov_b32 v[reg], seed
+        words.extend_from_slice(&[0x7E00_0000 | (reg as u32) << 17 | 0x01 << 9 | 255, seed]);
+        words.push(v_mov(2, 128)); // v2 = 0 (x)
+        words.push(v_mov(3, 128)); // v3 = 0 (y)
+        words.extend_from_slice(&image_load(dmask, true, reg, 2, 12));
+        words.push(v_mov(5, 128)); // LDS address
+        for k in 0..channels as u8 {
+            words.extend_from_slice(&ds_write_b32(5, reg + k));
+        }
+        words.push(S_ENDPGM);
+        words
+    }
+
+    #[test]
+    fn packed_d16_image_loads_keep_an_odd_high_half() {
+        // VIC-BT-017: a one-channel d16 image_load leaves vdst[31:16] intact;
+        // a full pair (dmask:0x3) replaces the whole dword.
+        let (layout, used) = texture_tables();
+        for (label, dmask, want) in [
+            ("dmask1", 0x1u8, 1u32),
+            ("dmask3", 0x3, 0),
+            ("dmask7", 0x7, 1),
+        ] {
+            let l = lower_with(
+                &d16_image_load_program(dmask, 0, 0x5A5A_0000),
+                layout.clone(),
+                used.clone(),
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(l.d16_kept_high_halves, want, "{label}");
         }
     }
 
