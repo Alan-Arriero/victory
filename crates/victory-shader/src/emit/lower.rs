@@ -3571,10 +3571,7 @@ impl<'a> Lower<'a> {
         if buffer_view || srv.is_some() {
             // A listed structured SRV in a table is read element by element;
             // a heap view of no listed kind is read as raw bytes.
-            let stride = srv
-                .filter(|u| u.root == RootType::Table && u.stride > 4 && u.stride.is_multiple_of(4))
-                .map(|u| u.stride)
-                .or_else(|| self.bound_structured_stride(src, false, false));
+            let stride = self.scalar_srv_stride(src, srv);
             let h = match stride {
                 Some(stride) => self.handle(site, src, false, (12, stride))?,
                 None => self.handle(site, src, false, (11, 0))?,
@@ -3727,6 +3724,13 @@ impl<'a> Lower<'a> {
         matches!((first_lane_of(x), first_lane_of(y)), (Some(a), Some(b)) if a == b)
     }
 
+    /// The element stride used by scalar data loads through this SRV.
+    fn scalar_srv_stride(&self, src: &Source, srv: Option<&UsedResource>) -> Option<u32> {
+        srv.filter(|u| u.root == RootType::Table && u.stride > 4 && u.stride.is_multiple_of(4))
+            .map(|u| u.stride)
+            .or_else(|| self.bound_structured_stride(src, false, false))
+    }
+
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         if self.atomic_descriptor_loads.contains(&site) {
             return Ok(());
@@ -3801,6 +3805,28 @@ impl<'a> Lower<'a> {
                         return Err("a constant buffer's descriptor read as data");
                     }
                     (props, None)
+                }
+                Fields::Smem { .. }
+                    if un.starts_with("s_buffer_load_dword")
+                        && used.is_some_and(|u| {
+                            u.kind == ResourceType::Srv && u.root == RootType::Table
+                        }) =>
+                {
+                    // A scalar buffer load consumes its descriptor without
+                    // reading word 2 as a count. Keep that path free of a
+                    // dimensions query unless another operand needs the count.
+                    let k = u32::from(first) + 2;
+                    if k >= count
+                        || inst
+                            .write(Reg::S(code + k as u8))
+                            .is_none_or(|v| !self.scalar_record_count_used(v))
+                    {
+                        return Err("a scalar memory read as data");
+                    }
+                    let stride = self
+                        .scalar_srv_stride(&src, used)
+                        .ok_or("a scalar memory read as data")?;
+                    ((12, stride), None)
                 }
                 _ => return Err("a scalar memory read as data"),
             };
@@ -3908,6 +3934,23 @@ impl<'a> Lower<'a> {
             b.phis.iter().any(|p| p.args.contains(&v))
                 || b.insts.iter().any(|i| {
                     !i.name().starts_with("v_interp_p2") && i.reads.iter().any(|r| r.1 == v)
+                })
+        })
+    }
+
+    /// A scalar buffer load takes the whole descriptor by reference. Its
+    /// byte offset can also name one of those SGPRs, this time as a value.
+    fn scalar_record_count_used(&self, v: Value) -> bool {
+        self.x.p.blocks.iter().any(|b| {
+            b.phis.iter().any(|p| p.args.contains(&v))
+                || b.insts.iter().any(|i| {
+                    if let Fields::Smem { soffset, .. } = i.fields
+                        && i.name().starts_with("s_buffer_load_dword")
+                    {
+                        return matches!(soffset, Operand::Scalar { code, .. }
+                            if i.read(Reg::S(code)) == Some(v));
+                    }
+                    i.reads.iter().any(|r| r.1 == v)
                 })
         })
     }
