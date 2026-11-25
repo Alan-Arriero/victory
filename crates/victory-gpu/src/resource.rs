@@ -331,6 +331,82 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
 /// typeless depth resources.
 pub(crate) const DEPTH_FORMATS: [(u32, u32); 4] = [(20, 19), (40, 39), (45, 44), (55, 53)];
 
+/// Default concrete format for a typeless DXGI family. Depth multi-plane,
+/// block-compressed, and 96-bit `R32G32B32` allow shader views only
+/// (`None` when `unordered`). Device-specific typed-UAV support is the
+/// caller's to check.
+pub(crate) fn typeless_default_format(typeless: u32, unordered: bool) -> Option<u32> {
+    // DXGI_FORMAT numbers: typeless → a common concrete member of the family.
+    match typeless {
+        // R24G8_TYPELESS → R24_UNORM_X8_TYPELESS
+        44 => (!unordered).then_some(46),
+        // R32G8X24_TYPELESS → R32_FLOAT_X8X24_TYPELESS
+        19 => (!unordered).then_some(21),
+        // BC1..BC7 typeless → UNORM / UF16 (SRV only)
+        70 => (!unordered).then_some(71),
+        73 => (!unordered).then_some(74),
+        76 => (!unordered).then_some(77),
+        79 => (!unordered).then_some(80),
+        82 => (!unordered).then_some(83),
+        94 => (!unordered).then_some(95),
+        97 => (!unordered).then_some(98),
+        // R32G32B32_TYPELESS → FLOAT (no typed UAV in D3D12)
+        5 => (!unordered).then_some(6),
+        // Color typeless → FLOAT / UNORM defaults
+        1 => Some(2),   // R32G32B32A32
+        9 => Some(10),  // R16G16B16A16
+        15 => Some(16), // R32G32
+        23 => Some(24), // R10G10B10A2
+        27 => Some(28), // R8G8B8A8
+        33 => Some(34), // R16G16
+        39 => Some(41), // R32
+        48 => Some(49), // R8G8
+        53 => Some(54), // R16
+        60 => Some(61), // R8
+        90 => Some(87), // B8G8R8A8
+        92 => Some(88), // B8G8R8X8
+        _ => None,
+    }
+}
+
+/// Concrete format for a null or `DXGI_FORMAT_UNKNOWN` SRV/UAV of a typeless
+/// host texture. `title` is the console format when the host copy was promoted
+/// from a typed resource (depth without deny-shader, or sRGB with UAV); `None`
+/// when the title created the resource typeless. Maps sRGB → linear for UAVs
+/// and depth → an SRV-capable plane format. (#438 VIC-BT-004)
+pub(crate) fn null_view_format(
+    host_typeless: u32,
+    title: Option<u32>,
+    unordered: bool,
+) -> Option<u32> {
+    const D16_UNORM: u32 = 55;
+    const R16_UNORM: u32 = 56;
+    if let Some(fmt) = title {
+        if unordered {
+            let linear = SRGB
+                .iter()
+                .find(|&&(srgb, _)| srgb == fmt)
+                .map(|&(_, linear)| linear)
+                .unwrap_or(fmt);
+            if DEPTH_FORMATS
+                .iter()
+                .any(|&(typed, _)| typed == linear || typed == fmt)
+            {
+                return None;
+            }
+            return Some(linear);
+        }
+        if fmt == D16_UNORM {
+            return Some(R16_UNORM);
+        }
+        if DEPTH_FORMATS.iter().any(|&(typed, _)| typed == fmt) {
+            return typeless_default_format(host_typeless, false);
+        }
+        return Some(fmt);
+    }
+    typeless_default_format(host_typeless, unordered)
+}
+
 /// Mip levels, the full chain for 0.
 fn mip_count(desc: &ResourceDesc) -> u32 {
     let depth = if desc.dimension == TEXTURE_3D {
@@ -2017,6 +2093,64 @@ mod tests {
     #[test]
     fn a_missing_resource_has_no_default_view_format() {
         assert_eq!(view_format(std::ptr::null()), None);
+    }
+
+    /// Null / UNKNOWN SRV and UAV formats for typeless host copies, including
+    /// textures `host_texture` promotes from typed console formats (VIC-BT-004).
+    #[test]
+    fn null_view_formats_for_typeless_and_promoted_textures() {
+        const R8G8B8A8_TYPELESS: u32 = 27;
+        const R8G8B8A8_UNORM: u32 = 28;
+        const R8G8B8A8_UNORM_SRGB: u32 = 29;
+        const R32_TYPELESS: u32 = 39;
+        const D32_FLOAT: u32 = 40;
+        const R32_FLOAT: u32 = 41;
+        const R24G8_TYPELESS: u32 = 44;
+        const D24_UNORM_S8_UINT: u32 = 45;
+        const R24_UNORM_X8_TYPELESS: u32 = 46;
+        const R16_TYPELESS: u32 = 53;
+        const D16_UNORM: u32 = 55;
+        const R16_UNORM: u32 = 56;
+
+        // Title-created typeless: inherit a family default.
+        assert_eq!(
+            null_view_format(R8G8B8A8_TYPELESS, None, false),
+            Some(R8G8B8A8_UNORM)
+        );
+        assert_eq!(
+            null_view_format(R8G8B8A8_TYPELESS, None, true),
+            Some(R8G8B8A8_UNORM)
+        );
+        assert_eq!(null_view_format(R24G8_TYPELESS, None, true), None);
+
+        // sRGB + UAV promotes to typeless: SRV keeps sRGB, UAV is linear.
+        assert_eq!(
+            null_view_format(R8G8B8A8_TYPELESS, Some(R8G8B8A8_UNORM_SRGB), false),
+            Some(R8G8B8A8_UNORM_SRGB)
+        );
+        assert_eq!(
+            null_view_format(R8G8B8A8_TYPELESS, Some(R8G8B8A8_UNORM_SRGB), true),
+            Some(R8G8B8A8_UNORM)
+        );
+
+        // Depth without deny-shader promotes to typeless: SRV uses a plane format.
+        assert_eq!(
+            null_view_format(R32_TYPELESS, Some(D32_FLOAT), false),
+            Some(R32_FLOAT)
+        );
+        assert_eq!(
+            null_view_format(R24G8_TYPELESS, Some(D24_UNORM_S8_UINT), false),
+            Some(R24_UNORM_X8_TYPELESS)
+        );
+        assert_eq!(
+            null_view_format(R16_TYPELESS, Some(D16_UNORM), false),
+            Some(R16_UNORM)
+        );
+        assert_eq!(
+            null_view_format(R32_TYPELESS, Some(D32_FLOAT), true),
+            None,
+            "depth has no typed UAV"
+        );
     }
 
     #[test]
