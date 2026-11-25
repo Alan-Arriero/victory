@@ -1822,7 +1822,9 @@ impl<'a> Lower<'a> {
     /// binary16 matches a single round of the exact `a*b + c` (RDNA2
     /// `v_fma_mixlo_f16` / `v_fma_mixhi_f16`). Without this, an exact value
     /// just above a half-ulp midpoint can round to the midpoint in f32 and
-    /// then tie-to-even the wrong way in f16.
+    /// then tie-to-even the wrong way in f16. The sticky step picks the
+    /// adjacent odd f32 toward the exact result (residual sign); always
+    /// OR-ing 1 would push a just-below-midpoint value across the midpoint.
     fn fmad_round_to_odd(&mut self, a: V, b: V, c: V) -> V {
         let cur = self.cur;
         let r = self.fmad(a, b, c);
@@ -1841,9 +1843,25 @@ impl<'a> Lower<'a> {
         let inf = self.s.m.i32(0x7F80_0000);
         let finite = self.s.m.cmp(cur, pred::IULT, abs, inf);
         let adjust = self.s.m.bin(cur, Bin::And, sticky, finite);
+        // Already odd: keep. Even: step one ulp toward the exact value.
         let one = self.s.m.i32(1);
-        let odd = self.s.m.bin(cur, Bin::Or, bits, one);
-        let out = self.s.m.select(cur, adjust, odd, bits);
+        let lsb = self.s.m.bin(cur, Bin::And, bits, one);
+        let even = self.s.m.cmp(cur, pred::EQ, lsb, zero);
+        let do_step = self.s.m.bin(cur, Bin::And, adjust, even);
+        let sign = self.s.m.i32(0x8000_0000);
+        let err_sign = self.s.m.bin(cur, Bin::And, err_bits, sign);
+        let err_pos = self.s.m.cmp(cur, pred::EQ, err_sign, zero);
+        let abs_zero = self.s.m.cmp(cur, pred::EQ, abs, zero);
+        let min_neg = self.s.m.i32(0x8000_0001);
+        let stepped_z = self.s.m.select(cur, err_pos, one, min_neg);
+        let xored = self.s.m.bin(cur, Bin::Xor, err_bits, bits);
+        let xored_sign = self.s.m.bin(cur, Bin::And, xored, sign);
+        let same_sign = self.s.m.cmp(cur, pred::EQ, xored_sign, zero);
+        let up = self.s.m.bin(cur, Bin::Add, bits, one);
+        let down = self.s.m.bin(cur, Bin::Sub, bits, one);
+        let stepped_nz = self.s.m.select(cur, same_sign, up, down);
+        let stepped = self.s.m.select(cur, abs_zero, stepped_z, stepped_nz);
+        let out = self.s.m.select(cur, do_step, stepped, bits);
         self.as_float(out)
     }
 
@@ -11217,8 +11235,19 @@ mod tests {
         let err = a.mul_add(b, -r) + c;
         let mut bits = r.to_bits();
         let sticky = err.to_bits() & 0x7FFF_FFFF != 0;
-        if sticky && bits & 0x7FFF_FFFF < 0x7F80_0000 {
-            bits |= 1;
+        if sticky && bits & 0x7FFF_FFFF < 0x7F80_0000 && bits & 1 == 0 {
+            let abs = bits & 0x7FFF_FFFF;
+            if abs == 0 {
+                bits = if err.to_bits() & 0x8000_0000 == 0 {
+                    0x1
+                } else {
+                    0x8000_0001
+                };
+            } else {
+                // Same sign of residual and `r` → away from zero (+1 to bits).
+                let same_sign = (err.to_bits() ^ bits) & 0x8000_0000 == 0;
+                bits = if same_sign { bits + 1 } else { bits - 1 };
+            }
         }
         f32::from_bits(bits)
     }
@@ -11288,13 +11317,13 @@ mod tests {
     fn fma_mix_f16_round_to_odd_matches_single_round() {
         // Midpoint ties where f32 FMA alone then f16 RNE double-rounds the
         // wrong way (VIC-BT-041): exact is just above 1 + 2^-11.
-        let mid_cases = [
+        let above_mid = [
             (1.0f32, 1.0f32, f32::from_bits(0x3A00_0001)),
             (1.0, 1.0, 2.0f32.powi(-11) + 2.0f32.powi(-30)),
             (-1.0, 1.0, -(2.0f32.powi(-11) + 2.0f32.powi(-30))),
             (2.0, 0.5, f32::from_bits(0x3A00_0001)),
         ];
-        for (a, b, c) in mid_cases {
+        for (a, b, c) in above_mid {
             let want = fma_f16_single_round(a, b, c);
             let got = f16_nearest_f32(f32_fma_round_to_odd(a, b, c));
             let double = f16_nearest_f32(a.mul_add(b, c));
@@ -11305,6 +11334,26 @@ mod tests {
             assert_eq!(
                 got, want,
                 "RTO path {a:?}*{b:?}+{c:?} = {got:#06x}, want {want:#06x} (double-round {double:#06x})"
+            );
+        }
+        // Just below the same midpoint: f32 FMA alone already ties correctly,
+        // but always-OR-1 sticky would cross the midpoint the wrong way.
+        let below_mid = [
+            (1.0f32, 1.0f32, 2.0f32.powi(-11) - 2.0f32.powi(-30)),
+            (-1.0, 1.0, -(2.0f32.powi(-11) - 2.0f32.powi(-30))),
+            (2.0, 0.5, 2.0f32.powi(-11) - 2.0f32.powi(-30)),
+        ];
+        for (a, b, c) in below_mid {
+            let want = fma_f16_single_round(a, b, c);
+            let got = f16_nearest_f32(f32_fma_round_to_odd(a, b, c));
+            let naive = f16_nearest_f32(f32::from_bits(a.mul_add(b, c).to_bits() | 1));
+            assert_ne!(
+                naive, want,
+                "case should catch always-OR-1: {a:?}*{b:?}+{c:?}"
+            );
+            assert_eq!(
+                got, want,
+                "below-mid RTO {a:?}*{b:?}+{c:?} = {got:#06x}, want {want:#06x} (naive {naive:#06x})"
             );
         }
         // Exact and ordinary results still match single-round.

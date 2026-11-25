@@ -1648,10 +1648,15 @@ fn fma_mix_f16_single_rounds_midpoint_ties() {
     let f = f32::to_bits;
     // 1*1 + (2^-11 + 1 ulp): exact sits just above the 1 + 2^-11 midpoint.
     let c = 0x3A00_0001u32;
+    // 2^-11 - 2^-30: exact sits just below the same midpoint.
+    let c_below = f(2.0f32.powi(-11) - 2.0f32.powi(-30));
     let cases: &[([u32; 4], u32)] = &[
         ([f(1.0), f(1.0), c, 0], 0x3C01),
         ([f(-1.0), f(1.0), c | 0x8000_0000, 0], 0xBC01),
         ([f(2.0), f(0.5), c, 0], 0x3C01),
+        ([f(1.0), f(1.0), c_below, 0], 0x3C00),
+        ([f(-1.0), f(1.0), c_below | 0x8000_0000, 0], 0xBC00),
+        ([f(2.0), f(0.5), c_below, 0], 0x3C00),
         // Ordinary fused multiply-add still lands on the exact half.
         ([f(2.0), f(3.0), f(1.0), 0], 0x4700), // 7.0
     ];
