@@ -54,7 +54,7 @@ pub(crate) struct Staging {
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hash: Option<(u32, blake3::Hash)>,
     asked: u64,
 }
 
@@ -64,7 +64,9 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
-static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+type Stagings = HashMap<usize, Vec<Arc<Staging>>>;
+
+static STAGING: Mutex<Option<Stagings>> = Mutex::new(None);
 
 thread_local! {
     /// Texture memory read for hashing and detiling: one per submitting
@@ -421,6 +423,7 @@ impl Staging {
                 return 0;
             }
             last.asked = now;
+            last.hash = None;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_tiled_copy(self.memory, size, |tiled| self.detile(tiled));
@@ -428,15 +431,19 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
         }
-        if !committed(self.memory, size) {
-            #[cfg(feature = "diagnostics")]
-            tracing::debug!(
-                memory = ?self.memory,
-                size,
-                desc = ?self.layout.desc,
-                "a sampled texture's memory is not committed"
-            );
-            return 0;
+        last.asked = 0;
+        let resident = committed_prefix(self.memory, size);
+        if resident < size {
+            // A full-chain copy may follow a placed view with only its tail
+            // resident. Populate the same tail at its full-chain footprints.
+            let end = self.first + self.footprints.len() as u32;
+            let first =
+                (self.first..end).find(|&mip| self.layout.bytes_from(mip) <= resident as u64);
+            let bytes = first.map_or(0, |mip| self.layout.bytes_from(mip) as usize);
+            with_tiled_copy(self.memory, bytes, |tiled| {
+                self.changed(last, tiled, first.unwrap_or(end));
+            });
+            return bytes;
         }
         // Read through the kernel, as above: the title may unmap the pages
         // (evicting a texture a big table lists) while we read them, and a
@@ -444,22 +451,22 @@ impl Staging {
         SCRATCH.with_borrow_mut(|tiled| {
             tiled.resize(size, 0);
             crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
-            self.changed(last, tiled)
+            self.changed(last, tiled, self.first)
         })
     }
 
     /// After reading the texture's memory into `tiled`: detiles it unless
     /// its hash is the last one's. Returns the bytes read.
-    fn changed(&self, last: &mut Last, tiled: &[u8]) -> usize {
+    fn changed(&self, last: &mut Last, tiled: &[u8], first: u32) -> usize {
         let size = tiled.len();
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        if last.hash == Some((first, hash)) {
             return size;
         }
-        last.hash = Some(hash);
-        self.detile(tiled);
+        last.hash = Some((first, hash));
+        self.detile_from(tiled, first);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
@@ -476,6 +483,10 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        self.detile_from(tiled, self.first);
+    }
+
+    fn detile_from(&self, tiled: &[u8], first: u32) {
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -494,6 +505,10 @@ impl Staging {
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
+            if sub < first {
+                linear.fill(0);
+                continue;
+            }
             if let Err(e) =
                 self.layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
@@ -522,6 +537,10 @@ fn with_tiled_copy(memory: *const u8, size: usize, detile: impl FnOnce(&[u8])) {
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
+    committed_prefix(at, len) == len
+}
+
+fn committed_prefix(at: *const u8, len: usize) -> usize {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     let mut p = at as usize;
     let end = p + len;
@@ -531,11 +550,11 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
         if n == 0 || info.State != MEM_COMMIT {
-            return false;
+            break;
         }
         p = info.BaseAddress as usize + info.RegionSize;
     }
-    true
+    p.min(end) - at as usize
 }
 
 /// The staging state of a title texture, made on first use.
@@ -549,9 +568,11 @@ fn staging(resource: This, texture: &ID3D12Resource, requested: u32) -> Option<A
             0
         }
     };
-    if let Some(s) = map.get(&(resource as usize))
-        && s.first == first_mip(&s.layout, s.mips)
-    {
+    if let Some(s) = map.get(&(resource as usize)).and_then(|ranges| {
+        let cached = ranges.first()?;
+        let first = first_mip(&cached.layout, cached.mips);
+        ranges.iter().find(|s| s.first == first)
+    }) {
         return Some(s.clone());
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
@@ -614,11 +635,7 @@ fn staging(resource: This, texture: &ID3D12Resource, requested: u32) -> Option<A
         memory,
         last: Mutex::default(),
     });
-    let previous = map.insert(resource as usize, s.clone());
-    drop(cache);
-    if let Some(old) = previous {
-        crate::host::retire(old);
-    }
+    map.entry(resource as usize).or_default().push(s.clone());
     Some(s)
 }
 
@@ -680,7 +697,11 @@ mod tests {
         assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
     }
 
-    fn test_texture(width: u32, mips: u16) -> (This, &'static ID3D12Resource) {
+    fn test_texture(
+        width: u32,
+        mips: u16,
+        address: Option<u64>,
+    ) -> (This, &'static ID3D12Resource) {
         use windows::Win32::Graphics::Dxgi::Common::{
             DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
         };
@@ -706,7 +727,17 @@ mod tests {
         };
         let iid = ID3D12Resource::IID;
         let mut tex = null;
-        assert_eq!(
+        let result = if let Some(at) = address {
+            crate::resource::create_at_address(
+                null,
+                at,
+                (&raw const desc).cast(),
+                0,
+                null.cast(),
+                (&raw const iid).cast(),
+                &mut tex,
+            )
+        } else {
             crate::resource::create_committed(
                 null,
                 (&raw const heap).cast(),
@@ -716,9 +747,9 @@ mod tests {
                 null.cast(),
                 (&raw const iid).cast(),
                 &mut tex,
-            ),
-            crate::object::S_OK
-        );
+            )
+        };
+        assert_eq!(result, crate::object::S_OK);
         let host_tex = crate::resource::host_resource(tex).expect("host texture");
         (tex, host_tex)
     }
@@ -729,7 +760,14 @@ mod tests {
             eprintln!("skipping texture readback: no D3D12 device");
             return;
         };
-        let (resource, texture) = test_texture(256, 9);
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        // SAFETY: reserve space for the complete texture without committing its pages.
+        let memory = unsafe { VirtualAlloc(std::ptr::null(), 2 << 20, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!memory.is_null());
+        let (resource, texture) = test_texture(256, 9, Some(memory as u64));
         let mut words = [0; 16];
         words[1] = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
         words[4] = 8;
@@ -745,12 +783,34 @@ mod tests {
         assert_eq!(tail.footprints.len(), 1);
         assert_eq!(tail.tiled_bytes as u64, tail.layout.bytes_from(first));
         assert!((tail.tiled_bytes as u64) < tail.layout.size);
-        // SAFETY: our committed resource owns the full layout, including this span.
+        // SAFETY: the tail fits in the reservation and is the only committed span.
+        let mapped_tail =
+            unsafe { VirtualAlloc(memory, tail.tiled_bytes, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(mapped_tail, memory);
+        assert!(!committed(memory.cast(), tail.layout.size as usize));
+        // SAFETY: the committed tail is writable through the resource's address.
         let bytes =
             unsafe { std::slice::from_raw_parts_mut(tail.memory.cast_mut(), tail.tiled_bytes) };
         let pixel = [0xa3, 0xb5, 0xc7, 0xd9];
         tail.layout.tile(bytes, first, 0, &pixel, 4, 4).unwrap();
         assert_eq!(tail.refresh_now(), tail.tiled_bytes);
+        // The placed table, full-chain copy source, and another list can all use
+        // this texture before any of their deferred detiles have run.
+        let other = host.new_list().unwrap();
+        upload_from(&other, resource, texture, 2);
+        let broader = staging(resource, texture, 2).unwrap();
+        assert!(other.covers_texture(resource as usize, 2));
+        assert!(!list.covers_texture(resource as usize, 2));
+        upload(&list, resource, texture);
+        assert!(list.covers_texture(resource as usize, 0));
+        assert!(Arc::ptr_eq(
+            &tail,
+            &staging(resource, texture, first).unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &broader,
+            &staging(resource, texture, 2).unwrap()
+        ));
         crate::list::ensure_state(&list, resource, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
         let (back, mapped) = host.readback_buffer(tail.size).unwrap();
         let dest = D3D12_TEXTURE_COPY_LOCATION {
@@ -771,13 +831,6 @@ mod tests {
         };
         // SAFETY: both locations describe the same 1x1 mip in the copy states.
         unsafe { list.list.CopyTextureRegion(&dest, 0, 0, 0, &src, None) };
-        // A second list requests a broader range while the tail copy is still pending.
-        let other = host.new_list().unwrap();
-        upload_from(&other, resource, texture, 2);
-        assert!(other.covers_texture(resource as usize, 2));
-        assert!(!list.covers_texture(resource as usize, 2));
-        upload_from(&list, resource, texture, 2);
-        assert!(list.covers_texture(resource as usize, 2));
         list.close();
         host.execute(&[&list]);
         // SAFETY: execution waited for the readback of our one RGBA8 texel.
@@ -788,6 +841,8 @@ mod tests {
         assert!(!list.covers_texture(resource as usize, first));
         let release = crate::object::slot::<extern "system" fn(This) -> u32>(resource, 0x10);
         assert_eq!(release(resource), 0);
+        // SAFETY: the lists have been reset and the resource has been released.
+        assert_ne!(unsafe { VirtualFree(memory, 0, MEM_RELEASE) }, 0);
     }
 
     #[test]
@@ -796,7 +851,7 @@ mod tests {
         if host().is_none() {
             return;
         }
-        let (tex, host_tex) = test_texture(4, 1);
+        let (tex, host_tex) = test_texture(4, 1, None);
         let weak = {
             let s = staging(tex, host_tex, 0).expect("staging");
             Arc::downgrade(&s)
@@ -814,7 +869,7 @@ mod tests {
         let Some(host) = host() else {
             return;
         };
-        let (tex, host_tex) = test_texture(4, 1);
+        let (tex, host_tex) = test_texture(4, 1, None);
         let list = host.new_list().expect("host list");
         list.mark_work();
 

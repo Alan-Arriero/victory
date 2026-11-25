@@ -1065,12 +1065,12 @@ impl State {
         // it in SRV state).
         let srv_set: Option<std::collections::HashSet<usize>> =
             (uses_heap_srv && uses_heap_uav && live_srvs.len() > 64)
-                .then(|| live_srvs.iter().map(|h| h.get() as usize).collect());
+                .then(|| live_srvs.iter().map(|(h, _)| h.get() as usize).collect());
         let in_srvs = |r: usize| {
             uses_heap_srv
                 && match &srv_set {
                     Some(set) => set.contains(&r),
-                    None => live_srvs.iter().any(|h| h.get() as usize == r),
+                    None => live_srvs.iter().any(|(h, _)| h.get() as usize == r),
                 }
         };
         let mut uav_transitioned: std::collections::HashSet<usize> =
@@ -1099,7 +1099,7 @@ impl State {
         }
         let mut depth_sampled = false;
         if uses_heap_srv {
-            for held in &live_srvs {
+            for (held, first) in &live_srvs {
                 let r = held.get() as usize;
                 if is_active_rt(r) || uav_transitioned.contains(&r) {
                     continue;
@@ -1119,7 +1119,7 @@ impl State {
                 }
                 if let Some(t) = crate::resource::host_resource(held.get()) {
                     if crate::texture::title_written(t) {
-                        crate::texture::upload(list, held.get(), t);
+                        crate::texture::upload_from(list, held.get(), t, *first);
                     }
                     crate::list::ensure_bindless_state(list, held.get(), SHADER_RESOURCE);
                 }
