@@ -4,7 +4,10 @@
 //! order: slot `i` is made from what the title wrote at slot `i`, when it
 //! writes it (view creation and descriptor copies), when a heap is synced for
 //! direct CPU copies inside heap memory, and again when a draw reads it
-//! through a table and finds the slot changed.
+//! through a table and finds the slot changed. Draws that index
+//! `ResourceDescriptorHeap` also refresh the live buffer ranges tracked here
+//! ([`HostHeap::refresh_bindless_buffers`]) so heap-indexed views stay as
+//! current as table ones.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -36,6 +39,20 @@ type SrvMips = (usize, (u32, u32));
 /// [`TexTracker::changes`] for incremental bindless sync across `tex_gen`
 /// bumps; overflowing falls back to a full `live_textures` walk once.
 const MAX_TEX_CHANGES: usize = 4096;
+
+/// Live title-memory buffer range a heap slot views, for bindless refresh.
+/// The bool is whether the view is unordered (refresh must leave the host
+/// copy in unordered-access state, not generic-read).
+type BufRange = (Arc<Shadow>, u64, u64, bool);
+
+/// Tracks which title slots hold buffer / constant views whose host copies
+/// need a submission-time refresh when a shader indexes `ResourceDescriptorHeap`.
+/// Unaligned and aliased structured slots stay in [`HostHeap::refreshes`] instead.
+#[derive(Default)]
+struct BufTracker {
+    /// Title slot → host copy range. Dynamic slots are never recorded.
+    live: HashMap<u32, BufRange>,
+}
 
 /// Tracks which live host textures each view-heap slot currently references,
 /// keeping `O(active)` live sets of SRV and UAV resources for bindless heaps.
@@ -163,6 +180,8 @@ pub(crate) struct HostHeap {
     next: Mutex<(u32, Vec<bool>)>,
     /// Leaf-only tracker of live SRV/UAV textures across title slots.
     tex_tracker: Mutex<TexTracker>,
+    /// Title slots holding buffer / constant views for bindless refresh.
+    buf_tracker: Mutex<BufTracker>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -355,6 +374,7 @@ impl HostHeap {
             srv_mips: Mutex::new(HashMap::new()),
             next: Mutex::new((0, vec![false; extra as usize])),
             tex_tracker: Mutex::new(TexTracker::new(sampler, count)),
+            buf_tracker: Mutex::new(BufTracker::default()),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -552,6 +572,7 @@ impl HostHeap {
             null_view(self.cpu(index));
         }
         self.keep(index, Kept::Empty);
+        self.track_buffer(index, None);
     }
 
     /// Slot `index` now views `kept` (or nothing of the host's).
@@ -634,19 +655,6 @@ impl HostHeap {
                 true
             }
             None => false,
-        }
-    }
-
-    /// Refreshes every off-element / aliased buffer view this heap holds.
-    /// Table paths call [`Self::refresh_slot`] per entry; ResourceHeap draws
-    /// never walk those tables, so bindless must refresh them here (#553).
-    pub(crate) fn refresh_special_buffers(&self, list: &HostList) {
-        let special: Vec<u32> = {
-            let map = self.refreshes.lock().unwrap_or_else(|e| e.into_inner());
-            map.keys().copied().filter(|&i| i < self.count).collect()
-        };
-        for index in special {
-            let _ = self.refresh_slot(index, list);
         }
     }
 
@@ -790,6 +798,7 @@ impl HostHeap {
                 made[index as usize] = 0;
                 self.make_null(index);
                 self.track_slot(index, None);
+                self.track_buffer(index, None);
             }
             return None;
         };
@@ -817,17 +826,26 @@ impl HostHeap {
                 }
                 _ => None,
             };
+            // Ordinary buffer / constant copies are not in `refreshes` (only
+            // unaligned and aliased structured slots are); record them so
+            // bindless draws can refresh the ranges they index.
+            let buf = match &kept {
+                Some(Kept::Resource(_)) => buffer_refresh_range(&view),
+                _ => None,
+            };
             if !made_ok && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.unwrap_or(Kept::Empty));
             self.track_slot(index, new_entry);
+            self.track_buffer(index, buf);
             // Close the race with `descriptor::forget` running between the initial
             // `view_at` lookup and `track_slot` before this heap's publication.
             if new_entry.is_some() && view_at(i, generation).is_none() {
                 made[index as usize] = 0;
                 self.make_null(index);
                 self.track_slot(index, None);
+                self.track_buffer(index, None);
                 return None;
             }
         }
@@ -933,6 +951,66 @@ impl HostHeap {
         if let Some((res, _, _)) = new_entry {
             tracker.record_change(res);
         }
+    }
+
+    /// Updates the live buffer-range tracker for title slot `index`.
+    fn track_buffer(&self, index: u32, range: Option<BufRange>) {
+        if self.sampler || index >= self.count {
+            return;
+        }
+        let mut tracker = self.buf_tracker.lock().unwrap_or_else(|e| e.into_inner());
+        match range {
+            Some(range) => {
+                tracker.live.insert(index, range);
+            }
+            None => {
+                tracker.live.remove(&index);
+            }
+        }
+    }
+
+    /// Brings title-memory buffer ranges viewed by this heap's title slots up
+    /// to date for a draw or dispatch that indexes `ResourceDescriptorHeap`.
+    ///
+    /// Covers ordinary buffer / constant copies tracked in [`BufTracker`], and
+    /// unaligned / aliased structured slots registered in [`Self::refreshes`].
+    /// Unordered heap views refresh into unordered-access state so the
+    /// dispatch can write them; copy-back of heap-only UAV ranges is still
+    /// skipped (a full-heap snapshot is too expensive; table UAVs still go
+    /// through [`crate::draw`]'s `readable` path).
+    pub(crate) fn refresh_bindless_buffers(&self, list: &HostList) {
+        if self.sampler {
+            return;
+        }
+        let special: Vec<u32> = {
+            let map = self.refreshes.lock().unwrap_or_else(|e| e.into_inner());
+            map.keys().copied().filter(|&i| i < self.count).collect()
+        };
+        for index in special {
+            let _ = self.refresh_slot(index, list);
+        }
+        let live: Vec<BufRange> = {
+            let tracker = self.buf_tracker.lock().unwrap_or_else(|e| e.into_inner());
+            tracker.live.values().cloned().collect()
+        };
+        for (shadow, address, len, is_uav) in live {
+            let access = if is_uav {
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+            } else {
+                D3D12_RESOURCE_STATE_GENERIC_READ
+            };
+            shadow.refresh_as(list, address, len, access);
+        }
+    }
+
+    /// Live buffer ranges currently tracked for bindless refresh (tests).
+    #[cfg(test)]
+    pub(crate) fn live_buffer_count(&self) -> usize {
+        self.buf_tracker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .live
+            .len()
     }
 
     /// Removes all tracked references to `resource` when the title releases it,
@@ -1341,6 +1419,48 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
         4
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+    }
+}
+
+/// Host copy range a buffer or constant view reads, for bindless refresh.
+///
+/// Resolves the shadow the same way descriptor creation does (`find` on the
+/// buffer's full base and length), then refreshes only the viewed subrange —
+/// so overlapping title buffers do not pick a different innermost shadow than
+/// the one the descriptor was created against.
+fn buffer_refresh_range(view: &View) -> Option<BufRange> {
+    let is_uav = matches!(view, View::Unordered(..) | View::Placed(true, ..));
+    let (base, extent) = buffer_host_extent(view)?;
+    if extent == 0 {
+        return None;
+    }
+    let shadow = crate::shadow::find(base, extent)?;
+    let (address, len) = match *view {
+        View::Constant(address, size) => (address, u64::from(size)),
+        _ => buffer_range(view)?,
+    };
+    if len == 0 {
+        return None;
+    }
+    let len = len.min(shadow.left(address));
+    (len > 0).then_some((shadow, address, len, is_uav))
+}
+
+/// The full title buffer a view was created against: base address and length
+/// passed to [`crate::shadow::find`] when making the host descriptor.
+fn buffer_host_extent(view: &View) -> Option<(u64, u64)> {
+    match view {
+        View::Constant(address, size) => Some((*address, u64::from(*size))),
+        View::Shader(resource, Some(_)) | View::Unordered(resource, _, Some(_)) => {
+            let (data, len) = crate::resource::buffer_bytes(*resource as crate::object::This)?;
+            Some((data as u64, len))
+        }
+        View::Placed(_, resource, desc) if resource[0] == 1 => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+            Some((address, len))
+        }
+        _ => None,
     }
 }
 
@@ -3743,6 +3863,60 @@ mod structured_alias_tests {
         let v = view(handle).expect("placed raw SRV");
         let dyn_idx = heap.dynamic(1).expect("dynamic slot");
         assert!(!heap.make_structured_at(dyn_idx, &v, 64));
+    }
+
+    /// Buffer views mirrored for draws are tracked and refreshed when a
+    /// ResourceDescriptorHeap path asks; deferred (non-draw) mirrors are not.
+    #[test]
+    fn bindless_buffer_views_are_tracked_and_refreshed() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let mut backing = vec![0u8; 4096];
+        backing[..16].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        let base = backing.as_ptr() as u64;
+        let _guard = ShadowGuard {
+            resource: base as usize,
+            address: base,
+        };
+        crate::shadow::register(base as usize, base, backing.len() as u64);
+
+        let mut slot = [0u64; 16];
+        // 64 dwords from element 0: a 256-byte raw view of the buffer start.
+        let handle = placed_raw_srv_handle(&mut slot, base, 256, 0, 64);
+
+        assert!(heap.mirror(0, handle, false).is_some());
+        assert_eq!(
+            heap.live_buffer_count(),
+            0,
+            "deferred buffer mirrors must not track yet"
+        );
+
+        assert!(heap.mirror(0, handle, true).is_some());
+        assert_eq!(
+            heap.live_buffer_count(),
+            1,
+            "draw-time mirror must track the buffer range"
+        );
+
+        backing[..16].fill(0xAB);
+        let list = host.new_list().expect("host list");
+        heap.refresh_bindless_buffers(&list);
+        list.close();
+        host.execute(&[&list]);
+
+        let shadow = crate::shadow::find(base, 16).expect("shadow");
+        assert_eq!(
+            shadow.bytes(base, 16).expect("mapped"),
+            &[0xAB; 16],
+            "bindless refresh must copy title writes into the host copy"
+        );
+
+        heap.make_null(0);
+        assert_eq!(heap.live_buffer_count(), 0);
     }
 
     #[test]
