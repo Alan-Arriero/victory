@@ -658,19 +658,6 @@ impl HostHeap {
         }
     }
 
-    /// Refreshes every off-element / aliased buffer view this heap holds.
-    /// Table paths call [`Self::refresh_slot`] per entry; ResourceHeap draws
-    /// never walk those tables, so bindless must refresh them here (#553).
-    pub(crate) fn refresh_special_buffers(&self, list: &HostList) {
-        let special: Vec<u32> = {
-            let map = self.refreshes.lock().unwrap_or_else(|e| e.into_inner());
-            map.keys().copied().filter(|&i| i < self.count).collect()
-        };
-        for index in special {
-            let _ = self.refresh_slot(index, list);
-        }
-    }
-
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
