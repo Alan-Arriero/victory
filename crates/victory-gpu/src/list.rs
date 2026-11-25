@@ -205,7 +205,9 @@ pub(crate) fn segments(this: This) -> Vec<Segment> {
     let segments = list.segments.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = segments.clone();
     if let Some(current) = host.as_ref()
-        && (list.has_work.load(std::sync::atomic::Ordering::Acquire) || out.is_empty())
+        && (list.has_work.load(std::sync::atomic::Ordering::Acquire)
+            || current.has_epoch()
+            || out.is_empty())
     {
         out.push(Segment::List(current.clone()));
     }
@@ -2903,6 +2905,14 @@ mod tests {
         state::blend_factor(list, &blend);
         state::stencil_ref(list, 0);
         set_pipeline(list, null);
+        // Empty OMSetRenderTargets (0 targets, null depth) must not pin an epoch.
+        slot::<extern "system" fn(This, u32, *const u64, u32, *const u64)>(list, 0x170)(
+            list,
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+        );
         let (c_idle, d_idle) = crate::host::DropCounter::new();
         crate::host::retire(c_idle);
         assert_eq!(

@@ -461,7 +461,6 @@ impl State {
         if crate::host::host().is_none() {
             return;
         }
-        list.mark_work();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(

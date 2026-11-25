@@ -814,6 +814,7 @@ impl Resource {
                 Some(std::sync::Arc::new(HostTexture {
                     texture,
                     state: state.into(),
+                    born_seq: crate::host::birth_seq(),
                 }))
             })
             .as_ref()
@@ -830,6 +831,7 @@ impl Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    pub(crate) born_seq: u64,
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -1088,10 +1090,9 @@ impl Drop for Resource {
                 );
             }
         }
-        // A running submission may still read the host copy.
-        if let Some(host) = self.host.take().flatten() {
-            crate::host::retire(host);
-        }
+        // Forget descriptor/staging/target entries before retiring the host
+        // copy so no concurrent bindless sweep can observe it after retirement
+        // snapshots active epochs.
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension != BUFFER && host_writes(&self.desc) {
@@ -1106,6 +1107,12 @@ impl Drop for Resource {
                 std::ptr::from_ref::<Resource>(self) as usize,
                 self.data() as u64,
             );
+        }
+        // A running submission or list that recorded work after this host copy
+        // was created may still read it.
+        if let Some(host) = self.host.take().flatten() {
+            let born = host.born_seq;
+            crate::host::retire_born(host, born);
         }
     }
 }
