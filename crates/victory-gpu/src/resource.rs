@@ -1306,7 +1306,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // format/flags): do not cache that failure, or the next call would
     // return Some with host == None (VIC-BT-027).
     if resource(out).host().is_none() {
-        object::release(out);
+        object::release_boxed::<Resource>(out);
         return None;
     }
     map.insert((address, *desc), out as usize);
