@@ -185,6 +185,15 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(&list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// Updates draw state even when no host GPU / host list is available (so
+/// Create/Reset `pInitialState` stays testable without D3D12).
+#[cfg(windows)]
+fn with_draw_state(this: This, f: impl FnOnce(&mut crate::draw::State)) {
+    // SAFETY: the title passes one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    f(&mut state.lock().unwrap_or_else(|e| e.into_inner()));
+}
+
 /// Marks the active host list segment as having recorded GPU or deferred work.
 #[cfg(windows)]
 fn mark_work(this: This) {
@@ -419,12 +428,16 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     };
     apply_initial_pipeline(pipeline);
     #[cfg(windows)]
-    with_state(this, |host, state| {
-        if !fresh && !keep_pending {
-            host.reset();
-        }
-        state.reset(pipeline);
-    });
+    {
+        // Remember the PSO even when there is no host list (no D3D12 device):
+        // `with_state` alone would skip the update and leave Create's pipeline.
+        with_draw_state(this, |state| state.reset(pipeline));
+        with_state(this, |host, _| {
+            if !fresh && !keep_pending {
+                host.reset();
+            }
+        });
+    }
     #[cfg(not(windows))]
     {
         let _ = uploads;
@@ -1322,7 +1335,7 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 extern "system" fn set_pipeline(this: This, pipeline: This) {
     apply_initial_pipeline(pipeline);
     #[cfg(windows)]
-    with_state(this, |_, state| state.set_pipeline(pipeline));
+    with_draw_state(this, |state| state.set_pipeline(pipeline));
     #[cfg(not(windows))]
     {
         // SAFETY: the title passes one of our lists.
