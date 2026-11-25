@@ -1546,6 +1546,11 @@ fn supports_typed_uav(format: DXGI_FORMAT) -> bool {
 /// multi-plane, block-compressed, and 96-bit `R32G32B32` formats only allow
 /// shader views (`None` for UAVs); every typed UAV format is gated on the host
 /// device's cached `D3D12_FEATURE_FORMAT_SUPPORT` query.
+///
+/// Production null/UNKNOWN resolution goes through [`concrete_format_for`]
+/// (and `null_view_format`); this helper is the direct typeless-family table
+/// used by the unit tests below.
+#[cfg(test)]
 fn default_concrete_format(typeless: u32, unordered: bool) -> Option<u32> {
     let concrete = crate::resource::typeless_default_format(typeless, unordered)?;
     if unordered && !supports_typed_uav(DXGI_FORMAT(concrete as i32)) {
