@@ -57,6 +57,9 @@ pub(crate) struct Lowered {
     /// Test builds: typed loads assembled from a dword-aligned pair.
     #[cfg(test)]
     pub unaligned_typed_loads: u32,
+    /// Test builds: constant byte offsets of `s_buffer_load_dword*`.
+    #[cfg(test)]
+    pub smem_buffer_bytes: Vec<u32>,
     /// Test builds: indices into the address list of image instructions that
     /// were read.
     #[cfg(test)]
@@ -1208,8 +1211,9 @@ impl<'a> Lower<'a> {
         let has_coverage_op = self.s.m.has_dx_op("dx.op.coverage.i32", 91);
         Ok(Lowered {
             #[cfg(test)]
-            #[cfg(test)]
             unaligned_typed_loads: self.s.unaligned_typed_loads,
+            #[cfg(test)]
+            smem_buffer_bytes: std::mem::take(&mut self.s.smem_buffer_bytes),
             #[cfg(test)]
             image_address_reads: std::mem::take(&mut self.s.image_address_reads),
             #[cfg(test)]
@@ -3587,14 +3591,39 @@ impl<'a> Lower<'a> {
         let kind = self.used_kind(src);
         let c = self.cur;
         let (base, extra) = self.built_offset(src)?;
-        let offset = &((*offset as u32).wrapping_add(base) as i32);
-        let mut addr = self.s.m.i32(*offset as u32);
+        // Hardware clears the low 2 bits of each *instruction* addend
+        // (soffset, immediate offset) before summing, so soffset=3 and
+        // offset:3 load byte 0, not byte 4 from carrying the low bits across.
+        // The built descriptor address (constant `base` + computed `extra`)
+        // is one operand already combined by `resource::combine_sum`: add
+        // those parts first, then truncate their sum, so carries from
+        // constructing the descriptor are kept.
+        let align = |l: &mut Self, v: V| match l.s.m.int_value(v) {
+            Some(n) => l.s.m.i32((n as u32) & !3),
+            None => {
+                let not3 = l.s.m.i32(!3);
+                l.s.m.bin(c, Bin::And, v, not3)
+            }
+        };
+        let add = |l: &mut Self, a: V, b: V| match (l.s.m.int_value(a), l.s.m.int_value(b)) {
+            (Some(x), Some(y)) => l.s.m.i32((x as u32).wrapping_add(y as u32)),
+            _ => l.s.m.bin(c, Bin::Add, a, b),
+        };
+        let mut built = self.s.m.i32(base);
         if let Some(x) = extra {
-            addr = self.s.m.bin(c, Bin::Add, addr, x);
+            built = add(self, built, x);
         }
+        let built = align(self, built);
+        let imm = self.s.m.i32((*offset as u32) & !3);
+        let mut addr = add(self, built, imm);
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
             let so = self.operand(inst, soffset)?;
-            addr = self.s.m.bin(c, Bin::Add, addr, so);
+            let so = align(self, so);
+            addr = add(self, addr, so);
+        }
+        #[cfg(test)]
+        if let Some(v) = self.s.m.int_value(addr) {
+            self.s.smem_buffer_bytes.push(v as u32);
         }
         if matches!(src, Source::Built { address, .. } if address.param == CODE) {
             // A descriptor built around a table in the code.
@@ -3648,19 +3677,15 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let h = self.handle(site, src, false, (13, 0x1_0000))?;
-        let constant = match addr {
-            V::Const(_)
-                if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
-            {
-                Some(*offset as u32)
-            }
-            _ => None,
-        };
+        let constant = self.s.m.int_value(addr).map(|v| v as u32);
         let mut rows: HashMap<u32, V> = HashMap::new();
         for k in 0..count {
             let x = match constant {
                 Some(base) => {
-                    let byte = base + 4 * k;
+                    // Shader byte arithmetic wraps; debug builds must not
+                    // panic when a near-end constant address expands to
+                    // dwordxN (e.g. soffset 0xfffffffc, dwordx2).
+                    let byte = base.wrapping_add(4 * k);
                     let row = match rows.get(&(byte >> 4)) {
                         Some(&r) => r,
                         None => {
@@ -9486,6 +9511,49 @@ mod tests {
             0,
             "dynamic v_perm_b32 must not require INT64"
         );
+    }
+
+    #[test]
+    fn s_buffer_load_truncates_each_address_term_before_adding() {
+        // Hardware masks soffset and imm_offset with & ~3 independently
+        // before adding (VIC-BT-025): soffset=3 and offset:3 load byte 0, not 6.
+        let program = |soffset_imm: u32, imm: u32| {
+            let w0 = 0x3d << 26 | 8 << 18 | 13 << 6 | 4; // s13 from s[8:11]
+            let w1 = 12 << 25 | (imm & 0x1f_ffff);
+            vec![
+                0xBE81_0380, // s_mov_b32 s1, 0
+                0xF408_0200,
+                0xFA00_0000,               // s_load_dwordx4 s[8:11], s[0:1], null
+                0xBE8C_0380 | soffset_imm, // s_mov_b32 s12, imm
+                w0,
+                w1,          // s_buffer_load_dword s13, s[8:11], s12 offset:imm
+                0x7E02_020D, // v_mov_b32 v1, s13
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]
+        };
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let bytes = |so, off| {
+            lower_with(&program(so, off), layout.clone(), used.clone())
+                .unwrap()
+                .smem_buffer_bytes
+        };
+        assert_eq!(bytes(3, 3), vec![0], "3+3 must not carry to byte 4");
+        assert_eq!(bytes(0, 0), vec![0]);
+        assert_eq!(bytes(4, 0), vec![4]);
+        assert_eq!(bytes(0, 4), vec![4]);
+        assert_eq!(bytes(5, 7), vec![8], "(5&~3)+(7&~3) = 8");
     }
 
     #[test]
