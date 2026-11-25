@@ -794,6 +794,31 @@ mod tests {
         let pixel = [0xa3, 0xb5, 0xc7, 0xd9];
         tail.layout.tile(bytes, first, 0, &pixel, 4, 4).unwrap();
         assert_eq!(tail.refresh_now(), tail.tiled_bytes);
+        // Snapshot the partial copy on the GPU before another upload can overwrite it.
+        let read_mip = || {
+            crate::list::ensure_state(&list, resource, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+            let (back, mapped) = host.readback_buffer(tail.size).unwrap();
+            let dest = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: the readback buffer lives through execution.
+                pResource: unsafe { std::mem::transmute_copy(&back) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: tail.footprints[0],
+                },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: the host texture lives through execution.
+                pResource: unsafe { std::mem::transmute_copy(texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: first,
+                },
+            };
+            // SAFETY: both locations describe the same 1x1 mip in the copy states.
+            unsafe { list.list.CopyTextureRegion(&dest, 0, 0, 0, &src, None) };
+            (back, mapped)
+        };
+        let (_partial_buffer, partial_pixel) = read_mip();
         // The placed table, full-chain copy source, and another list can all use
         // this texture before any of their deferred detiles have run.
         let other = host.new_list().unwrap();
@@ -811,30 +836,18 @@ mod tests {
             &broader,
             &staging(resource, texture, 2).unwrap()
         ));
-        crate::list::ensure_state(&list, resource, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
-        let (back, mapped) = host.readback_buffer(tail.size).unwrap();
-        let dest = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: the readback buffer lives through execution.
-            pResource: unsafe { std::mem::transmute_copy(&back) },
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: tail.footprints[0],
-            },
-        };
-        let src = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: the host texture lives through execution.
-            pResource: unsafe { std::mem::transmute_copy(texture) },
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: first,
-            },
-        };
-        // SAFETY: both locations describe the same 1x1 mip in the copy states.
-        unsafe { list.list.CopyTextureRegion(&dest, 0, 0, 0, &src, None) };
+        let (_full_buffer, full_pixel) = read_mip();
         list.close();
         host.execute(&[&list]);
-        // SAFETY: execution waited for the readback of our one RGBA8 texel.
-        assert_eq!(unsafe { mapped.cast::<[u8; 4]>().read_unaligned() }, pixel);
+        // SAFETY: execution finished both copies and both mapped buffers are still live.
+        let (partial, full) = unsafe {
+            (
+                partial_pixel.cast::<[u8; 4]>().read_unaligned(),
+                full_pixel.cast::<[u8; 4]>().read_unaligned(),
+            )
+        };
+        assert_eq!(partial, pixel, "partial upload wrote mip 8");
+        assert_eq!(full, pixel, "full-chain upload preserved mip 8");
         other.close();
         other.reset();
         list.reset();
