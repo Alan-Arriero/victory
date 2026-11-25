@@ -1060,6 +1060,11 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        // D3D12 requires NumCommandLists >= 1; an empty submission is a no-op
+        // (VIC-BT-035 / #440).
+        if runs.is_empty() {
+            return;
+        }
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
