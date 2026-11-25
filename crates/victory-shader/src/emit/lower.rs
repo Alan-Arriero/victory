@@ -3731,8 +3731,52 @@ impl<'a> Lower<'a> {
             .or_else(|| self.bound_structured_stride(src, false, false))
     }
 
+    /// Whether every dword `inst` writes is read only as the descriptor of
+    /// `image_bvh*` instructions (directly or through phis), which never
+    /// look at it.
+    fn read_only_by_bvh(&self, inst: &Inst) -> bool {
+        let mut pending: Vec<Value> = inst.writes.iter().map(|w| w.1).collect();
+        let mut seen = HashSet::new();
+        let mut reads = 0;
+        while let Some(v) = pending.pop() {
+            if !seen.insert(v) {
+                continue;
+            }
+            for block in &self.x.p.blocks {
+                for phi in block.phis.iter().filter(|phi| phi.args.contains(&v)) {
+                    pending.push(phi.value);
+                }
+                for reader in block
+                    .insts
+                    .iter()
+                    .filter(|r| r.reads.iter().any(|r| r.1 == v))
+                {
+                    let rsrc = match &reader.fields {
+                        Fields::Image {
+                            rsrc: Operand::Scalar { code, dwords },
+                            ..
+                        } if reader.name().starts_with("image_bvh") => (*code, *dwords),
+                        _ => return false,
+                    };
+                    let in_rsrc = reader.reads.iter().any(|r| {
+                        r.1 == v
+                            && matches!(r.0, Reg::S(n) if (rsrc.0..rsrc.0 + rsrc.1).contains(&n))
+                    });
+                    if !in_rsrc {
+                        return false;
+                    }
+                    reads += 1;
+                }
+            }
+        }
+        reads > 0
+    }
+
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         if self.atomic_descriptor_loads.contains(&site) {
+            return Ok(());
+        }
+        if self.read_only_by_bvh(inst) {
             return Ok(());
         }
         const OTHER: Why = "a descriptor's address or format read as data";
@@ -6732,6 +6776,54 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, old, x)
     }
 
+    /// `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`: every
+    /// ray misses.
+    ///
+    /// A leaf node (low pointer bits 0..=3) answers with an infinite
+    /// numerator over a denominator of one, so no distance test passes and
+    /// no division gives NaN; a box node (4..=7) answers with four
+    /// `INVALID_NODE` children, so a traversal loop pops its stack and ends.
+    // shortcut: no ray is traced. Shadow rays find no occluder and
+    // reflection rays no surface; real traversal needs the BVH read through
+    // the title's memory.
+    fn bvh_miss(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        let Fields::Image { data, addr, .. } = &inst.fields else {
+            unreachable!()
+        };
+        let guard = self.guard(b, i)?;
+        let c = self.cur;
+        let Some(&Operand::Vector { reg: node, .. }) = addr.first() else {
+            return Err("an image address");
+        };
+        let Operand::Vector { reg, .. } = *data else {
+            return Err("an image result");
+        };
+        let node = inst.read(Reg::V(node)).ok_or("an image address")?;
+        let node = self.i32_of(node)?;
+        let (seven, four) = (self.s.m.i32(7), self.s.m.i32(4));
+        let kind = self.s.m.bin(c, Bin::And, node, seven);
+        let leaf = self.s.m.cmp(c, pred::ULT, kind, four);
+        let invalid = self.s.m.i32(u32::MAX);
+        let (inf, one, zero) = (
+            self.s.m.i32(0x7F80_0000),
+            self.s.m.i32(0x3F80_0000),
+            self.s.m.i32(0),
+        );
+        for (k, (leaf_word, box_word)) in [
+            (inf, invalid),
+            (one, invalid),
+            (zero, invalid),
+            (zero, invalid),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let x = self.s.m.select(c, leaf, leaf_word, box_word);
+            self.write(inst, Reg::V(reg + k as u8), x, guard);
+        }
+        Ok(())
+    }
+
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Image {
             data,
@@ -6748,10 +6840,13 @@ impl<'a> Lower<'a> {
         else {
             unreachable!()
         };
+        let name = inst.name();
+        if name.starts_with("image_bvh") {
+            return self.bvh_miss(inst, b, i);
+        }
         if *tfe || *lwe {
             return Err("an image access with tfe or lwe");
         }
-        let name = inst.name();
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
