@@ -82,6 +82,10 @@ pub(crate) struct Lowered {
     /// Test builds: whether i32 immediate `0x3C00` (f16 1.0 bits) is present.
     #[cfg(test)]
     pub has_f16_one_imm: bool,
+    /// Test builds: ballots of active masks taken after the loop that wrote
+    /// them (issue #465), not at the write site inside the loop.
+    #[cfg(test)]
+    pub mask_ballots_after_loop: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -305,6 +309,9 @@ struct Lower<'a> {
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
     balloting: HashSet<Value>,
+    /// See [`Lowered::mask_ballots_after_loop`].
+    #[cfg(test)]
+    mask_ballots_after_loop: u32,
     /// Block writing each value.
     def_block: HashMap<Value, usize>,
     /// IR block being lowered.
@@ -706,6 +713,8 @@ impl<'a> Lower<'a> {
             mask_ok: false,
             ballots: HashMap::new(),
             balloting: HashSet::new(),
+            #[cfg(test)]
+            mask_ballots_after_loop: 0,
             def_block: p
                 .blocks
                 .iter()
@@ -1253,6 +1262,8 @@ impl<'a> Lower<'a> {
             has_f32_one_imm: self.s.m.has_i32_const(i64::from(0x3F80_0000u32 as i32)),
             #[cfg(test)]
             has_f16_one_imm: self.s.m.has_i32_const(0x3C00),
+            #[cfg(test)]
+            mask_ballots_after_loop: self.mask_ballots_after_loop,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -1600,8 +1611,12 @@ impl<'a> Lower<'a> {
         self.s.m.extract(entry, r, index % 4)
     }
 
-    /// A dword of a lane mask as a number: the ballot of the lanes' bits,
-    /// taken in the block that writes the mask (see [`MaskData`]).
+    /// A dword of a lane mask as a number: the ballot of the lanes' bits
+    /// (see [`MaskData`]). Taken where the mask is written, except an active
+    /// mask written inside a loop and read after that loop: balloting there
+    /// sees only the lanes still in the loop, so each lane's own bit of an
+    /// exit mask (issue #465); after the loop the wave has reconverged and
+    /// the ballot is the wave's mask.
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
         let (lo, high) = match self.x.st.highs.get(&v) {
             Some(&lo) => (lo, true),
@@ -1624,6 +1639,20 @@ impl<'a> Lower<'a> {
                     // Program inputs (EXEC on entry).
                     None => self.s.entry,
                     Some(&b) if b == self.cur_ir => self.cur,
+                    // After a loop its lanes leave at different iterations:
+                    // ballot at the reconverged post-loop block that dominates
+                    // this read (not inside a later divergent branch).
+                    Some(&b) if !outside => {
+                        if let Some(at) = self.after_loop_ballot_site(b, self.cur_ir) {
+                            #[cfg(test)]
+                            {
+                                self.mask_ballots_after_loop += 1;
+                            }
+                            at
+                        } else {
+                            self.tail[b].ok_or("a lane mask written after its use")?
+                        }
+                    }
                     Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
                 if !self.balloting.insert(lo) {
@@ -1657,6 +1686,98 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// Successors of IR block `b`.
+    fn block_successors(p: &Program, b: usize) -> impl Iterator<Item = usize> {
+        match p.blocks[b].exit {
+            Exit::Jump(t) => [Some(t), None],
+            Exit::Branch { taken, not_taken } => [Some(taken), Some(not_taken)],
+            Exit::End | Exit::Indirect => [None, None],
+        }
+        .into_iter()
+        .flatten()
+    }
+
+    /// Whether there is a nonempty path from `from` to `to`.
+    fn reaches(p: &Program, from: usize, to: usize) -> bool {
+        let mut seen = vec![false; p.blocks.len()];
+        let mut stack = vec![from];
+        while let Some(b) = stack.pop() {
+            if b == to {
+                return true;
+            }
+            if seen[b] {
+                continue;
+            }
+            seen[b] = true;
+            stack.extend(Self::block_successors(p, b));
+        }
+        false
+    }
+
+    /// Whether `from` lies on a cycle (a nonempty path back to itself).
+    fn in_cycle(p: &Program, from: usize) -> bool {
+        let mut seen = vec![false; p.blocks.len()];
+        let mut stack: Vec<usize> = Self::block_successors(p, from).collect();
+        while let Some(b) = stack.pop() {
+            if b == from {
+                return true;
+            }
+            if seen[b] {
+                continue;
+            }
+            seen[b] = true;
+            stack.extend(Self::block_successors(p, b));
+        }
+        false
+    }
+
+    /// Blocks of the natural loop containing `def` (reachable from `def` and
+    /// able to reach `def` again). Empty when `def` is not in a cycle.
+    fn natural_loop(p: &Program, def: usize) -> Vec<bool> {
+        let n = p.blocks.len();
+        if !Self::in_cycle(p, def) {
+            return vec![false; n];
+        }
+        (0..n)
+            .map(|b| Self::reaches(p, def, b) && Self::reaches(p, b, def))
+            .collect()
+    }
+
+    /// DXIL block for a ballot of a mask written in loop block `def` and
+    /// first read at `use_b` after leaving that loop: the earliest (RPO)
+    /// loop-exit target that reaches the use, so the ballot sees the
+    /// reconverged wave and dominates later reads.
+    fn after_loop_ballot_site(&self, def: usize, use_b: usize) -> Option<usize> {
+        let p = self.x.p;
+        if !Self::in_cycle(p, def) || Self::reaches(p, use_b, def) {
+            return None;
+        }
+        let in_loop = Self::natural_loop(p, def);
+        let mut best: Option<usize> = None;
+        for (b, &member) in in_loop.iter().enumerate() {
+            if !member {
+                continue;
+            }
+            for exit in Self::block_successors(p, b) {
+                if in_loop[exit] {
+                    continue;
+                }
+                if exit != use_b && !Self::reaches(p, exit, use_b) {
+                    continue;
+                }
+                if best.is_none_or(|cur| self.rpo[exit] < self.rpo[cur]) {
+                    best = Some(exit);
+                }
+            }
+        }
+        let exit = best?;
+        if exit == self.cur_ir {
+            Some(self.cur)
+        } else {
+            self.block[exit].or(self.tail[exit])
+        }
     }
 
     // ---- operands ----
@@ -10029,6 +10150,134 @@ mod tests {
             S_ENDPGM,
         ];
         assert_eq!(fence_only(&words), Vec::<usize>::new());
+    }
+
+    /// A wave32 exit mask grown while lanes leave a loop at different
+    /// iterations, counted after the loop: every lane is in the mask (32),
+    /// not each lane's own bit (1). Issue #465.
+    #[test]
+    fn loop_exit_mask_counted_after_the_loop_is_wave_wide() {
+        let words: &[u32] = &[
+            0x4A02_0081, // v_add_nc_u32 v1, 1, v0  (lane i loops i + 1 times)
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0x4E02_0281, // loop: v_subrev_nc_u32 v1, 1, v1
+            0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+            0x880A_0A6A, // s_or_b32 s10, vcc_lo, s10
+            0x8A7E_0A7E, // s_andn2_b32 exec_lo, exec_lo, s10
+            0xBF89_FFFB, // s_cbranch_execnz loop
+            0x887E_0A7E, // s_or_b32 exec_lo, exec_lo, s10
+            0xBE89_0F0A, // s_bcnt1_i32_b32 s9, s10
+            0x7E04_0209, // v_mov_b32 v2, s9
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1,
+                threads: [32, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .expect("lower");
+        // The count is a ballot of the reconverged wave, not a per-lane 0/1.
+        assert!(lowered.wave_ops, "exit-mask count must ballot the wave");
+        assert!(
+            lowered.mask_ballots_after_loop > 0,
+            "exit-mask count must ballot after the loop, not inside it"
+        );
+    }
+
+    /// A mask written before a branch and counted inside it still ballots at
+    /// the definition: `reaches(def, def)` alone must not count as a loop.
+    #[test]
+    fn a_mask_before_a_branch_is_not_balloted_as_after_a_loop() {
+        let words: &[u32] = &[
+            0x7D88_008A, // v_cmp_gt_u32 vcc_lo, 10, v0
+            0xBE94_036A, // s_mov_b32 s20, vcc_lo
+            0xBE86_3C6A, // s_and_saveexec_b32 s6, vcc_lo
+            0xBF88_0001, // s_cbranch_execz over the count
+            0xBE89_0F14, // s_bcnt1_i32_b32 s9, s20
+            0x7E04_0209, // v_mov_b32 v2, s9
+            0x881E_067E, // s_or_b32 exec_lo, exec_lo, s6
+            S_ENDPGM,
+        ];
+        let lowered = lower_words(words, 1 << 1).expect("lower");
+        assert_eq!(
+            lowered.mask_ballots_after_loop, 0,
+            "acyclic mask defs must keep definition-site ballots"
+        );
+    }
+
+    /// Wave64 form of [`loop_exit_mask_counted_after_the_loop_is_wave_wide`].
+    #[test]
+    fn wave64_loop_exit_mask_counted_after_the_loop_is_wave_wide() {
+        let words: &[u32] = &[
+            0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+            0xBE8A_0480, // s_mov_b64 s[10:11], 0
+            0x4E02_0281, // loop: v_subrev_nc_u32 v1, 1, v1
+            0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+            0x888A_0A6A, // s_or_b64 s[10:11], vcc, s[10:11]
+            0x8AFE_0A7E, // s_andn2_b64 exec, exec, s[10:11]
+            0xBF89_FFFB, // s_cbranch_execnz loop
+            0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+            0xBE89_100A, // s_bcnt1_i32_b64 s9, s[10:11]
+            0x7E04_0209, // v_mov_b32 v2, s9
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1,
+                threads: [64, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, true, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .expect("lower");
+        assert!(lowered.wave_ops, "exit-mask count must ballot the wave");
+        assert!(
+            lowered.mask_ballots_after_loop > 0,
+            "exit-mask count must ballot after the loop, not inside it"
+        );
     }
 
     /// Lowers a synthetic compute program with these input registers and
