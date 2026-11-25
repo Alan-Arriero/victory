@@ -2282,12 +2282,14 @@ fn readable(
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
-            // Unordered access to a depth texture is its colour twin's.
+            // Unordered access to a depth texture is its colour twin's: the
+            // write does not land in the depth texture, so it is not the
+            // draw's depth target and is not marked as sampled.
             let twinned = list.twin_use(*resource as This, true, true);
             if !twinned {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
             }
-            twinned
+            false
         }
         _ => false,
     }

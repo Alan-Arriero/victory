@@ -855,9 +855,9 @@ pub(crate) struct HostTexture {
 /// same size and format family instead, and one is copied into the other
 /// when a side is used after the other was written
 /// (`HostList::twin_use`).
-/// A depth texture with a stencil plane gets a twin for each plane (Grand
-/// Theft Auto VI's tiled lighting writes each pixel's material class into
-/// the depth plane and masks into the stencil plane, then draws each class
+/// A depth texture with a stencil plane gets a twin for each plane (a
+/// title's tiled lighting writes each pixel's material class into the
+/// depth plane and masks into the stencil plane, then draws each class
 /// with the depth test "equal"): the stencil plane's is copied through a
 /// buffer, the depth plane's is drawn into the plane by a pass of ours
 /// (`HostList::pass_plane`). Unordered access views of a multisampled

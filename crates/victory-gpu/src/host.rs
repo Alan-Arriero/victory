@@ -724,9 +724,9 @@ fn record_twin_copy(
     // shortcut: the depth plane's twin is not given the plane (that is a
     // pass the other way: the plane read by a shader, the twin as its
     // target). The twin then lacks what draws and clears wrote to the
-    // plane since shaders last wrote the twin. In Grand Theft Auto VI
-    // nothing writes that plane but the twin's pass (its 192 draws against
-    // it only test, run 29), so the twin lacks nothing. Counted.
+    // plane since shaders last wrote the twin. In a title whose draws and
+    // clears only test the plane (192 draws, run 29), nothing writes it but
+    // the twin's pass, so the twin lacks nothing. Counted.
     if colour && twin.plane.is_some() {
         crate::resource::PLANES[1].fetch_add(1, Ordering::Relaxed);
     }
@@ -803,9 +803,9 @@ fn record_twin_copy(
 /// (the stencil plane is copied through a buffer and not touched here).
 ///
 /// A 16-bit twin holds whole steps of 1/65535, and the depth written is
-/// the step times the float nearest 1/65535 (0x37800080). That is how
-/// Grand Theft Auto VI's tiled lighting computes the depth of the
-/// rectangles it then draws with the test "equal", one class of materials
+/// the step times the float nearest 1/65535 (0x37800080). That is how a
+/// title's tiled lighting computes the depth of the rectangles it then
+/// draws with the test "equal", one class of materials
 /// a draw (all six of its vertex shaders multiply the class number by that
 /// constant), so the pass and the draw give the host the same float, and
 /// the host turns the same float into the same 24 bits. The step divided
