@@ -913,8 +913,11 @@ impl Resource {
     /// The host copy, made now if this is its first use.
     ///
     /// Placed views (`texture_at`) never lose mips: they often alias a
-    /// render-target or UAV that keeps every level, and a dropped host
-    /// copy would refuse the alias texel copy (`texture::alias`).
+    /// render-target or UAV that keeps every level. Dropping here would
+    /// make the host subresource counts differ from that source; the SRV
+    /// path would then fall back to uploading title memory, which does not
+    /// hold the source's GPU writes. (`texture::alias` can also copy the
+    /// retained source levels when counts differ, as a backstop.)
     fn host(&self, this: This) -> Option<&std::sync::Arc<HostTexture>> {
         self.host
             .get_or_init(|| {
@@ -3127,5 +3130,73 @@ void main() {
             assert_eq!(slot::<Release>(image, 0x10)(image), 0);
             assert_eq!(slot::<Release>(target, 0x10)(target), 0);
         });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn placed_views_keep_all_mips_under_pressure_so_aliases_match() {
+        use std::sync::atomic::Ordering::Relaxed;
+        if crate::host::host().is_none() {
+            return;
+        }
+        // Pressure alone makes committed sampled textures start smaller;
+        // placed views must not follow, or alias copies against a full-mip
+        // RT/UAV refuse (mismatched host subresource counts).
+        with_pressure(2, || {
+            let mut committed = std::ptr::null();
+            assert_eq!(
+                create_committed(
+                    std::ptr::null(),
+                    &PROPERTIES,
+                    0,
+                    &texture(64, 64, 28, 7),
+                    0,
+                    std::ptr::null(),
+                    &RESOURCE_IIDS[0],
+                    &mut committed,
+                ),
+                S_OK
+            );
+            assert_eq!(dropped_mips(committed), 2);
+            // SAFETY: ResourceDesc is 56 bytes / 14 words.
+            let words = unsafe {
+                std::ptr::from_ref(&texture(64, 64, 28, 7))
+                    .cast::<[u32; 14]>()
+                    .read_unaligned()
+            };
+            // Any non-zero address: the host copy is a separate committed resource.
+            let mut memory = [0u8; 8];
+            let placed = texture_at(memory.as_mut_ptr() as u64, &words)
+                .expect("placed view under pressure");
+            let host = host_resource(placed).expect("placed host texture");
+            // SAFETY: a live host texture.
+            let d = unsafe { host.GetDesc() };
+            assert_eq!(
+                (d.Width, d.Height, d.MipLevels),
+                (64, 64, 7),
+                "placed views must keep every level so alias copies against a full-mip RT/UAV still match"
+            );
+            assert_eq!(dropped_mips(placed), 0);
+            assert_eq!(PRESSURE.load(Relaxed), 2);
+            assert_eq!(slot::<Release>(committed, 0x10)(committed), 0);
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn synthetic_oom_threshold_is_restored_on_drop() {
+        let previous = synthetic_oom_above();
+        {
+            let _oom = SyntheticOom::above(32);
+            assert_eq!(synthetic_oom_above(), 32);
+        }
+        assert_eq!(synthetic_oom_above(), previous);
+        // Nested scopes restore the outer limit, not the process default.
+        let _outer = SyntheticOom::above(64);
+        {
+            let _inner = SyntheticOom::above(8);
+            assert_eq!(synthetic_oom_above(), 8);
+        }
+        assert_eq!(synthetic_oom_above(), 64);
     }
 }
