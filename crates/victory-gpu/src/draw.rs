@@ -1083,6 +1083,10 @@ impl State {
         let Some(host) = crate::descriptor::heap(self.heaps[0] as This).host() else {
             return;
         };
+        // Off-element aligned copies and other special buffer views are not
+        // textures; refresh them every ResourceHeap draw/dispatch so heap-
+        // indexed SRVs see title writes (#553).
+        host.refresh_special_buffers(list);
         let targets_hash = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();

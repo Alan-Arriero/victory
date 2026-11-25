@@ -623,8 +623,16 @@ pub(crate) fn aligned(address: u64, len: u64) -> Option<Arc<Shadow>> {
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let copy = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    // Populate now so a ResourceHeap-only first use (which never walks the
+    // table refresh path) still sees title memory rather than zeros (#553).
+    // SAFETY: `data` is the mapping of `buffer`; `address` is title memory
+    // of `len` bytes the view was created for.
+    crate::host::copy_mapped(data, address as *const u8, len as usize, false);
     {
         let mut copies = ALIGNED.lock().unwrap_or_else(|e| e.into_inner());
+        // Drop expired weaks so distinct (address, len) churn cannot grow
+        // the map without bound (docs/code-standards.md host-cache bound).
+        copies.retain(|_, weak| weak.strong_count() > 0);
         // Another recorder may have published the same range while we allocated.
         if let Some(existing) = copies.get(&key).and_then(std::sync::Weak::upgrade) {
             return Some(existing);
