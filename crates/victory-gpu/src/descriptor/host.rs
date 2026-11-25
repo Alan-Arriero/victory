@@ -2343,6 +2343,7 @@ mod tests {
 
         let got = copy.bytes(start, len).expect("view bytes inside its copy");
         assert_eq!(got, &updated);
+        // SAFETY: queries the live host device's removal status only.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
