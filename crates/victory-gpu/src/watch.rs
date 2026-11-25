@@ -128,7 +128,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// allocation, already refused).
 fn by_allocation(start: usize, end: usize, found: &mut Vec<usize>) -> Option<Vec<usize>> {
     use windows_sys::Win32::System::Memory::{
-        GetWriteWatch, MEM_COMMIT, MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        GetWriteWatch, MEM_COMMIT, MEM_FREE, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let query = |at: usize| {
@@ -140,6 +140,11 @@ fn by_allocation(start: usize, end: usize, found: &mut Vec<usize>) -> Option<Vec
     let (mut pages, mut at, mut allocations, mut any) = (Vec::new(), start, 0, false);
     while at < end {
         let info = query(at)?;
+        // A committed section view cannot belong to a MEM_WRITE_WATCH
+        // reservation. Its other protection regions need no further queries.
+        if info.State == MEM_COMMIT && info.Type == MEM_MAPPED {
+            return None;
+        }
         let base = info.AllocationBase as usize;
         let mut committed = info.State == MEM_COMMIT;
         let mut to = (info.BaseAddress as usize + info.RegionSize).min(end);
