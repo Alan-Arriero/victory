@@ -2049,6 +2049,72 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     true
 }
 
+/// The unordered access view description for a title's view of a depth
+/// texture, made for the texture's colour twin `twin`
+/// ([`crate::resource::Twin`]): the same mip and slices, in the colour
+/// format of the twin's family for a typeless or depth view format.
+/// The twin of a stencil plane (R8) stands for the views of that plane
+/// only: those that name plane 1 or a stencil format. A view of the depth
+/// plane has a twin of its own, viewed as a depth texture's without
+/// stencil: a view of it that names plane 0 or a depth format takes the
+/// twin's colour format too.
+fn twin_uav(
+    twin: &ID3D12Resource,
+    desc: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+) -> Option<D3D12_UNORDERED_ACCESS_VIEW_DESC> {
+    // SAFETY: a live resource.
+    let d = unsafe { twin.GetDesc() };
+    let mut desc = desc.cloned().unwrap_or_else(|| {
+        let mut all = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        if d.DepthOrArraySize > 1 {
+            all.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+            all.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                ArraySize: u32::from(d.DepthOrArraySize),
+                ..Default::default()
+            };
+        }
+        all
+    });
+    // A stencil plane's twin (R8 typeless, 60): the title's view is of the
+    // stencil plane if it names plane 1 or a stencil view format (22, 47).
+    if d.Format.0 == 60 {
+        let mut plane = 0;
+        match desc.ViewDimension {
+            D3D12_UAV_DIMENSION_TEXTURE2D => {
+                // SAFETY: the member the dimension names.
+                let mut view = unsafe { desc.Anonymous.Texture2D };
+                plane = std::mem::take(&mut view.PlaneSlice);
+                desc.Anonymous.Texture2D = view;
+            }
+            D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+                // SAFETY: the member the dimension names.
+                let mut view = unsafe { desc.Anonymous.Texture2DArray };
+                plane = std::mem::take(&mut view.PlaneSlice);
+                desc.Anonymous.Texture2DArray = view;
+            }
+            _ => {}
+        }
+        if plane != 1 && !matches!(desc.Format.0, 22 | 47) {
+            return None;
+        }
+        desc.Format.0 = 62;
+        return Some(desc);
+    }
+    // None, typeless and depth formats (R16: 0, 53, 55; R32: 0, 39, 40),
+    // and those of a depth-stencil format's depth plane (19 to 21, 44 to
+    // 46), for the twin of such a plane: the twin's UNORM / float view
+    // formats (R16_UNORM 56, R32_FLOAT 41).
+    desc.Format.0 = match (desc.Format.0, d.Format.0) {
+        (0 | 53 | 55 | 19..=21 | 44..=46, 53) => 56,
+        (0 | 39 | 40 | 19..=21 | 44..=46, 39) => 41,
+        (other, _) => other,
+    };
+    Some(desc)
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -2157,6 +2223,23 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     }
                 }
             }
+            // A depth texture's unordered access is its colour twin's: the
+            // host gives a depth texture none.
+            let twin = crate::resource::twin_resource(resource)
+                .and_then(|twin| Some((twin, twin_uav(twin, desc.as_ref())?)))
+                // A view of the depth plane of a texture with a stencil
+                // plane: of that plane's own twin.
+                .or_else(|| {
+                    let twin = crate::resource::twin_plane_resource(resource)?;
+                    Some((twin, twin_uav(twin, desc.as_ref())?))
+                });
+            let texture = match twin {
+                Some((twin, view)) => {
+                    desc = Some(view);
+                    twin
+                }
+                None => texture,
+            };
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }

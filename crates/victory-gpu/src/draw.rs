@@ -698,6 +698,10 @@ impl State {
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
+        if let Some(depth) = self.depth {
+            // A depth texture shaders also write: what they wrote, first.
+            list.twin_use(depth.resource as This, false, true);
+        }
         self.ensure_depth_state(list);
         true
     }
@@ -886,6 +890,9 @@ impl State {
                 }
             }
         }
+        // Depth textures it writes through unordered access: their colour
+        // twins hold what they lack from here on.
+        list.twins_written();
         true
     }
 
@@ -2359,6 +2366,8 @@ fn readable(
             {
                 crate::texture::upload_from(list, *resource as This, t, first_mip);
             }
+            // A depth texture shaders also write: what they wrote, first.
+            list.twin_use(*resource as This, false, false);
             // Keep the same read bits the depth target will request at draw time.
             let samples_depth = read_only_depth == Some(*resource);
             let state = if samples_depth {
@@ -2384,7 +2393,13 @@ fn readable(
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
-            crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+            // Unordered access to a depth texture is its colour twin's: the
+            // write does not land in the depth texture, so it is not the
+            // draw's depth target and is not marked as sampled.
+            let twinned = list.twin_use(*resource as This, true, true);
+            if !twinned {
+                crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+            }
             false
         }
         _ => false,
