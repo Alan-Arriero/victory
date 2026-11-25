@@ -884,16 +884,6 @@ struct Deferred {
     budget_zeroed: bool,
 }
 
-impl Deferred {
-    /// Whether a fill of upload memory at `dst` from title memory at `src`
-    /// (`len` bytes) is not yet among the steps since the last title copy
-    /// (and notes it). Kept with the refreshed ranges: both are forgotten
-    /// when a title copy may have changed their source.
-    fn first_fill(&mut self, dst: usize, src: usize, len: usize) -> bool {
-        self.refreshed.insert((dst, src, len))
-    }
-}
-
 impl Host {
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
@@ -1999,26 +1989,6 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
-    }
-
-    /// Copies `len` bytes of title memory at `src` into `dst` (mapped inside
-    /// `upload`) when the list is submitted, keeping `upload` alive until the
-    /// list is reset.
-    pub(crate) fn defer_fill_upload(
-        &self,
-        upload: ID3D12Resource,
-        dst: *mut u8,
-        src: *const u8,
-        len: usize,
-    ) {
-        self.mark_work();
-        let mut d = self.deferred();
-        // Every draw or dispatch that binds the slot asks; until a title
-        // copy intervenes another fill would copy the same bytes again.
-        if d.first_fill(dst as usize, src as usize, len) {
-            d.uploads.push(upload);
-            d.copies.push(Step::Fill(dst as usize, src as usize, len));
-        }
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -3987,22 +3957,6 @@ mod tests {
         let raw = [b'R' as u16, b'T' as u16, b'X' as u16, 0, b'X' as u16];
         assert_eq!(adapter_name(&raw), "RTX");
         assert_eq!(adapter_name(&[b'X' as u16, b'e' as u16]), "Xe");
-    }
-
-    /// A slot's upload fill is asked for by every draw that binds it: the
-    /// list takes it once, and again only after a title copy (which forgets
-    /// what was refreshed, as `defer_copy` and `defer` do).
-    #[test]
-    fn an_upload_fill_is_taken_once_until_a_title_copy() {
-        let mut d = Deferred::default();
-        assert!(d.first_fill(0x1000, 0x2000, 24));
-        assert!(!d.first_fill(0x1000, 0x2000, 24));
-        // Another source, length or upload is a fill of its own.
-        assert!(d.first_fill(0x1000, 0x2018, 24));
-        assert!(d.first_fill(0x1000, 0x2000, 48));
-        assert!(d.first_fill(0x3000, 0x2000, 24));
-        d.refreshed.clear();
-        assert!(d.first_fill(0x1000, 0x2000, 24));
     }
 
     #[test]
