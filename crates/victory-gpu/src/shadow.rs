@@ -441,11 +441,13 @@ impl Shadow {
 }
 
 /// A refresh that copies none of its range is skipped: the writes it was
-/// asked about were already in the copy (or the range is outside the
-/// buffer). Counted for the frame-rate line as one skipped refresh of
+/// asked about were already in the copy, the range is outside the buffer,
+/// or shaders were still writing all of it (that part is left to a later
+/// refresh). Counted for the frame-rate line as one skipped refresh of
 /// `len` bytes, so `0 skipped` there means no refresh was answered
-/// without a copy, not that nothing was checked. A range copied in part
-/// is not skipped; the bytes it did not copy show in `unchanged`.
+/// without a copy, not that nothing was checked. A range copied in part is
+/// not skipped; of what it did not copy, `unchanged` counts only the parts
+/// this refresh checked, not the sub-ranges shaders still write.
 #[cfg(any(feature = "diagnostics", test))]
 pub(crate) fn skipped(len: usize, copied: usize) -> Option<u64> {
     (len > 0 && copied == 0).then_some(len as u64)
