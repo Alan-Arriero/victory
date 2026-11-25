@@ -1442,10 +1442,7 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 /// so overlapping title buffers do not pick a different innermost shadow than
 /// the one the descriptor was created against.
 fn buffer_refresh_range(view: &View) -> Option<BufRange> {
-    let is_uav = matches!(
-        view,
-        View::Unordered(..) | View::Placed(true, ..)
-    );
+    let is_uav = matches!(view, View::Unordered(..) | View::Placed(true, ..));
     let (base, extent) = buffer_host_extent(view)?;
     if extent == 0 {
         return None;
