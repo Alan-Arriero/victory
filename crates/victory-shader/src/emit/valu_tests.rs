@@ -704,6 +704,52 @@ fn v_fma_legacy_f32_follows_the_d3d9_zero_rule() {
     });
 }
 
+/// `v_fma_f16` is fused; unfused `v_mad_f16` / `v_mac_f16` round the product
+/// to f16 first. With `a = b = 256h` and `c = -65504h`, the product overflows
+/// to +inf unfused, while the fused form yields `32h` (VIC-BT-042).
+#[test]
+fn v_fma_f16_is_fused_mul_add_rounds_the_product() {
+    // 256.0h, 256.0h, -65504.0h
+    let cases = [[0x5C00u32, 0x5C00, 0xFBFF, 0]];
+
+    // v_fma_f16 v0, v1, v2, v3 (VOP3 0x34b)
+    let fma = build_valu_cs(&vop3(0x34b, 0, vgpr(1), vgpr(2), vgpr(3)));
+    run_cases(&fma, &cases, |backend, _, _, got| {
+        assert_eq!(
+            got & 0xFFFF,
+            0x5000,
+            "{backend}: v_fma_f16(256h, 256h, -65504h) = {:#06x}, want 0x5000 (32h)",
+            got & 0xFFFF
+        );
+    });
+
+    // v_mad_f16 v0, v1, v2, v3 (VOP3 0x203, GFX9 opcode retained for titles)
+    let mad = build_valu_cs(&vop3(0x203, 0, vgpr(1), vgpr(2), vgpr(3)));
+    run_cases(&mad, &cases, |backend, _, _, got| {
+        assert_eq!(
+            got & 0xFFFF,
+            0x7C00,
+            "{backend}: v_mad_f16(256h, 256h, -65504h) = {:#06x}, want 0x7C00 (+inf)",
+            got & 0xFFFF
+        );
+    });
+
+    // v_mac_f16 v0, v1, v2: dst is the accumulator. Seed v0 from v3 first.
+    // VOP3 encoding of VOP2 0x023 → 0x123.
+    let mut body = Vec::new();
+    body.push(vop1(0x001, 0, vgpr(3))); // v_mov_b32 v0, v3
+    body.extend_from_slice(&vop3(0x123, 0, vgpr(1), vgpr(2), 0));
+    let mac = build_valu_cs(&body);
+    run_cases(&mac, &cases, |backend, _, _, got| {
+        assert_eq!(
+            got & 0xFFFF,
+            0x7C00,
+            "{backend}: v_mac_f16(256h, 256h, -65504h) = {:#06x}, want 0x7C00 (+inf)",
+            got & 0xFFFF
+        );
+    });
+}
+
 /// `v_cmp_lg_*` is "less or greater": ordered and not equal, so false when
 /// either operand is a NaN (RDNA2 ISA; the same on gfx1036 hardware).
 #[test]
