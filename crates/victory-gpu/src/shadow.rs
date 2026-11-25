@@ -140,6 +140,16 @@ impl Shadow {
         self.gpu + (address - self.start)
     }
 
+    /// Where the copy starts in title memory and how long it is.
+    pub(crate) fn span(&self) -> (u64, u64) {
+        (self.start, self.len)
+    }
+
+    /// The offset of a title address in the copy, if it lies in it.
+    pub(crate) fn offset_in(&self, address: u64) -> Option<u64> {
+        address.checked_sub(self.start).filter(|&at| at < self.len)
+    }
+
     /// Bytes from a title address to the buffer's end.
     pub(crate) fn left(&self, address: u64) -> u64 {
         (self.start + self.len).saturating_sub(address)

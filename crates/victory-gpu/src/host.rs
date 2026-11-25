@@ -3022,6 +3022,13 @@ impl HostList {
         self.deferred().copies.push(Step::Run(Box::new(work)));
     }
 
+    /// Whether this is the first time since the reset that the list asks
+    /// about `key` (a memory copy to bring up to date, keyed away from any
+    /// texture's).
+    pub(crate) fn first_use(&self, key: usize) -> bool {
+        self.deferred().textures.insert(key, 0).is_none()
+    }
+
     /// Whether this list already covers the requested mip and all smaller ones.
     pub(crate) fn covers_texture(&self, key: usize, first: u32) -> bool {
         self.deferred()

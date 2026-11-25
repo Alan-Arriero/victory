@@ -725,6 +725,37 @@ impl State {
             .map(|depth| depth.resource)
     }
 
+    /// A user-data dword the host computes for a translated shader
+    /// (`victory_shader::emit::USER_MEMORY_BASE`).
+    fn host_word(&self, kind: u32, memory: Option<&crate::memory::Ready>) -> u32 {
+        if kind == victory_shader::emit::USER_MEMORY_BASE {
+            return memory.map_or(0, |m| m.base);
+        }
+        once!(kind, "a shader reads a host value this build does not know");
+        0
+    }
+
+    /// For a shader that reads title memory by address
+    /// ([`crate::memory`]): its directory, fault notes and view slots,
+    /// with the pages of the root views the list has set made ready.
+    fn memory_ready(
+        &self,
+        list: &HostList,
+        compute: bool,
+        writes: bool,
+    ) -> Option<crate::memory::Ready> {
+        let heap = crate::descriptor::recording_heap(self.host_heaps[0])?;
+        let (mut addresses, mut constants) = (Vec::new(), Vec::new());
+        for root in self.roots_ref(compute) {
+            match root {
+                Root::View(address) => addresses.push(*address),
+                Root::Constants(values) => constants.extend_from_slice(values),
+                _ => {}
+            }
+        }
+        crate::memory::ready(list, heap, &addresses, &constants, writes)
+    }
+
     /// A descriptor a shader reads through a table: its host slot made if
     /// it changed, constant data copied, textures made readable.
     /// What draws and dispatches share: heaps, our root signature, the
@@ -809,9 +840,29 @@ impl State {
                 }
                 return false;
             }
+            // Title memory by address: what the shader finds it by.
+            let memory = if t
+                .host
+                .root_srvs
+                .contains(&victory_shader::emit::SLOT_MEMORY)
+            {
+                let Some(ready) = self.memory_ready(list, compute, false) else {
+                    once!(
+                        "a shader that reads title memory by address without a view heap to hold its views: the draw is dropped"
+                    );
+                    return false;
+                };
+                Some(ready)
+            } else {
+                None
+            };
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
+                    if let RootType::Other(kind) = u.root {
+                        values[u.index as usize] = self.host_word(kind, memory.as_ref());
+                        continue;
+                    }
                     if u.indexed_buffer {
                         let selected =
                             self.user_value(compute, u.slot, RootType::Constants, u.dword);
@@ -841,6 +892,30 @@ impl State {
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
+                    if srv && slot == victory_shader::emit::SLOT_MEMORY {
+                        // Ours: the directory of title memory by address.
+                        if let Some(m) = &memory {
+                            // SAFETY: an open list; the directory and its heap slot live
+                            // as long as the process and the list holds both.
+                            unsafe {
+                                match (compute, tabled) {
+                                    (true, true) => {
+                                        l.SetComputeRootDescriptorTable(param, m.directory_table)
+                                    }
+                                    (false, true) => {
+                                        l.SetGraphicsRootDescriptorTable(param, m.directory_table)
+                                    }
+                                    (true, false) => {
+                                        l.SetComputeRootShaderResourceView(param, m.directory)
+                                    }
+                                    (false, false) => {
+                                        l.SetGraphicsRootShaderResourceView(param, m.directory)
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
@@ -879,6 +954,21 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_FAULTS {
+                    // Ours: where shaders note the pages they found empty.
+                    if let Some(m) = &memory {
+                        // SAFETY: an open list; the buffer and its heap slot live as long
+                        // as the process and the list holds both.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootDescriptorTable(param, m.faults_table);
+                            } else {
+                                l.SetGraphicsRootDescriptorTable(param, m.faults_table);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let address = match self.roots_ref(compute).get(usize::from(slot)) {
                     Some(&Root::View(address)) => Some(address),
                     _ => {
