@@ -1609,15 +1609,16 @@ impl<'a> Lower<'a> {
                     // After a loop its lanes leave at different iterations:
                     // ballot at the reconverged post-loop block that dominates
                     // this read (not inside a later divergent branch).
-                    Some(&b)
-                        if !outside
-                            && let Some(at) = self.after_loop_ballot_site(b, self.cur_ir) =>
-                    {
-                        #[cfg(test)]
-                        {
-                            self.mask_ballots_after_loop += 1;
+                    Some(&b) if !outside => {
+                        if let Some(at) = self.after_loop_ballot_site(b, self.cur_ir) {
+                            #[cfg(test)]
+                            {
+                                self.mask_ballots_after_loop += 1;
+                            }
+                            at
+                        } else {
+                            self.tail[b].ok_or("a lane mask written after its use")?
                         }
-                        at
                     }
                     Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
