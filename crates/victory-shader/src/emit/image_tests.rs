@@ -68,7 +68,10 @@ fn results(words: &[u32], comparison: bool) -> Vec<(&'static str, [f32; 4])> {
         D3D12_FILTER_MIN_MAG_MIP_POINT
     };
     let out = run_with_sampler(&shader, &views, point_sampler(filter));
-    assert!(!out.is_empty());
+    // Neither hardware nor WARP may offer SM 6.6; preserve that skip.
+    if out.is_empty() {
+        return Vec::new();
+    }
     out.into_iter()
         .map(|(label, words)| {
             let at = |i: usize| f32::from_bits(words[i]);

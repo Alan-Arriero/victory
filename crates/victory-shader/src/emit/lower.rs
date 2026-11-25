@@ -350,7 +350,7 @@ const LANE_MASK: Why = "a lane mask read as data";
 /// Clamp and offset tokens (`_cl`, `_o`) keep that; explicit LOD, gradients,
 /// and comparison forms do not.
 fn implicit_derivatives(name: &str) -> bool {
-let Some(rest) = name.strip_prefix("image_sample") else {
+    let Some(rest) = name.strip_prefix("image_sample") else {
         return false;
     };
     !rest
@@ -10671,7 +10671,6 @@ mod tests {
                 .expect("DXIL validation failed");
         }
     }
-
 
     /// VIC-BT-009: the same immediate sampler words used non-comparison first
     /// then comparison (or the reverse) allocate two static slots so each
