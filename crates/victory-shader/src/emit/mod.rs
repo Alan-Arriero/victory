@@ -1253,10 +1253,6 @@ mod tests {
         assert_ne!(features & 0x1000, 0, "SFI0 {features:#x}: no ROVs");
     }
 
-    /// The primitive mask (s1 with one user SGPR) arrives in every pixel
-    /// program. A path that reuses its register and one that keeps it join
-    /// in a phi, which the read after them takes only on the reusing path:
-    /// the phi still needs a value for the mask.
     /// Without `LOAD_COLLISION_WAVEID` the same store is no ROV. s2 is then
     /// above the SGPRs the hardware initializes, and since no instruction
     /// writes it, reading it stays refused, as in compute programs.
@@ -1272,6 +1268,10 @@ mod tests {
         assert!(pixel_uav_store(1 << 1, &body).is_err());
     }
 
+    /// The primitive mask (s1 with one user SGPR) arrives in every pixel
+    /// program. A path that reuses its register and one that keeps it join
+    /// in a phi, which the read after them takes only on the reusing path:
+    /// the phi still needs a value for the mask.
     #[test]
     fn a_primitive_mask_joined_with_a_reused_register_translates() {
         let body = [
