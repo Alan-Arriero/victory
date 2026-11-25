@@ -6802,7 +6802,7 @@ impl<'a> Lower<'a> {
         let node = self.i32_of(node)?;
         let (seven, four) = (self.s.m.i32(7), self.s.m.i32(4));
         let kind = self.s.m.bin(c, Bin::And, node, seven);
-        let leaf = self.s.m.cmp(c, pred::ULT, kind, four);
+        let leaf = self.s.m.cmp(c, pred::IULT, kind, four);
         let invalid = self.s.m.i32(u32::MAX);
         let (inf, one, zero) = (
             self.s.m.i32(0x7F80_0000),
