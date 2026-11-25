@@ -113,6 +113,7 @@ const _: () = assert!(std::mem::offset_of!(ResourceDesc, flags) == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
 
 const BUFFER: u32 = 1;
+const TEXTURE_2D: u32 = 3;
 const TEXTURE_3D: u32 = 4;
 
 /// Bytes per element and the element's width in texels (4 for block
@@ -135,13 +136,22 @@ pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
     })
 }
 
+/// Bytes, width and height of one storage block in a linear texture footprint.
+fn texture_element(format: u32) -> Option<(u64, u64, u64)> {
+    // Packed RGB formats store two adjacent texels in each 32-bit word.
+    if matches!(format, 68 | 69) {
+        return Some((4, 2, 1));
+    }
+    let (bytes, block) = element(format)?;
+    Some((bytes, block, block))
+}
+
 /// A texture's layout in console memory, as the console's layout library
 /// gives it (`victory-hle`'s `xg` serves the same): the description's
 /// layout field is `0x100 | swizzle mode`, 1 linear, 0 the library's pick.
 pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
     use texture::{Dimension, Swizzle, TextureDesc};
     const TEXTURE_1D: u32 = 2;
-    const TEXTURE_2D: u32 = 3;
     const RENDER_TARGET: u32 = 1;
     const DEPTH: u32 = 2;
     let dimension = match desc.dimension {
@@ -196,7 +206,7 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
     let bytes = if desc.dimension == BUFFER {
         desc.width
     } else {
-        let (element, block) = element(desc.format)?;
+        let (element, block_width, block_height) = texture_element(desc.format)?;
         let (depth, slices) = if desc.dimension == TEXTURE_3D {
             (u64::from(desc.depth_or_array_size), 1)
         } else {
@@ -206,8 +216,8 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
         let mips = mip_count(desc);
         let mut chain = 0u64;
         for mip in 0..mips.min(64) {
-            let w = (desc.width >> mip).max(1).div_ceil(block);
-            let h = (height >> mip).max(1).div_ceil(block);
+            let w = (desc.width >> mip).max(1).div_ceil(block_width);
+            let h = (height >> mip).max(1).div_ceil(block_height);
             let d = (depth >> mip).max(1);
             chain = chain.checked_add(w.checked_mul(h)?.checked_mul(d)?.checked_mul(element)?)?;
         }
@@ -356,11 +366,13 @@ impl PlacedFootprint {
     /// `(lines, row_bytes, total_bytes)` spanned in a buffer: every row
     /// pitched but the last.
     pub(crate) fn layout(&self) -> Option<(u64, u64, u64)> {
-        let (element, block) = element(self.format)?;
+        let (element, block_width, block_height) = texture_element(self.format)?;
         let lines = u64::from(self.height)
-            .div_ceil(block)
+            .div_ceil(block_height)
             .checked_mul(u64::from(self.depth))?;
-        let row_bytes = u64::from(self.width).div_ceil(block).checked_mul(element)?;
+        let row_bytes = u64::from(self.width)
+            .div_ceil(block_width)
+            .checked_mul(element)?;
         if lines == 0 {
             return Some((0, row_bytes, 0));
         }
@@ -386,10 +398,23 @@ const NO_FOOTPRINT: PlacedFootprint = PlacedFootprint {
     row_pitch: 0,
 };
 
-/// One subresource's size in an upload buffer: footprint (offset 0), rows
-/// and bytes per row. Planes of depth-stencil formats are not told apart.
+/// One subresource's upload footprint (offset 0), row count and unpadded row size.
 fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32, u64)> {
     const PITCH: u64 = 256;
+    // NV12 and P010 copy footprints require an even-sized 2D texture with one mip.
+    if matches!(desc.format, 103 | 104)
+        && (desc.dimension != TEXTURE_2D
+            || desc.mip_levels != 1
+            || desc.sample_count != 1
+            || !(1..=2048).contains(&desc.depth_or_array_size)
+            || desc.width < 2
+            || desc.width > u64::from(u32::MAX)
+            || desc.height < 2
+            || !desc.width.is_multiple_of(2)
+            || !desc.height.is_multiple_of(2))
+    {
+        return None;
+    }
     if desc.dimension == BUFFER {
         let footprint = PlacedFootprint {
             offset: 0,
@@ -397,7 +422,7 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
             width: u32::try_from(desc.width).ok()?,
             height: 1,
             depth: 1,
-            row_pitch: u32::try_from(desc.width.next_multiple_of(PITCH)).ok()?,
+            row_pitch: u32::try_from(desc.width.checked_next_multiple_of(PITCH)?).ok()?,
         };
         return (index == 0).then_some((footprint, 1, desc.width));
     }
@@ -407,35 +432,54 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
     } else {
         u32::from(desc.depth_or_array_size).max(1)
     };
-    let (mip, slice) = (index % mips, index / mips);
-    if slice >= slices {
-        return None;
-    }
-    let (element, block) = element(desc.format)?;
-    let width = (desc.width >> mip).max(1).next_multiple_of(block);
-    let height = (u64::from(desc.height) >> mip)
+    let mip = index % mips;
+    let plane = index / mips / slices;
+    // Each plane contains all mips and array slices. Video chroma samples
+    // contain two components and cover a 2x2 luma region.
+    let (format, pitch_alignment, extent_shift) = match (desc.format, plane) {
+        (19..=22 | 44..=47, 0) => (39, 512, mip), // R32_TYPELESS
+        (19..=22 | 44..=47, 1) => (60, 512, mip), // R8_TYPELESS
+        (103, 0) => (60, 512, 0),                 // NV12 Y: R8_TYPELESS
+        (103, 1) => (48, 512, 1),                 // NV12 UV: R8G8_TYPELESS
+        (104, 0) => (53, 512, 0),                 // P010 Y: R16_TYPELESS
+        (104, 1) => (33, 512, 1),                 // P010 UV: R16G16_TYPELESS
+        (format, 0) => (format, PITCH, mip),
+        _ => return None,
+    };
+    let (element, block_width, block_height) = texture_element(format)?;
+    let width = desc
+        .width
+        .checked_shr(extent_shift)?
         .max(1)
-        .next_multiple_of(block);
+        .checked_next_multiple_of(block_width)?;
+    let height = u64::from(desc.height)
+        .checked_shr(extent_shift)?
+        .max(1)
+        .checked_next_multiple_of(block_height)?;
     let depth = if desc.dimension == TEXTURE_3D {
-        (u32::from(desc.depth_or_array_size) >> mip).max(1)
+        u32::from(desc.depth_or_array_size).checked_shr(mip)?.max(1)
     } else {
         1
     };
-    let row_size = width / block * element;
+    let row_size = (width / block_width).checked_mul(element)?;
     let footprint = PlacedFootprint {
         offset: 0,
-        format: desc.format,
+        format,
         width: u32::try_from(width).ok()?,
         height: u32::try_from(height).ok()?,
         depth,
-        row_pitch: u32::try_from(row_size.next_multiple_of(PITCH)).ok()?,
+        row_pitch: u32::try_from(row_size.checked_next_multiple_of(pitch_alignment)?).ok()?,
     };
-    Some((footprint, u32::try_from(height / block).ok()?, row_size))
+    Some((
+        footprint,
+        u32::try_from(height / block_height).ok()?,
+        row_size,
+    ))
 }
 
-/// Device method: where each subresource goes in an upload buffer, rows
-/// 256-byte and subresources 512-byte aligned, as on PC. Unknown sizes give
-/// the documented all-ones values.
+/// Places subresources at 512-byte boundaries in an upload buffer.
+/// Row pitch is aligned to 512 bytes for depth/stencil and planar video,
+/// and 256 bytes otherwise. An unknown size gives an all-ones total.
 pub(crate) extern "system" fn copyable_footprints(
     _: This,
     desc: *const ResourceDesc,
@@ -450,16 +494,26 @@ pub(crate) extern "system" fn copyable_footprints(
     const PLACEMENT: u64 = 512;
     // SAFETY: the title passes a description (null is tolerated).
     let desc = unsafe { desc.as_ref() };
-    let mut end = base;
+    // Keep offsets relative to `base`: D3D12 preserves an unaligned base
+    // and aligns the distance to each following subresource.
+    let mut end = 0u64;
     let mut known = desc.is_some();
     for i in 0..count {
-        let one = desc.and_then(|d| subresource(d, first + i));
+        let one = desc
+            .and_then(|d| first.checked_add(i).and_then(|index| subresource(d, index)))
+            .and_then(|(mut footprint, row_count, row_size)| {
+                let start = end.checked_next_multiple_of(PLACEMENT)?;
+                footprint.offset = base.checked_add(start)?;
+                let lines = u64::from(row_count).checked_mul(u64::from(footprint.depth))?;
+                let preceding_rows =
+                    u64::from(footprint.row_pitch).checked_mul(lines.saturating_sub(1))?;
+                let span = preceding_rows.checked_add(row_size)?;
+                let next = start.checked_add(span)?;
+                Some((footprint, row_count, row_size, next))
+            });
         let (layout, row_count, row_size) = match one {
-            Some((mut footprint, row_count, row_size)) => {
-                footprint.offset = end.next_multiple_of(PLACEMENT);
-                let pitch = u64::from(footprint.row_pitch);
-                let lines = u64::from(row_count) * u64::from(footprint.depth);
-                end = footprint.offset + pitch * lines.saturating_sub(1) + row_size;
+            Some((footprint, row_count, row_size, next)) => {
+                end = next;
                 (footprint, row_count, row_size)
             }
             None => {
@@ -486,7 +540,7 @@ pub(crate) extern "system" fn copyable_footprints(
     }
     if !total.is_null() {
         // SAFETY: checked non-null.
-        unsafe { total.write(if known { end - base } else { u64::MAX }) };
+        unsafe { total.write(if known { end } else { u64::MAX }) };
     }
 }
 
@@ -1858,6 +1912,195 @@ mod tests {
         assert_eq!((r[0], s[0]), (16, 128));
         let (_, _, _, t) = footprints(&texture(64, 64, 71, 1), 1, 1);
         assert_eq!(t, u64::MAX, "no second subresource");
+    }
+
+    #[test]
+    fn copyable_footprints_match_native_packed_and_unaligned_cases() {
+        // DXGI 68/69 store pairs of texels in one 32-bit word. An odd mip
+        // width of five therefore occupies three words (six footprint texels).
+        for format in [68, 69] {
+            let desc = texture(10, 6, format, 2);
+            let (mut layout, mut rows, mut sizes, mut total) =
+                ([NO_FOOTPRINT], [0u32], [0u64], 0u64);
+            copyable_footprints(
+                std::ptr::null(),
+                &desc,
+                1,
+                1,
+                0,
+                layout.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+            assert_eq!(
+                (layout[0].width, layout[0].height),
+                (6, 3),
+                "format {format}"
+            );
+            assert_eq!((rows[0], sizes[0]), (3, 12), "format {format}");
+            assert_eq!(layout[0].row_pitch, 256, "format {format}");
+            assert_eq!(total, 524, "format {format}");
+            let odd_width = PlacedFootprint {
+                width: 5,
+                ..layout[0]
+            };
+            assert_eq!(odd_width.layout(), Some((3, 12, 524)));
+        }
+
+        let desc = texture(10, 6, 28, 2);
+        for base in [0, 1] {
+            let (mut layouts, mut rows, mut sizes, mut total) =
+                ([NO_FOOTPRINT; 2], [0u32; 2], [0u64; 2], 0u64);
+            copyable_footprints(
+                std::ptr::null(),
+                &desc,
+                0,
+                2,
+                base,
+                layouts.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+            assert_eq!(layouts[0].offset, base);
+            assert_eq!(layouts[1].offset, base + 1536);
+            assert_eq!(total, 2068);
+        }
+    }
+
+    #[test]
+    fn planar_video_copy_footprints() {
+        // Native D3D12 reports both Y slices first, then both interleaved UV slices.
+        for (format, y, uv, bytes, pitch) in [(103, 60, 48, 514, 1024), (104, 53, 33, 1028, 1536)] {
+            let desc = ResourceDesc {
+                depth_or_array_size: 2,
+                ..texture(514, 258, format, 1)
+            };
+            let mut layouts = [NO_FOOTPRINT; 4];
+            let (mut rows, mut sizes, mut total) = ([0; 4], [0; 4], 0);
+            copyable_footprints(
+                std::ptr::null(),
+                &desc,
+                0,
+                4,
+                512,
+                layouts.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+            assert_eq!(
+                layouts.map(|l| (l.format, l.width, l.height)),
+                [(y, 514, 258), (y, 514, 258), (uv, 257, 129), (uv, 257, 129)]
+            );
+            assert_eq!(layouts.map(|l| l.row_pitch), [pitch; 4]);
+            assert_eq!(rows, [258, 258, 129, 129]);
+            assert_eq!(sizes, [bytes; 4]);
+            let stride = u64::from(pitch);
+            assert_eq!(
+                layouts.map(|l| l.offset),
+                [0, 258, 516, 645].map(|r| 512 + r * stride)
+            );
+            assert_eq!(total, 773 * stride + bytes);
+            // Starting at UV describes only the requested range in the upload buffer.
+            copyable_footprints(
+                std::ptr::null(),
+                &desc,
+                2,
+                1,
+                512,
+                layouts.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+            assert_eq!(
+                (layouts[0].offset, layouts[0].format, rows[0], sizes[0]),
+                (512, uv, 129, bytes)
+            );
+            assert_eq!(total, 128 * stride + bytes);
+            assert!(subresource(&desc, 4).is_none());
+
+            for invalid in [
+                ResourceDesc {
+                    dimension: TEXTURE_3D,
+                    ..desc
+                },
+                ResourceDesc {
+                    mip_levels: 0,
+                    ..desc
+                },
+                ResourceDesc {
+                    mip_levels: 2,
+                    ..desc
+                },
+                ResourceDesc {
+                    sample_count: 4,
+                    ..desc
+                },
+                ResourceDesc { width: 513, ..desc },
+                ResourceDesc {
+                    height: 257,
+                    ..desc
+                },
+                ResourceDesc {
+                    depth_or_array_size: 2049,
+                    ..desc
+                },
+            ] {
+                assert!(subresource(&invalid, 0).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn depth_stencil_footprints_follow_the_pc_plane_order() {
+        // Native D3D12 reports the same layout for both depth/stencil families
+        // and their view formats. Mips vary fastest, then array slices, then planes.
+        let expected = [
+            (512, 39, 16, 8),
+            (4_608, 39, 8, 4),
+            (6_656, 39, 16, 8),
+            (10_752, 39, 8, 4),
+            (12_800, 60, 16, 8),
+            (16_896, 60, 8, 4),
+            (18_944, 60, 16, 8),
+            (23_040, 60, 8, 4),
+        ];
+        for format in (19..=22).chain(44..=47) {
+            let desc = ResourceDesc {
+                depth_or_array_size: 2,
+                ..texture(16, 8, format, 2)
+            };
+            let mut layouts = [NO_FOOTPRINT; 8];
+            let (mut rows, mut sizes, mut total) = ([0; 8], [0; 8], 0);
+            copyable_footprints(
+                std::ptr::null(),
+                &desc,
+                0,
+                8,
+                512,
+                layouts.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+
+            assert_eq!(
+                layouts.map(|l| (l.offset, l.format, l.width, l.height)),
+                expected,
+                "format {format}"
+            );
+            assert!(
+                layouts.iter().all(|l| l.depth == 1 && l.row_pitch == 512),
+                "format {format}"
+            );
+            assert_eq!(rows, [8, 4, 8, 4, 8, 4, 8, 4], "format {format}");
+            assert_eq!(sizes, [64, 32, 64, 32, 16, 8, 16, 8], "format {format}");
+            assert_eq!(total, 24_072, "format {format}");
+            assert!(subresource(&desc, 8).is_none(), "format {format}");
+        }
     }
 
     /// The title may view a texture as sRGB or linear whichever format it
