@@ -1607,13 +1607,17 @@ impl<'a> Lower<'a> {
                     None => self.s.entry,
                     Some(&b) if b == self.cur_ir => self.cur,
                     // After a loop its lanes leave at different iterations:
-                    // ballot where the mask is read, once they reconverge.
-                    Some(&b) if !outside && self.mask_read_after_loop(b, self.cur_ir) => {
+                    // ballot at the reconverged post-loop block that dominates
+                    // this read (not inside a later divergent branch).
+                    Some(&b)
+                        if !outside
+                            && let Some(at) = self.after_loop_ballot_site(b, self.cur_ir) =>
+                    {
                         #[cfg(test)]
                         {
                             self.mask_ballots_after_loop += 1;
                         }
-                        self.cur
+                        at
                     }
                     Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
@@ -1650,33 +1654,100 @@ impl<'a> Lower<'a> {
         Ok(if high { y } else { x })
     }
 
-    /// Whether `def` sits in a loop and `use_b` is only reached after leaving
-    /// it: the use cannot go back to `def`, while `def` can reach itself.
-    fn mask_read_after_loop(&self, def: usize, use_b: usize) -> bool {
-        fn reaches(p: &Program, from: usize, to: usize) -> bool {
-            let mut seen = vec![false; p.blocks.len()];
-            let mut stack = vec![from];
-            while let Some(b) = stack.pop() {
-                if b == to {
-                    return true;
-                }
-                if seen[b] {
+    /// Successors of IR block `b`.
+    fn block_successors(p: &Program, b: usize) -> impl Iterator<Item = usize> {
+        match p.blocks[b].exit {
+            Exit::Jump(t) => [Some(t), None],
+            Exit::Branch { taken, not_taken } => [Some(taken), Some(not_taken)],
+            Exit::End | Exit::Indirect => [None, None],
+        }
+        .into_iter()
+        .flatten()
+    }
+
+    /// Whether there is a nonempty path from `from` to `to`.
+    fn reaches(p: &Program, from: usize, to: usize) -> bool {
+        let mut seen = vec![false; p.blocks.len()];
+        let mut stack = vec![from];
+        while let Some(b) = stack.pop() {
+            if b == to {
+                return true;
+            }
+            if seen[b] {
+                continue;
+            }
+            seen[b] = true;
+            stack.extend(Self::block_successors(p, b));
+        }
+        false
+    }
+
+    /// Whether `from` lies on a cycle (a nonempty path back to itself).
+    fn in_cycle(p: &Program, from: usize) -> bool {
+        let mut seen = vec![false; p.blocks.len()];
+        let mut stack: Vec<usize> = Self::block_successors(p, from).collect();
+        while let Some(b) = stack.pop() {
+            if b == from {
+                return true;
+            }
+            if seen[b] {
+                continue;
+            }
+            seen[b] = true;
+            stack.extend(Self::block_successors(p, b));
+        }
+        false
+    }
+
+    /// Blocks of the natural loop containing `def` (reachable from `def` and
+    /// able to reach `def` again). Empty when `def` is not in a cycle.
+    fn natural_loop(p: &Program, def: usize) -> Vec<bool> {
+        let n = p.blocks.len();
+        let mut in_loop = vec![false; n];
+        if !Self::in_cycle(p, def) {
+            return in_loop;
+        }
+        for b in 0..n {
+            if Self::reaches(p, def, b) && Self::reaches(p, b, def) {
+                in_loop[b] = true;
+            }
+        }
+        in_loop
+    }
+
+    /// DXIL block for a ballot of a mask written in loop block `def` and
+    /// first read at `use_b` after leaving that loop: the earliest (RPO)
+    /// loop-exit target that reaches the use, so the ballot sees the
+    /// reconverged wave and dominates later reads.
+    fn after_loop_ballot_site(&self, def: usize, use_b: usize) -> Option<usize> {
+        let p = self.x.p;
+        if !Self::in_cycle(p, def) || Self::reaches(p, use_b, def) {
+            return None;
+        }
+        let in_loop = Self::natural_loop(p, def);
+        let mut best: Option<usize> = None;
+        for b in 0..p.blocks.len() {
+            if !in_loop[b] {
+                continue;
+            }
+            for exit in Self::block_successors(p, b) {
+                if in_loop[exit] {
                     continue;
                 }
-                seen[b] = true;
-                match p.blocks[b].exit {
-                    Exit::Jump(t) => stack.push(t),
-                    Exit::Branch { taken, not_taken } => {
-                        stack.push(taken);
-                        stack.push(not_taken);
-                    }
-                    Exit::End | Exit::Indirect => {}
+                if exit != use_b && !Self::reaches(p, exit, use_b) {
+                    continue;
+                }
+                if best.map_or(true, |cur| self.rpo[exit] < self.rpo[cur]) {
+                    best = Some(exit);
                 }
             }
-            false
         }
-        let p = self.x.p;
-        reaches(p, def, def) && !reaches(p, use_b, def)
+        let exit = best?;
+        if exit == self.cur_ir {
+            Some(self.cur)
+        } else {
+            self.block[exit].or(self.tail[exit])
+        }
     }
 
     // ---- operands ----
@@ -9389,6 +9460,27 @@ mod tests {
         assert!(
             lowered.mask_ballots_after_loop > 0,
             "exit-mask count must ballot after the loop, not inside it"
+        );
+    }
+
+    /// A mask written before a branch and counted inside it still ballots at
+    /// the definition: `reaches(def, def)` alone must not count as a loop.
+    #[test]
+    fn a_mask_before_a_branch_is_not_balloted_as_after_a_loop() {
+        let words: &[u32] = &[
+            0x7D88_008A, // v_cmp_gt_u32 vcc_lo, 10, v0
+            0xBE94_036A, // s_mov_b32 s20, vcc_lo
+            0xBE86_3C6A, // s_and_saveexec_b32 s6, vcc_lo
+            0xBF88_0001, // s_cbranch_execz over the count
+            0xBE89_0F14, // s_bcnt1_i32_b32 s9, s20
+            0x7E04_0209, // v_mov_b32 v2, s9
+            0x881E_067E, // s_or_b32 exec_lo, exec_lo, s6
+            S_ENDPGM,
+        ];
+        let lowered = lower_words(words, 1 << 1).expect("lower");
+        assert_eq!(
+            lowered.mask_ballots_after_loop, 0,
+            "acyclic mask defs must keep definition-site ballots"
         );
     }
 
