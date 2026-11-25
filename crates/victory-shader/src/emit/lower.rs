@@ -3812,8 +3812,17 @@ impl<'a> Lower<'a> {
                             u.kind == ResourceType::Srv && u.root == RootType::Table
                         }) =>
                 {
-                    // Word 2 counts elements in a structured view. Query the
-                    // same view type and stride as its scalar data load.
+                    // A scalar buffer load consumes its descriptor without
+                    // reading word 2 as a count. Keep that path free of a
+                    // dimensions query unless another operand needs the count.
+                    let k = u32::from(first) + 2;
+                    if k >= count
+                        || inst
+                            .write(Reg::S(code + k as u8))
+                            .is_none_or(|v| !self.scalar_record_count_used(v))
+                    {
+                        return Err("a scalar memory read as data");
+                    }
                     let stride = self
                         .scalar_srv_stride(&src, used)
                         .ok_or("a scalar memory read as data")?;
@@ -3925,6 +3934,23 @@ impl<'a> Lower<'a> {
             b.phis.iter().any(|p| p.args.contains(&v))
                 || b.insts.iter().any(|i| {
                     !i.name().starts_with("v_interp_p2") && i.reads.iter().any(|r| r.1 == v)
+                })
+        })
+    }
+
+    /// A scalar buffer load takes the whole descriptor by reference. Its
+    /// byte offset can also name one of those SGPRs, this time as a value.
+    fn scalar_record_count_used(&self, v: Value) -> bool {
+        self.x.p.blocks.iter().any(|b| {
+            b.phis.iter().any(|p| p.args.contains(&v))
+                || b.insts.iter().any(|i| {
+                    if let Fields::Smem { soffset, .. } = i.fields
+                        && i.name().starts_with("s_buffer_load_dword")
+                    {
+                        return matches!(soffset, Operand::Scalar { code, .. }
+                            if i.read(Reg::S(code)) == Some(v));
+                    }
+                    i.reads.iter().any(|r| r.1 == v)
                 })
         })
     }

@@ -411,9 +411,17 @@ fn scalar_structured_load_and_record_count_use_the_same_view() {
         0xe0701000, 0x80030102,     // buffer_store_dword v1, v2, s[12:15], 0 offen
         0xbf810000,                 // s_endpgm
     ];
-    let (shader, _) = build_with_view(&words, Some(16));
-    for records in [3, 7] {
+    // The second program uses descriptor word 2 only as the byte offset
+    // of the scalar buffer load that also consumes the whole descriptor.
+    let mut offset_words = words;
+    offset_words[7] = 0x14000000; // soffset = s10, immediate offset = 0
+    offset_words[8] = 0xbe910310; // s_mov_b32 s17, s16
+    let (sum, _) = build_with_view(&words, Some(16));
+    let (offset, _) = build_with_view(&offset_words, Some(16));
+    for records in [4, 8] {
         let mut data = vec![0u32; records * 4];
+        data[1] = 0x1234;
+        data[2] = 0x5678;
         data[5] = 0x9012;
         let views = [
             View::Buffer {
@@ -423,10 +431,15 @@ fn scalar_structured_load_and_record_count_use_the_same_view() {
             View::Texture(1, 1, &[[0.0; 4]]),
             View::RawUav(32),
         ];
-        let results = run(&shader, &views);
-        assert!(!results.is_empty());
-        for (label, result) in results {
-            assert_eq!(result, vec![0x9012 + records as u32; 32], "{label}");
+        for (shader, expected) in [
+            (&sum, data[5] + records as u32),
+            (&offset, data[records / 4]),
+        ] {
+            let results = run(shader, &views);
+            assert!(!results.is_empty());
+            for (label, result) in results {
+                assert_eq!(result, vec![expected; 32], "{label}");
+            }
         }
     }
 }
