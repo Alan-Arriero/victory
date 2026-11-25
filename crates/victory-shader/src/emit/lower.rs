@@ -4054,7 +4054,24 @@ impl<'a> Lower<'a> {
             let w = load(self, at, 1)[0];
             let byte = self.s.m.bin(c, Bin::And, off, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
-            vec![self.s.m.bin(c, Bin::LShr, w, sh)]
+            let low = self.s.m.bin(c, Bin::LShr, w, sh);
+            let word = if total == 16 && self.s.m.int_value(off).is_none_or(|v| v % 4 == 3) {
+                // A halfword at byte 3 reads the low byte of the next dword.
+                // Other alignments stay within the first dword, including
+                // when it is the last word exposed by a root buffer.
+                let crosses = self.s.m.cmp(c, pred::EQ, byte, three);
+                let four = self.s.m.i32(4);
+                let next = self.s.m.bin(c, Bin::Add, at, four);
+                let addr = self.s.m.select(c, crosses, next, at);
+                let high = load(self, addr, 1)[0];
+                let eight = self.s.m.i32(8);
+                let high = self.s.m.bin(c, Bin::Shl, high, eight);
+                let combined = self.s.m.bin(c, Bin::Or, low, high);
+                self.s.m.select(c, crosses, combined, low)
+            } else {
+                low
+            };
+            vec![word]
         } else if let Some(at) = self.s.m.int_value(off) {
             if at % 4 == 0 {
                 load(self, off, total / 32)
@@ -7514,6 +7531,15 @@ impl<'a> Lower<'a> {
             Some("cmpswap") => Some(u32::MAX),
             Some(_) => return Err(name),
         };
+        // These unformatted loads return the same register bits as the
+        // corresponding single-channel GFX10 integer formats.
+        let narrow_format = match name {
+            "buffer_load_ubyte" => Some(5),   // 8_UINT
+            "buffer_load_sbyte" => Some(6),   // 8_SINT
+            "buffer_load_ushort" => Some(11), // 16_UINT
+            "buffer_load_sshort" => Some(12), // 16_SINT
+            _ => None,
+        };
         // d16: two 16-bit channels per VGPR, low half first.
         let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
@@ -7522,7 +7548,7 @@ impl<'a> Lower<'a> {
             .or(plain.strip_prefix("buffer_store_"))
             .or(plain.strip_prefix("tbuffer_load_"))
         {
-            _ if atomic.is_some() => (false, 1),
+            _ if atomic.is_some() || narrow_format.is_some() => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -7566,6 +7592,11 @@ impl<'a> Lower<'a> {
         }
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
+        }
+        if narrow_format.is_some()
+            && used.is_some_and(|u| u.kind == ResourceType::Cbv || u.stride > 1)
+        {
+            return Err("a byte or halfword load through a constant or structured buffer");
         }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             // A constant buffer read per lane (a dynamically indexed array).
@@ -7710,7 +7741,7 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
             return Ok(());
         }
-        if let Some(f) = *format {
+        if let Some(f) = format.or(narrow_format) {
             if index.is_some() {
                 return Err("a typed-format load by index");
             }
