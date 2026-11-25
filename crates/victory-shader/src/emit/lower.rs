@@ -4406,7 +4406,8 @@ impl<'a> Lower<'a> {
                             self.s.m.bin(c, Bin::Shl, field, sh)
                         }
                     };
-                    float(self, self.f16_widen_keep_snan(h))
+                    let f = self.f16_widen_keep_snan(h);
+                    float(self, f)
                 }
             };
             out.push(x);
