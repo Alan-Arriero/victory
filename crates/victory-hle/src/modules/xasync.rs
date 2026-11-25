@@ -149,7 +149,11 @@ impl Port {
     }
 
     /// The next queued task, waiting up to `timeout_ms`, or until `ended`
-    /// (checked whenever the port is woken) says no task will come.
+    /// (checked whenever the port is woken) says no task will come. Once
+    /// `ended`, nothing is taken even if tasks are queued: termination
+    /// drained the queue's own, so those left are other queues' on a shared
+    /// port, and running them would keep a dispatcher loop of the ended
+    /// queue going.
     fn take(&self, timeout_ms: u32, ended: impl Fn() -> bool) -> Option<Task> {
         let waiting = |t: &mut VecDeque<(u64, Task)>| t.is_empty() && !ended();
         let tasks = lock(&self.tasks);
@@ -164,6 +168,9 @@ impl Port {
                 .unwrap_or_else(|e| e.into_inner())
                 .0
         };
+        if ended() {
+            return None;
+        }
         tasks.pop_front().map(|(_, task)| task)
     }
 }
@@ -1718,6 +1725,11 @@ mod tests {
         assert_eq!(XTaskQueueTerminate(b, false, none, None), S_OK);
         assert_eq!(from_b, 2, "its own task is canceled");
         assert_eq!(from_a, 0, "the other queue's task is untouched");
+        // A dispatch through the ended queue takes nothing, though the
+        // shared port still holds the other queue's task.
+        assert!(!XTaskQueueDispatch(b, WORK, 0));
+        assert!(!XTaskQueueDispatch(b, WORK, INFINITE));
+        assert_eq!(from_a, 0, "not run through the terminated queue");
         assert!(XTaskQueueDispatch(a, WORK, 0));
         assert_eq!(from_a, 1, "and still runs normally");
         XTaskQueueCloseHandle(a);
