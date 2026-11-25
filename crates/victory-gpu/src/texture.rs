@@ -1365,7 +1365,7 @@ void read(uint3 id : SV_DispatchThreadID) {
 
 #[cfg(test)]
 mod resident_tests {
-    use super::{host_written, is_host_written, note_resident, resident};
+    use super::{forget, host_written, is_host_written, note_resident, resident};
 
     #[test]
     fn noted_resident_window_updates_when_more_arrive() {
