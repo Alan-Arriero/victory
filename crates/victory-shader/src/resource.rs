@@ -251,7 +251,7 @@ pub fn track(
                             pending_waterfall_loads.insert(site, reads);
                             a
                         }
-                        Err(what) => return Err(fail(what)),
+                        Err(what) => t.by_address(what).map_err(fail)?,
                     };
                     out.scalar.push((site, address));
                 }
@@ -263,6 +263,7 @@ pub fn track(
                 } if inst.name().starts_with("global_") => {
                     let address = t
                         .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
+                        .or_else(|why| t.by_address(why))
                         .map_err(fail)?;
                     out.scalar.push((site, address));
                 }
