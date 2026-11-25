@@ -1703,16 +1703,12 @@ impl<'a> Lower<'a> {
     /// able to reach `def` again). Empty when `def` is not in a cycle.
     fn natural_loop(p: &Program, def: usize) -> Vec<bool> {
         let n = p.blocks.len();
-        let mut in_loop = vec![false; n];
         if !Self::in_cycle(p, def) {
-            return in_loop;
+            return vec![false; n];
         }
-        for b in 0..n {
-            if Self::reaches(p, def, b) && Self::reaches(p, b, def) {
-                in_loop[b] = true;
-            }
-        }
-        in_loop
+        (0..n)
+            .map(|b| Self::reaches(p, def, b) && Self::reaches(p, b, def))
+            .collect()
     }
 
     /// DXIL block for a ballot of a mask written in loop block `def` and
@@ -1726,8 +1722,8 @@ impl<'a> Lower<'a> {
         }
         let in_loop = Self::natural_loop(p, def);
         let mut best: Option<usize> = None;
-        for b in 0..p.blocks.len() {
-            if !in_loop[b] {
+        for (b, &member) in in_loop.iter().enumerate() {
+            if !member {
                 continue;
             }
             for exit in Self::block_successors(p, b) {
@@ -1737,7 +1733,7 @@ impl<'a> Lower<'a> {
                 if exit != use_b && !Self::reaches(p, exit, use_b) {
                     continue;
                 }
-                if best.map_or(true, |cur| self.rpo[exit] < self.rpo[cur]) {
+                if best.is_none_or(|cur| self.rpo[exit] < self.rpo[cur]) {
                     best = Some(exit);
                 }
             }
