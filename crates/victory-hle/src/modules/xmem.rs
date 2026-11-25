@@ -1535,6 +1535,31 @@ mod tests {
         assert_eq!(old_view.bytes()[0], 7);
     }
 
+    /// Streaming allocate/free must reuse page numbers. Without a free list,
+    /// `next_page` would climb by `n * FRAMES` each round and eventually pack
+    /// past the title's 21-bit `number >> 4` field.
+    #[test]
+    fn allocate_reuses_freed_page_numbers_without_growing_next_page() {
+        let pages = allocate(2);
+        let ceiling = physical().next_page;
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        for _ in 0..1024 {
+            let again = allocate(2);
+            assert_eq!(physical().next_page, ceiling);
+            for &p in &again {
+                assert!(p >> 4 < 1 << 21, "{p:#x}");
+                assert!(p > 0);
+            }
+            // Same numbers we freed (LIFO may reverse them within the batch).
+            let mut got = again.clone();
+            got.sort_unstable();
+            let mut want = pages.clone();
+            want.sort_unstable();
+            assert_eq!(got, want);
+            assert_eq!(XMemFreePhysicalPages(2, again.as_ptr()), 1);
+        }
+    }
+
     #[test]
     fn runs_group_consecutive_pages_of_one_allocation() {
         let (a, b) = (allocate(3), allocate(1));
