@@ -67,6 +67,12 @@ pub(crate) struct Lowered {
     /// Test builds: whether a 16-bit float is widened (`legacyF16ToF32`).
     #[cfg(test)]
     pub widens_f16: bool,
+    /// Test builds: whether i32 immediate `0x3F80_0000` (f32 1.0 bits) is present.
+    #[cfg(test)]
+    pub has_f32_one_imm: bool,
+    /// Test builds: whether i32 immediate `0x3C00` (f16 1.0 bits) is present.
+    #[cfg(test)]
+    pub has_f16_one_imm: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1218,6 +1224,10 @@ impl<'a> Lower<'a> {
             image_address_reads: std::mem::take(&mut self.s.image_address_reads),
             #[cfg(test)]
             widens_f16: self.s.m.has_dx_op("dx.op.legacyF16ToF32", 131),
+            #[cfg(test)]
+            has_f32_one_imm: self.s.m.has_i32_const(i64::from(0x3F80_0000u32 as i32)),
+            #[cfg(test)]
+            has_f16_one_imm: self.s.m.has_i32_const(0x3C00),
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -5649,11 +5659,23 @@ impl<'a> Lower<'a> {
         (lo, hi)
     }
 
-    /// Source `k` of a 16-bit operation in the low 16 bits (the rest 0):
+    /// Source `k` of a 16-bit f16 operation in the low 16 bits (the rest 0):
     /// op_sel (or an SDWA word select) picks the high half, except that
     /// 16-bit compares other than `v_cmp_class` ignore op_sel; inline float
     /// constants are f16 values here.
-    fn half_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+    fn half_src_f16(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        self.half_src(inst, k, true)
+    }
+
+    /// Source `k` of a 16-bit integer (u16/i16/b16) operation in the low 16
+    /// bits (the rest 0): same half selection as [`Self::half_src_f16`], but
+    /// inline float constants keep their 32-bit f32 bit patterns (hardware
+    /// uses the selected 16 of those).
+    fn half_src_i16(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        self.half_src(inst, k, false)
+    }
+
+    fn half_src(&mut self, inst: &Inst, k: usize, float: bool) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
@@ -5672,7 +5694,8 @@ impl<'a> Lower<'a> {
         }
         let x = match self.src0 {
             Some(x) if k == 0 => x,
-            _ => self.f16_operand(inst, &op)?,
+            _ if float => self.f16_operand(inst, &op)?,
+            _ => self.operand(inst, &op)?,
         };
         let c = self.cur;
         let x = if high {
@@ -5690,7 +5713,7 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let h = self.half_src(inst, k)?;
+        let h = self.half_src_f16(inst, k)?;
         let f32t = self.s.t.f32;
         let mut f = self
             .s
@@ -5911,7 +5934,7 @@ impl<'a> Lower<'a> {
         if float1.contains(&name) {
             let r = match name {
                 "v_cvt_f16_u16" | "v_cvt_f16_i16" => {
-                    let mut x = self.half_src(inst, 0)?;
+                    let mut x = self.half_src_i16(inst, 0)?;
                     let op = if name == "v_cvt_f16_i16" {
                         let k16 = self.s.m.i32(16);
                         let t = self.s.m.bin(c, Bin::Shl, x, k16);
@@ -5983,7 +6006,7 @@ impl<'a> Lower<'a> {
                 self.s.m.select(c, nan, z, r)
             }
             _ => {
-                let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+                let (mut a, mut b) = (self.half_src_i16(inst, 0)?, self.half_src_i16(inst, 1)?);
                 let k16 = self.s.m.i32(16);
                 let sext = |l: &mut Self, x: V| {
                     let t = l.s.m.bin(c, Bin::Shl, x, k16);
@@ -6042,7 +6065,7 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let k = |l: &mut Self, x: u32| l.s.m.i32(x);
-        let mut h = self.half_src(inst, 0)?;
+        let mut h = self.half_src_f16(inst, 0)?;
         if v.abs & 1 != 0 {
             let m = k(self, 0x7FFF);
             h = self.s.m.bin(c, Bin::And, h, m);
@@ -6625,7 +6648,7 @@ impl<'a> Lower<'a> {
                     let Fields::Valu(v) = &inst.fields else {
                         unreachable!()
                     };
-                    let mut h = self.half_src(inst, 0)?;
+                    let mut h = self.half_src_f16(inst, 0)?;
                     if v.abs & 1 != 0 {
                         let m = self.s.m.i32(0x7FFF);
                         h = self.s.m.bin(c, Bin::And, h, m);
@@ -6745,7 +6768,7 @@ impl<'a> Lower<'a> {
             }
             "u32" | "i32" | "u16" | "i16" => {
                 let (a, b) = if ty.ends_with("16") {
-                    let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+                    let (mut a, mut b) = (self.half_src_i16(inst, 0)?, self.half_src_i16(inst, 1)?);
                     if ty == "i16" {
                         let k16 = self.s.m.i32(16);
                         for x in [&mut a, &mut b] {

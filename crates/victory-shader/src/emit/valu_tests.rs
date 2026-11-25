@@ -1584,6 +1584,28 @@ fn cmp16_sdwa_preserves_word_selects() {
     }
 }
 
+/// Inline float constants on 16-bit integer ops keep their f32 bits: `1.0`
+/// is `0x3F80_0000` (low half 0), not f16 `0x3C00` (VIC-BT-021 / #438).
+#[test]
+fn u16_inline_float_uses_f32_bits() {
+    // v_add_nc_u16 v0, 1.0, v1  (inline const 242)
+    let add = build_valu_cs(&vop3(0x303, 0, 242, vgpr(1), 0));
+    // Hardware: low half of 0x3F80_0000 is 0, so v0 = v1's low half.
+    // Bug: f16 decode of 1.0 is 0x3C00, so v0 = v1 + 0x3C00.
+    run_cases(
+        &add,
+        &[[5, 0, 0, 0], [0x000A_0007, 0, 0, 0]],
+        |backend, i, inp, got| {
+            let want = inp[0] & 0xFFFF;
+            assert_eq!(
+                got & 0xFFFF,
+                want,
+                "{backend}: v_add_nc_u16 1.0, v1 case {i}: {got:#010x}, want low {want:#06x}"
+            );
+        },
+    );
+}
+
 /// `v_mad_f32` / `v_mac_f32` flush subnormals before and after `omod`
 /// regardless of `MODE.denorm32` (VIC-BT-043 / #440).
 #[test]
