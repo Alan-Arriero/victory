@@ -734,6 +734,8 @@ extern "system" fn copy_texture_region(
             let Some((buffer, staging)) = list.readback(host, staging_bytes) else {
                 return;
             };
+            // A depth texture shaders also write: what they wrote, first.
+            list.twin_use(src.resource, false, false);
             crate::texture::upload(&list, src.resource, from_tex);
             ensure_state(&list, src.resource, COPY_SOURCE);
             list.mark_work();
