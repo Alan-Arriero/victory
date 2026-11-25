@@ -1302,9 +1302,16 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
+    // create_at_address can succeed with no host texture (unsupported
+    // format/flags): do not cache that failure, or the next call would
+    // return Some with host == None (VIC-BT-027).
+    if resource(out).host().is_none() {
+        object::release_boxed::<Resource>(out);
+        return None;
+    }
     map.insert((address, *desc), out as usize);
     placed_views().insert(out as usize);
-    resource(out).host().is_some().then_some(out)
+    Some(out)
 }
 
 /// The resources [`texture_at`] made (never released, as they are).
