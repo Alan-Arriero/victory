@@ -106,7 +106,8 @@ fn build_with_view(words: &[u32], buffer_stride: Option<u32>) -> (HostShader, lo
 
 /// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
 /// hardware GPU and on WARP (each skipped without a device) and returns,
-/// per one that ran, the UAV's 32 dwords.
+/// per one that ran, the UAV's 32 dwords. Panics when no device ran, as
+/// `valu_tests::run_cases` does, so a run without a device cannot pass.
 fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
@@ -154,6 +155,10 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         out.push((label, words[0].clone()));
     }
+    assert!(
+        !out.is_empty(),
+        "neither hardware nor WARP SM 6.6 device available"
+    );
     out
 }
 
