@@ -47,9 +47,15 @@ pub(crate) struct Lowered {
     pub has_isnan_op: bool,
     #[cfg(test)]
     pub has_fcmp_uno: bool,
+    #[cfg(test)]
+    pub has_fcmp_oeq: bool,
     /// Whether the program reads the pixel coverage mask.
     #[cfg(test)]
     pub has_coverage_op: bool,
+    /// Test builds: the `dx.op` calls before optimization, see
+    /// [`Module::dx_op_calls`].
+    #[cfg(test)]
+    pub dx_ops: Vec<(String, Vec<Option<i32>>)>,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -62,6 +68,9 @@ pub(crate) struct Lowered {
     /// Test builds: typed loads assembled from a dword-aligned pair.
     #[cfg(test)]
     pub unaligned_typed_loads: u32,
+    /// Test builds: d16 format loads that kept the destination's high half.
+    #[cfg(test)]
+    pub d16_kept_high_halves: u32,
     /// Test builds: constant byte offsets of `s_buffer_load_dword*`.
     #[cfg(test)]
     pub smem_buffer_bytes: Vec<u32>,
@@ -72,6 +81,12 @@ pub(crate) struct Lowered {
     /// Test builds: whether a 16-bit float is widened (`legacyF16ToF32`).
     #[cfg(test)]
     pub widens_f16: bool,
+    /// Test builds: whether i32 immediate `0x3F80_0000` (f32 1.0 bits) is present.
+    #[cfg(test)]
+    pub has_f32_one_imm: bool,
+    /// Test builds: whether i32 immediate `0x3C00` (f16 1.0 bits) is present.
+    #[cfg(test)]
+    pub has_f16_one_imm: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -200,11 +215,21 @@ fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
 /// How far a float channel of `width` bits (16, or the unsigned 11- and
 /// 10-bit floats of the packed formats) shifts up to be a half:
 /// the small floats are a half's exponent (5 bits, biased 15) and the top
-/// of its mantissa, without the sign, so `legacyF16ToF32` widens them
-/// exactly, denormals, infinities and NaNs included.
+/// of its mantissa, without the sign. Non-NaN values widen as a half;
+/// NaNs keep their payload via [`Lower::f16_widen_keep_snan`].
 fn half_shift(width: u32) -> u32 {
     debug_assert!(matches!(width, 10 | 11 | 16), "{width}-bit float");
     if width == 16 { 0 } else { 15 - width }
+}
+
+/// f32 bits for an f16 NaN without quieting: `sign | 0x7F800000 |
+/// (payload << 13)`. RDNA typed-buffer float formats preserve the
+/// signalling bit; `legacyF16ToF32` would set it (VIC-BT-019 / #440).
+#[cfg(test)]
+fn f16_nan_widen_bits(h: u32) -> u32 {
+    let h = h & 0xFFFF;
+    debug_assert!(h & 0x7FFF > 0x7C00, "{h:#x} is not an f16 NaN");
+    ((h & 0x8000) << 16) | 0x7F80_0000 | ((h & 0x3FF) << 13)
 }
 
 /// A cached descriptor handle: block, the load site, its first dword, whether
@@ -1216,16 +1241,26 @@ impl<'a> Lower<'a> {
         #[cfg(test)]
         let has_fcmp_uno = self.s.m.has_cmp(pred::UNO);
         #[cfg(test)]
+        let has_fcmp_oeq = self.s.m.has_cmp(pred::OEQ);
+        #[cfg(test)]
         let has_coverage_op = self.s.m.has_dx_op("dx.op.coverage.i32", 91);
+        #[cfg(test)]
+        let dx_ops = self.s.m.dx_op_calls();
         Ok(Lowered {
             #[cfg(test)]
             unaligned_typed_loads: self.s.unaligned_typed_loads,
+            #[cfg(test)]
+            d16_kept_high_halves: self.s.d16_kept_high_halves,
             #[cfg(test)]
             smem_buffer_bytes: std::mem::take(&mut self.s.smem_buffer_bytes),
             #[cfg(test)]
             image_address_reads: std::mem::take(&mut self.s.image_address_reads),
             #[cfg(test)]
             widens_f16: self.s.m.has_dx_op("dx.op.legacyF16ToF32", 131),
+            #[cfg(test)]
+            has_f32_one_imm: self.s.m.has_i32_const(i64::from(0x3F80_0000u32 as i32)),
+            #[cfg(test)]
+            has_f16_one_imm: self.s.m.has_i32_const(0x3C00),
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -1244,7 +1279,11 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             has_fcmp_uno,
             #[cfg(test)]
+            has_fcmp_oeq,
+            #[cfg(test)]
             has_coverage_op,
+            #[cfg(test)]
+            dx_ops,
         })
     }
 
@@ -1355,6 +1394,15 @@ impl<'a> Lower<'a> {
                     &[],
                 ));
             }
+            // M0 for `v_interp`, which takes the primitive's parameters from
+            // the signature here, so no lowering reads the value. A phi can
+            // still join it with the register's reuse on another path and
+            // needs a value then.
+            Input::PrimMask => return Val::I32(self.s.m.i32(0)),
+            // shortcut: bit 31 clear says the wave overlaps no earlier one,
+            // so a POPS program skips its own wait (see `pops`) and its UAV
+            // accesses are not ordered between overlapping pixels.
+            Input::CollisionWaveId => return Val::I32(self.s.m.i32(0)),
             _ => return Val::Missing("a pixel system input"),
         };
         let free = self
@@ -2032,12 +2080,21 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            // `src_pops_exiting_wave_id`: only compared with the fields of
+            // the collision wave id, which reads as overlapping no wave.
+            Operand::Const(239) if self.pops() => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
             Operand::Literal(x) => Ok(self.s.m.i32(x)),
             Operand::Attr { .. } => Err("an attribute operand"),
         }
+    }
+
+    /// Whether this is a pixel program that loads the POPS collision wave id.
+    fn pops(&self) -> bool {
+        matches!(&self.x.native.io, StageIo::Ps { rsrc2, .. }
+            if rsrc2.collision_wave_id_sgpr().is_some())
     }
 
     /// GFX10 puts an inline f16 constant in the low half of the operand.
@@ -2208,6 +2265,54 @@ impl<'a> Lower<'a> {
             46,
             &[a, b, c],
         )
+    }
+
+    /// `fma(a, b, c)` in binary32 with a round-to-odd sticky bit when the
+    /// fused result is not exact, so a following nearest-even narrow to
+    /// binary16 matches a single round of the exact `a*b + c` (RDNA2
+    /// `v_fma_mixlo_f16` / `v_fma_mixhi_f16`). Without this, an exact value
+    /// just above a half-ulp midpoint can round to the midpoint in f32 and
+    /// then tie-to-even the wrong way in f16. The sticky step picks the
+    /// adjacent odd f32 toward the exact result (residual sign); always
+    /// OR-ing 1 would push a just-below-midpoint value across the midpoint.
+    fn fmad_round_to_odd(&mut self, a: V, b: V, c: V) -> V {
+        let cur = self.cur;
+        let r = self.fmad(a, b, c);
+        // Residual of the f32 FMA: nonzero ⇒ the exact value was not `r`.
+        let z = self.s.m.f32(0x8000_0000);
+        let neg_r = self.s.m.bin(cur, Bin::Sub, z, r);
+        let err = self.fmad(a, b, neg_r);
+        let err = self.s.m.bin(cur, Bin::Add, err, c);
+        let bits = self.as_int(r);
+        let err_bits = self.as_int(err);
+        let abs_mask = self.s.m.i32(0x7FFF_FFFF);
+        let abs = self.s.m.bin(cur, Bin::And, bits, abs_mask);
+        let err_abs = self.s.m.bin(cur, Bin::And, err_bits, abs_mask);
+        let zero = self.s.m.i32(0);
+        let sticky = self.s.m.cmp(cur, pred::NE, err_abs, zero);
+        let inf = self.s.m.i32(0x7F80_0000);
+        let finite = self.s.m.cmp(cur, pred::IULT, abs, inf);
+        let adjust = self.s.m.bin(cur, Bin::And, sticky, finite);
+        // Already odd: keep. Even: step one ulp toward the exact value.
+        let one = self.s.m.i32(1);
+        let lsb = self.s.m.bin(cur, Bin::And, bits, one);
+        let even = self.s.m.cmp(cur, pred::EQ, lsb, zero);
+        let do_step = self.s.m.bin(cur, Bin::And, adjust, even);
+        let sign = self.s.m.i32(0x8000_0000);
+        let err_sign = self.s.m.bin(cur, Bin::And, err_bits, sign);
+        let err_pos = self.s.m.cmp(cur, pred::EQ, err_sign, zero);
+        let abs_zero = self.s.m.cmp(cur, pred::EQ, abs, zero);
+        let min_neg = self.s.m.i32(0x8000_0001);
+        let stepped_z = self.s.m.select(cur, err_pos, one, min_neg);
+        let xored = self.s.m.bin(cur, Bin::Xor, err_bits, bits);
+        let xored_sign = self.s.m.bin(cur, Bin::And, xored, sign);
+        let same_sign = self.s.m.cmp(cur, pred::EQ, xored_sign, zero);
+        let up = self.s.m.bin(cur, Bin::Add, bits, one);
+        let down = self.s.m.bin(cur, Bin::Sub, bits, one);
+        let stepped_nz = self.s.m.select(cur, same_sign, up, down);
+        let stepped = self.s.m.select(cur, abs_zero, stepped_z, stepped_nz);
+        let out = self.s.m.select(cur, do_step, stepped, bits);
+        self.as_float(out)
     }
 
     /// `f` as an f16 in the low bits, rounded to nearest even as the
@@ -2767,11 +2872,17 @@ impl<'a> Lower<'a> {
             0 => {}
             k => {
                 let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(k)];
-                let c = self.s.m.f32(factor.to_bits());
-                f = self.s.m.bin(self.cur, Bin::Mul, f, c);
+                let c = self.cur;
+                let scale = self.s.m.f32(factor.to_bits());
+                f = self.s.m.bin(c, Bin::Mul, f, scale);
                 if flush_denorms {
                     f = self.flush_f32_subnormal(f);
                 }
+                // RDNA2 omod (mul:2/mul:4/div:2) flushes -0.0 to +0.0;
+                // IEEE FMul keeps the sign of zero.
+                let zero = self.s.m.f32(0);
+                let is_zero = self.s.m.cmp(c, pred::OEQ, f, zero);
+                f = self.s.m.select(c, is_zero, zero, f);
             }
         }
         if v.clamp {
@@ -2795,7 +2906,9 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        if v.clamp || v.omod != 0 {
+        // Integer `clamp` is unsigned saturation on add/sub; those ops apply it
+        // before calling here. Other integer ops refuse the modifier.
+        if v.omod != 0 || (v.clamp && !Self::integer_clamp_op(inst.name())) {
             return Err("integer output modifiers");
         }
         match v.dst {
@@ -2804,6 +2917,22 @@ impl<'a> Lower<'a> {
             _ => return Err("a result without a register"),
         }
         Ok(())
+    }
+
+    /// VOP3 integer ops whose `clamp` means unsigned saturation via carry/borrow.
+    fn integer_clamp_op(name: &str) -> bool {
+        matches!(
+            name,
+            "v_add_co_u32"
+                | "v_sub_co_u32"
+                | "v_subrev_co_u32"
+                | "v_add_co_ci_u32"
+                | "v_sub_co_ci_u32"
+                | "v_subrev_co_ci_u32"
+                | "v_add_nc_u32"
+                | "v_sub_nc_u32"
+                | "v_subrev_nc_u32"
+        )
     }
 
     /// Starts code only the lanes where `guard` holds run (a store under a
@@ -4019,6 +4148,13 @@ impl<'a> Lower<'a> {
         (r, carry)
     }
 
+    /// VOP3 integer `clamp`: unsigned saturation from the carry (add →
+    /// `0xFFFF_FFFF`) or borrow (sub → `0`) bit.
+    fn clamp_u32(&mut self, c: usize, add: bool, r: V, carry: V) -> V {
+        let sat = self.s.m.i32(if add { u32::MAX } else { 0 });
+        self.s.m.select(c, carry, sat, r)
+    }
+
     fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
         let v = inst.read(Reg::Scc).ok_or("an unread SCC")?;
         match self.get(v)? {
@@ -4689,9 +4825,15 @@ impl<'a> Lower<'a> {
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             let low = self.s.m.bin(c, Bin::LShr, w, sh);
             let word = if total == 16 && self.s.m.int_value(off).is_none_or(|v| v % 4 == 3) {
-                // A halfword at byte 3 reads the low byte of the next dword.
-                // Other alignments stay within the first dword, including
-                // when it is the last word exposed by a root buffer.
+                // A halfword at byte 3 reads `(lo >> 24) | (hi << 8)` from
+                // the dword pair around it; shifting only the first dword
+                // would drop the high byte (VIC-BT-019 / #440). Other
+                // alignments stay within the first dword, including when it
+                // is the last word exposed by a root buffer.
+                #[cfg(test)]
+                if self.s.m.int_value(off).is_some_and(|v| v % 4 == 3) {
+                    self.s.unaligned_typed_loads += 1;
+                }
                 let crosses = self.s.m.cmp(c, pred::EQ, byte, three);
                 let four = self.s.m.i32(4);
                 let next = self.s.m.bin(c, Bin::Add, at, four);
@@ -4802,22 +4944,96 @@ impl<'a> Lower<'a> {
                             self.s.m.bin(c, Bin::Shl, field, sh)
                         }
                     };
-                    let f = self
-                        .s
-                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+                    let f = self.f16_widen_keep_snan(h);
                     float(self, f)
                 }
             };
             out.push(x);
         }
-        let one = match numeric {
-            Numeric::Uint | Numeric::Sint => 1,
-            _ => 1.0f32.to_bits(),
-        };
-        for k in out.len() as u32..channels {
-            out.push(self.s.m.i32(if k == 3 { one } else { 0 }));
+        // Absent channels are 0; DST_SEL supplies 1 only when set to SEL_1
+        // (VIC-BT-019 / #440).
+        for _ in out.len() as u32..channels {
+            out.push(self.s.m.i32(0));
         }
         out.truncate(channels as usize);
+        Ok(out)
+    }
+
+    /// Widen an f16 (or a 10/11-bit float shifted into half form) to f32
+    /// without quieting sNaNs: NaNs become `sign | 0x7F800000 |
+    /// (payload << 13)`; other values use `legacyF16ToF32`.
+    fn f16_widen_keep_snan(&mut self, h: V) -> V {
+        let c = self.cur;
+        let f32t = self.s.t.f32;
+        let quieted = self
+            .s
+            .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+        let quieted = self.as_int(quieted);
+        let (mask_abs, nan_min, sign_bit, k16, mant, k13, exp_ones) = (
+            self.s.m.i32(0x7FFF),
+            self.s.m.i32(0x7C00),
+            self.s.m.i32(0x8000),
+            self.s.m.i32(16),
+            self.s.m.i32(0x3FF),
+            self.s.m.i32(13),
+            self.s.m.i32(0x7F80_0000),
+        );
+        let abs = self.s.m.bin(c, Bin::And, h, mask_abs);
+        let is_nan = self.s.m.cmp(c, pred::IUGT, abs, nan_min);
+        let sign = self.s.m.bin(c, Bin::And, h, sign_bit);
+        let sign = self.s.m.bin(c, Bin::Shl, sign, k16);
+        let payload = self.s.m.bin(c, Bin::And, h, mant);
+        let payload = self.s.m.bin(c, Bin::Shl, payload, k13);
+        let kept = self.s.m.bin(c, Bin::Or, sign, exp_ones);
+        let kept = self.s.m.bin(c, Bin::Or, kept, payload);
+        let bits = self.s.m.select(c, is_nan, kept, quieted);
+        self.as_float(bits)
+    }
+
+    /// Channels of buffer format `format`, as [`Self::format_load`] gives
+    /// them, as d16 data: 16 bits each, two per dword, low half first.
+    /// Integer formats saturate to 16 bits (UINT to 0xFFFF, SINT to
+    /// -32768..32767), as RDNA2 does for a 32-bit channel; the others become
+    /// f16 (nearest even). An odd last channel is a single half: the caller
+    /// merges it with [`Self::low_half`].
+    fn d16_channels(&mut self, format: u8, channels: Vec<V>) -> Result<Vec<V>, Why> {
+        let (_, numeric) = buffer_format(format).ok_or("a buffer format")?;
+        let c = self.cur;
+        let mut halves = Vec::new();
+        for x in channels {
+            halves.push(if matches!(numeric, Numeric::Uint) {
+                let m = self.s.m.i32(0xFFFF);
+                let lt = self.s.m.cmp(c, pred::IULT, x, m);
+                self.s.m.select(c, lt, x, m)
+            } else if matches!(numeric, Numeric::Sint) {
+                let (lo, hi, m) = (
+                    self.s.m.i32((-32768i32) as u32),
+                    self.s.m.i32(32767),
+                    self.s.m.i32(0xFFFF),
+                );
+                let below = self.s.m.cmp(c, pred::SLT, x, lo);
+                let x = self.s.m.select(c, below, lo, x);
+                let above = self.s.m.cmp(c, pred::SGT, x, hi);
+                let x = self.s.m.select(c, above, hi, x);
+                self.s.m.bin(c, Bin::And, x, m)
+            } else {
+                // Float / normalized: round to nearest even f16.
+                let f = self.as_float(x);
+                self.f16_nearest(f)
+            });
+        }
+        let mut out = Vec::new();
+        for pair in halves.chunks(2) {
+            out.push(match *pair {
+                [lo, hi] => {
+                    let k16 = self.s.m.i32(16);
+                    let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                    self.s.m.bin(c, Bin::Or, lo, hi)
+                }
+                [lo] => lo,
+                _ => unreachable!("chunks of one or two"),
+            });
+        }
         Ok(out)
     }
 
@@ -5041,18 +5257,29 @@ impl<'a> Lower<'a> {
                     .get(..4)
                     .and_then(|w| w.try_into().ok())
                     .ok_or("a sampler constant")?;
-                let n = match self.samplers.iter().position(|w| *w == words) {
-                    Some(n) => n,
+                // Comparison and non-comparison samples need distinct static
+                // sampler slots (D3D12 SamplerComparisonState vs SamplerState):
+                // annotateHandle props must match dx.resources sampler kind.
+                let cmp = props.0 & 0x8000 != 0;
+                let n = match self
+                    .samplers
+                    .iter()
+                    .enumerate()
+                    .find(|(n, w)| **w == words && (self.s.cmp_samplers >> *n & 1 != 0) == cmp)
+                {
+                    Some((n, _)) => n,
                     None => {
+                        let n = self.samplers.len();
+                        if n >= 64 {
+                            return Err("too many immediate samplers");
+                        }
                         self.samplers.push(words);
-                        self.samplers.len() - 1
+                        if cmp {
+                            self.s.cmp_samplers |= 1 << n;
+                        }
+                        n
                     }
                 };
-                if props.0 & 0x8000 != 0 {
-                    // shortcut: one sampler used with and without comparison
-                    // would need two static samplers; it becomes a comparison one.
-                    self.s.cmp_samplers |= 1 << n;
-                }
                 Ok(self.s.sampler_handle(self.cur, n as u32))
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
@@ -5810,10 +6037,12 @@ impl<'a> Lower<'a> {
                     }
                     xs.push(x);
                 }
-                let mut r = self.fmad(xs[0], xs[1], xs[2]);
                 if name == "v_fma_mix_f32" {
+                    let r = self.fmad(xs[0], xs[1], xs[2]);
                     return float(self, r);
                 }
+                // Single-round to f16: round-to-odd in f32, then nearest-even.
+                let mut r = self.fmad_round_to_odd(xs[0], xs[1], xs[2]);
                 if v.clamp {
                     r = self.unary(7, r);
                 }
@@ -5902,7 +6131,11 @@ impl<'a> Lower<'a> {
                 } else {
                     None
                 };
-                let (r, carry) = self.add_sub_carry(c, name.starts_with("v_add"), a, bb, cin);
+                let add = name.starts_with("v_add");
+                let (mut r, carry) = self.add_sub_carry(c, add, a, bb, cin);
+                if v.clamp {
+                    r = self.clamp_u32(c, add, r, carry);
+                }
                 int(self, r)?;
                 if let Some(Operand::Scalar { code, .. }) = v.carry
                     && let Some(w) = inst.write(Reg::S(code))
@@ -6075,11 +6308,23 @@ impl<'a> Lower<'a> {
         (lo, hi)
     }
 
-    /// Source `k` of a 16-bit operation in the low 16 bits (the rest 0):
+    /// Source `k` of a 16-bit f16 operation in the low 16 bits (the rest 0):
     /// op_sel (or an SDWA word select) picks the high half, except that
     /// 16-bit compares other than `v_cmp_class` ignore op_sel; inline float
     /// constants are f16 values here.
-    fn half_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+    fn half_src_f16(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        self.half_src(inst, k, true)
+    }
+
+    /// Source `k` of a 16-bit integer (u16/i16/b16) operation in the low 16
+    /// bits (the rest 0): same half selection as [`Self::half_src_f16`], but
+    /// inline float constants keep their 32-bit f32 bit patterns (hardware
+    /// uses the selected 16 of those).
+    fn half_src_i16(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        self.half_src(inst, k, false)
+    }
+
+    fn half_src(&mut self, inst: &Inst, k: usize, float: bool) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
@@ -6098,7 +6343,8 @@ impl<'a> Lower<'a> {
         }
         let x = match self.src0 {
             Some(x) if k == 0 => x,
-            _ => self.f16_operand(inst, &op)?,
+            _ if float => self.f16_operand(inst, &op)?,
+            _ => self.operand(inst, &op)?,
         };
         let c = self.cur;
         let x = if high {
@@ -6116,7 +6362,7 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let h = self.half_src(inst, k)?;
+        let h = self.half_src_f16(inst, k)?;
         let f32t = self.s.t.f32;
         let mut f = self
             .s
@@ -6337,7 +6583,7 @@ impl<'a> Lower<'a> {
         if float1.contains(&name) {
             let r = match name {
                 "v_cvt_f16_u16" | "v_cvt_f16_i16" => {
-                    let mut x = self.half_src(inst, 0)?;
+                    let mut x = self.half_src_i16(inst, 0)?;
                     let op = if name == "v_cvt_f16_i16" {
                         let k16 = self.s.m.i32(16);
                         let t = self.s.m.bin(c, Bin::Shl, x, k16);
@@ -6409,7 +6655,7 @@ impl<'a> Lower<'a> {
                 self.s.m.select(c, nan, z, r)
             }
             _ => {
-                let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+                let (mut a, mut b) = (self.half_src_i16(inst, 0)?, self.half_src_i16(inst, 1)?);
                 let k16 = self.s.m.i32(16);
                 let sext = |l: &mut Self, x: V| {
                     let t = l.s.m.bin(c, Bin::Shl, x, k16);
@@ -6468,7 +6714,7 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let k = |l: &mut Self, x: u32| l.s.m.i32(x);
-        let mut h = self.half_src(inst, 0)?;
+        let mut h = self.half_src_f16(inst, 0)?;
         if v.abs & 1 != 0 {
             let m = k(self, 0x7FFF);
             h = self.s.m.bin(c, Bin::And, h, m);
@@ -6673,19 +6919,32 @@ impl<'a> Lower<'a> {
             l.s.m.bin(c, Bin::And, x, k31)
         };
         Ok(match name {
-            "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_add_nc_u32" | "v_sub_nc_u32"
-            | "v_subrev_nc_u32" | "v_mul_lo_u32" => {
+            "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_mul_lo_u32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 let (op, a, b) = match name {
                     "v_and_b32" => (Bin::And, a, b),
                     "v_or_b32" => (Bin::Or, a, b),
                     "v_xor_b32" => (Bin::Xor, a, b),
-                    "v_add_nc_u32" => (Bin::Add, a, b),
-                    "v_sub_nc_u32" => (Bin::Sub, a, b),
-                    "v_subrev_nc_u32" => (Bin::Sub, b, a),
                     _ => (Bin::Mul, a, b),
                 };
                 self.s.m.bin(c, op, a, b)
+            }
+            "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32" => {
+                let (mut a, mut b) = (s(self, 0)?, s(self, 1)?);
+                if name == "v_subrev_nc_u32" {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                let add = name == "v_add_nc_u32";
+                let Fields::Valu(v) = &inst.fields else {
+                    unreachable!()
+                };
+                if v.clamp {
+                    let (r, carry) = self.add_sub_carry(c, add, a, b, None);
+                    self.clamp_u32(c, add, r, carry)
+                } else {
+                    let op = if add { Bin::Add } else { Bin::Sub };
+                    self.s.m.bin(c, op, a, b)
+                }
             }
             "v_xnor_b32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
@@ -6833,6 +7092,63 @@ impl<'a> Lower<'a> {
                 let b = self.s.m.bin(c, op, b, sh);
                 let m = self.s.m.bin(c, Bin::Mul, a, b);
                 self.s.m.bin(c, Bin::Add, m, d)
+            }
+            // 16×16→32 multiply-add: op_sel[0]/[1] pick high/low halves of
+            // src0/src1; src2 is a full 32-bit addend. Clamp stays refused.
+            "v_mad_u32_u16" | "v_mad_i32_i16" => {
+                let (mut a, mut b, d) = (
+                    self.half_src_i16(inst, 0)?,
+                    self.half_src_i16(inst, 1)?,
+                    s(self, 2)?,
+                );
+                if name == "v_mad_i32_i16" {
+                    let sh = k(self, 16);
+                    let sext = |l: &mut Self, x: V| {
+                        let t = l.s.m.bin(c, Bin::Shl, x, sh);
+                        l.s.m.bin(c, Bin::AShr, t, sh)
+                    };
+                    a = sext(self, a);
+                    b = sext(self, b);
+                }
+                let m = self.s.m.bin(c, Bin::Mul, a, b);
+                self.s.m.bin(c, Bin::Add, m, d)
+            }
+            // Packed 4×8-bit unsigned average; per-byte rounding bit from src2:
+            // dst.u8[i] = (src0.u8[i] + src1.u8[i] + (src2.u8[i] & 1)) >> 1.
+            "v_lerp_u8" => {
+                let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let (mff, one) = (k(self, 0xFF), k(self, 1));
+                let mut out = k(self, 0);
+                for i in 0..4u32 {
+                    let (ai, bi, di) = if i == 0 {
+                        (a, b, d)
+                    } else {
+                        let sh = k(self, i * 8);
+                        (
+                            self.s.m.bin(c, Bin::LShr, a, sh),
+                            self.s.m.bin(c, Bin::LShr, b, sh),
+                            self.s.m.bin(c, Bin::LShr, d, sh),
+                        )
+                    };
+                    let ai = self.s.m.bin(c, Bin::And, ai, mff);
+                    let bi = self.s.m.bin(c, Bin::And, bi, mff);
+                    let di = self.s.m.bin(c, Bin::And, di, one);
+                    let sum = self.s.m.bin(c, Bin::Add, ai, bi);
+                    let sum = self.s.m.bin(c, Bin::Add, sum, di);
+                    let avg = self.s.m.bin(c, Bin::LShr, sum, one);
+                    let byte = if i == 0 {
+                        avg
+                    } else {
+                        let sh = k(self, i * 8);
+                        self.s.m.bin(c, Bin::Shl, avg, sh)
+                    };
+                    out = if i == 0 {
+                        byte
+                    } else {
+                        self.s.m.bin(c, Bin::Or, out, byte)
+                    };
+                }
+                out
             }
             "v_min3_i32" | "v_max3_i32" | "v_min3_u32" | "v_max3_u32" | "v_med3_i32"
             | "v_med3_u32" => {
@@ -7051,7 +7367,7 @@ impl<'a> Lower<'a> {
                     let Fields::Valu(v) = &inst.fields else {
                         unreachable!()
                     };
-                    let mut h = self.half_src(inst, 0)?;
+                    let mut h = self.half_src_f16(inst, 0)?;
                     if v.abs & 1 != 0 {
                         let m = self.s.m.i32(0x7FFF);
                         h = self.s.m.bin(c, Bin::And, h, m);
@@ -7171,7 +7487,7 @@ impl<'a> Lower<'a> {
             }
             "u32" | "i32" | "u16" | "i16" => {
                 let (a, b) = if ty.ends_with("16") {
-                    let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+                    let (mut a, mut b) = (self.half_src_i16(inst, 0)?, self.half_src_i16(inst, 1)?);
                     if ty == "i16" {
                         let k16 = self.s.m.i32(16);
                         for x in [&mut a, &mut b] {
@@ -7397,6 +7713,51 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Saturate a 32-bit unsigned channel to 16 bits (RDNA2 `image_load` d16).
+    fn saturate_u16(&mut self, x: V) -> V {
+        let c = self.cur;
+        let m = self.s.m.i32(0xFFFF);
+        let lt = self.s.m.cmp(c, pred::IULT, x, m);
+        self.s.m.select(c, lt, x, m)
+    }
+
+    /// Saturate a 32-bit signed channel to 16 bits (RDNA2 `image_load` d16).
+    fn saturate_i16(&mut self, x: V) -> V {
+        let c = self.cur;
+        let (lo, hi, m) = (
+            self.s.m.i32((-32768i32) as u32),
+            self.s.m.i32(32767),
+            self.s.m.i32(0xFFFF),
+        );
+        let below = self.s.m.cmp(c, pred::SLT, x, lo);
+        let x = self.s.m.select(c, below, lo, x);
+        let above = self.s.m.cmp(c, pred::SGT, x, hi);
+        let x = self.s.m.select(c, above, hi, x);
+        self.s.m.bin(c, Bin::And, x, m)
+    }
+
+    /// Whether GFX10 `IMG_FORMAT` / buffer format `fmt` is UINT or SINT
+    /// (the families in [`buffer_format`]).
+    fn format_is_uint_sint(&mut self, fmt: V) -> (V, V) {
+        let c = self.cur;
+        // Numbers from `buffer_format`'s UINT / SINT slots (1..=77).
+        const UINTS: &[u32] = &[5, 11, 18, 20, 27, 34, 41, 48, 54, 60, 62, 69, 72, 75];
+        const SINTS: &[u32] = &[6, 12, 19, 21, 28, 35, 42, 49, 55, 61, 63, 70, 73, 76];
+        let mut is_uint = self.s.m.int_const(self.s.t.i1, 0);
+        for &n in UINTS {
+            let lit = self.s.m.i32(n);
+            let eq = self.s.m.cmp(c, pred::EQ, fmt, lit);
+            is_uint = self.s.m.bin(c, Bin::Or, is_uint, eq);
+        }
+        let mut is_sint = self.s.m.int_const(self.s.t.i1, 0);
+        for &n in SINTS {
+            let lit = self.s.m.i32(n);
+            let eq = self.s.m.cmp(c, pred::EQ, fmt, lit);
+            is_sint = self.s.m.bin(c, Bin::Or, is_sint, eq);
+        }
+        (is_uint, is_sint)
+    }
+
     /// `x` (an f16 in the low bits) as the low half of VGPR `reg`: 16-bit
     /// results keep the register's high half (GFX10).
     fn low_half(&mut self, inst: &Inst, reg: u8, x: V) -> V {
@@ -7476,6 +7837,7 @@ impl<'a> Lower<'a> {
         let Fields::Image {
             data,
             addr,
+            rsrc,
             dmask,
             dim,
             unorm,
@@ -7722,19 +8084,24 @@ impl<'a> Lower<'a> {
         };
         let (op, sample) = match base_name {
             "image_sample" | "image_sample_cl" | "image_sample_o" => (60, true),
-            "image_sample_lz" | "image_sample_l" | "image_sample_lz_o" => (62, true),
+            "image_sample_lz" | "image_sample_l" | "image_sample_lz_o" | "image_sample_l_o" => {
+                (62, true)
+            }
             "image_sample_b" | "image_sample_b_cl" | "image_sample_b_o" | "image_sample_b_cl_o" => {
                 (61, true)
             }
-            "image_sample_c_lz" => (65, true),
+            "image_sample_c_lz" | "image_sample_c_lz_o" => (65, true),
             "image_sample_d" | "image_sample_d_cl" | "image_sample_d_o" | "image_sample_d_cl_o" => {
                 (63, true)
             }
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
-            "image_sample_c" | "image_sample_c_cl" if self.s.pixel => (64, true),
+            "image_sample_c" | "image_sample_c_cl" | "image_sample_c_o" if self.s.pixel => {
+                (64, true)
+            }
             "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" | "image_gather4_l"
             | "image_gather4_l_o" => (73, true),
+            "image_gather4_c_lz" | "image_gather4_c_lz_o" => (74, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -7790,15 +8157,23 @@ impl<'a> Lower<'a> {
                 .ok_or("an untracked sampler")?;
             // Comparison: the reference value is the first address after
             // the bias, and the sampler is a comparison sampler.
-            let cmp = matches!(op, 64 | 65);
+            let cmp = matches!(op, 64 | 65 | 74);
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
             let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
-            // signed (programmable offsets: gathers only). Offset, bias and
-            // z-compare are always full 32-bit VGPRs even with a16.
+            // z in 16-21, signed (programmable offsets: gathers only).
+            // Offset, bias and z-compare are always full 32-bit VGPRs even
+            // with a16. Token split (not ends_with) so `_o_g16` / `_cl_o` work.
             let offset_word = base_name.split('_').any(|t| t == "o");
+            let gather = matches!(op, 73 | 74);
+            if offset_word && kind == 5 {
+                return Err("a texel offset on a cube");
+            }
+            if gather && !matches!(kind, 2 | 5 | 7) {
+                return Err("a gather of a view other than 2D or cube");
+            }
             let has_cl = base_name.split('_').any(|t| t == "cl");
             let first = usize::from(offset_word) + usize::from(op == 61) + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
@@ -7823,6 +8198,7 @@ impl<'a> Lower<'a> {
                 }
             };
             // Bias is a whole VGPR even with a16; only its low half is the f16.
+            // The bias follows the offset word.
             let bias_float = |l: &mut Self| -> Result<V, Why> {
                 let bias = addr_u32(l, usize::from(offset_word))?;
                 if *a16 {
@@ -7906,7 +8282,7 @@ impl<'a> Lower<'a> {
             } else {
                 fu
             };
-            if matches!(op, 60 | 61 | 63) && offset_word {
+            if offset_word && !gather {
                 // DXIL takes immediate offsets in -8..=7; the console's are
                 // 6-bit and may be computed.
                 let w = addr_u32(self, 0)?;
@@ -8015,7 +8391,7 @@ impl<'a> Lower<'a> {
                         .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
                 }
                 62 => {
-                    let lod = if name == "image_sample_l" {
+                    let lod = if matches!(name, "image_sample_l" | "image_sample_l_o") {
                         let x = addr_packed(self, coord_base, coords)?;
                         to_float(self, x)
                     } else {
@@ -8032,7 +8408,8 @@ impl<'a> Lower<'a> {
                         &args,
                     )
                 }
-                _ if name.starts_with("image_gather4_l")
+                _ if op == 73
+                    && name.starts_with("image_gather4_l")
                     && !name.starts_with("image_gather4_lz") =>
                 {
                     if *unorm || *d16 {
@@ -8074,14 +8451,27 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os[..2]);
                     args.push(self.s.m.i32(dmask.trailing_zeros()));
-                    self.s.op(
-                        c,
-                        "textureGather.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        73,
-                        &args,
-                    )
+                    if op == 74 {
+                        let reference = addr_u32(self, first - 1)?;
+                        args.push(self.as_float(reference));
+                        self.s.op(
+                            c,
+                            "textureGatherCmp.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            74,
+                            &args,
+                        )
+                    } else {
+                        self.s.op(
+                            c,
+                            "textureGather.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            73,
+                            &args,
+                        )
+                    }
                 }
             }
         } else {
@@ -8098,6 +8488,96 @@ impl<'a> Lower<'a> {
             } else {
                 self.s.m.i32(0)
             };
+            // VIC-BT-017: d16 image_load packs two channels per VGPR and must
+            // keep an odd trailing high half; UINT/SINT texels saturate to 16
+            // bits via textureLoad.i32 rather than going through f16.
+            if *d16 {
+                let Operand::Vector { reg, .. } = *data else {
+                    return Err("an image result");
+                };
+                let channels: Vec<u32> = (0..4).filter(|ch| dmask >> ch & 1 != 0).collect();
+                let mut args = vec![h, mip];
+                args.extend(&cs);
+                args.extend([iu, iu, iu]);
+                let r_f = self.s.op(
+                    c,
+                    "textureLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    66,
+                    &args,
+                );
+                // U32 component type, four channels (matches 0x409 for F32).
+                let h_i = self.handle(site, src, false, (props.0, 0x405))?;
+                let i32t = self.s.t.i32;
+                let res_i = self
+                    .s
+                    .m
+                    .named_struct("dx.types.ResRet.i32", vec![i32t, i32t, i32t, i32t, i32t]);
+                let mut args_i = vec![h_i, mip];
+                args_i.extend(&cs);
+                args_i.extend([iu, iu, iu]);
+                let r_i = self
+                    .s
+                    .op(c, "textureLoad.i32", Attr::ReadOnly, res_i, 66, &args_i);
+                // SQ_IMG_RSRC_WORD1.FORMAT at bits 20..28 (GFX10).
+                let (is_uint, is_sint) = match rsrc {
+                    Operand::Scalar { code, dwords } if *dwords >= 2 => {
+                        let w1 = inst
+                            .read(Reg::S(code + 1))
+                            .ok_or("an unread image descriptor")?;
+                        let w1 = self.i32_of(w1)?;
+                        let sh = self.s.m.i32(20);
+                        let mask = self.s.m.i32(0x1FF);
+                        let fmt = self.s.m.bin(c, Bin::LShr, w1, sh);
+                        let fmt = self.s.m.bin(c, Bin::And, fmt, mask);
+                        self.format_is_uint_sint(fmt)
+                    }
+                    _ => (
+                        self.s.m.int_const(self.s.t.i1, 0),
+                        self.s.m.int_const(self.s.t.i1, 0),
+                    ),
+                };
+                let mut halves = Vec::new();
+                for ch in channels {
+                    let f = self.s.m.extract(c, r_f, ch);
+                    let f16 = self.f16_nearest(f);
+                    let i = self.s.m.extract(c, r_i, ch);
+                    let u = self.saturate_u16(i);
+                    let s = self.saturate_i16(i);
+                    let int = self.s.m.select(c, is_sint, s, u);
+                    let is_int = self.s.m.bin(c, Bin::Or, is_uint, is_sint);
+                    halves.push(self.s.m.select(c, is_int, int, f16));
+                }
+                let k16 = self.s.m.i32(16);
+                let n = halves.len();
+                let mut xs = Vec::new();
+                for (k, pair) in halves.chunks(2).enumerate() {
+                    let packed = match *pair {
+                        [lo, hi] => {
+                            let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                            self.s.m.bin(c, Bin::Or, lo, hi)
+                        }
+                        [lo] => lo,
+                        _ => unreachable!("chunks of one or two"),
+                    };
+                    let reg = reg + k as u8;
+                    let x = if k * 2 + 1 == n {
+                        #[cfg(test)]
+                        {
+                            self.s.d16_kept_high_halves += 1;
+                        }
+                        self.low_half(inst, reg, packed)
+                    } else {
+                        packed
+                    };
+                    xs.push((reg, x));
+                }
+                for (reg, x) in xs {
+                    self.write(inst, Reg::V(reg), x, guard);
+                }
+                return Ok(());
+            }
             let mut args = vec![h, mip];
             args.extend(&cs);
             args.extend([iu, iu, iu]);
@@ -8113,7 +8593,7 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
         };
-        let channels: Vec<u32> = if op == 73 {
+        let channels: Vec<u32> = if matches!(op, 73 | 74) {
             vec![0, 1, 2, 3]
         } else {
             (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
@@ -8121,27 +8601,7 @@ impl<'a> Lower<'a> {
         let mut xs = Vec::new();
         for ch in channels {
             let x = self.s.m.extract(c, r, ch);
-            xs.push(if *d16 {
-                // shortcut: d16 results are taken as floats (rounded to
-                // nearest even); integer formats would keep 16 bits.
-                self.f16_nearest(x)
-            } else {
-                self.as_int(x)
-            });
-        }
-        if *d16 {
-            // Two channels per VGPR, low half first (an odd last high half 0).
-            let k16 = self.s.m.i32(16);
-            xs = xs
-                .chunks(2)
-                .map(|p| match *p {
-                    [lo, hi] => {
-                        let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
-                        self.s.m.bin(c, Bin::Or, lo, hi)
-                    }
-                    _ => p[0],
-                })
-                .collect();
+            xs.push(self.as_int(x));
         }
         for (k, x) in xs.into_iter().enumerate() {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
@@ -8374,8 +8834,8 @@ impl<'a> Lower<'a> {
             "buffer_load_sshort" => Some(12), // 16_SINT
             _ => None,
         };
-        // d16: two 16-bit channels per VGPR, low half first.
-        let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
+        // d16: two 16-bit channels per VGPR, low half first (MUBUF and MTBUF).
+        let d16 = name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
@@ -8583,8 +9043,23 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
-                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            let mut xs = self.format_load(h, off, f, count)?;
+            if d16 {
+                xs = self.d16_channels(f, xs)?;
+            }
+            let n = xs.len();
+            for (k, x) in xs.into_iter().enumerate() {
+                let reg = reg + k as u8;
+                let x = if d16 && k + 1 == n && count % 2 == 1 {
+                    #[cfg(test)]
+                    {
+                        self.s.d16_kept_high_halves += 1;
+                    }
+                    self.low_half(inst, reg, x)
+                } else {
+                    x
+                };
+                self.write(inst, Reg::V(reg), x, guard);
             }
             return Ok(());
         }
@@ -8670,7 +9145,10 @@ impl<'a> Lower<'a> {
             return Err("a buffer result");
         };
         if d16 {
-            // Two f16 channels per VGPR (an odd last high half 0).
+            // Two f16 channels per VGPR. An odd last channel leaves its high
+            // half intact. shortcut: MUBUF typed loads use a float view, so
+            // UINT/SINT saturation for d16 is handled on the MTBUF path where
+            // the instruction names the format (`d16_channels`).
             let k16 = self.s.m.i32(16);
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
@@ -8685,7 +9163,16 @@ impl<'a> Lower<'a> {
                         None => h,
                     });
                 }
-                self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
+                let reg = reg + k as u8;
+                let mut x = x.expect("a channel");
+                if 2 * k + 1 == count {
+                    #[cfg(test)]
+                    {
+                        self.s.d16_kept_high_halves += 1;
+                    }
+                    x = self.low_half(inst, reg, x);
+                }
+                self.write(inst, Reg::V(reg), x, guard);
             }
             return Ok(());
         }
@@ -9117,6 +9604,25 @@ impl<'a> Lower<'a> {
                 when,
                 taken,
                 not_taken,
+            } if taken == not_taken => {
+                // Degenerate branch: both arms share one successor. Emitting
+                // CondBr with two critical-edge blocks would insert the same
+                // edges map key twice and drop the first edge from fill_phis
+                // (VIC-BT-007). Treat it as an unconditional jump.
+                let _ = when;
+                if self.counters.contains_key(&taken) && self.rpo[taken] <= self.rpo[b] {
+                    let ok = self.count_iteration(taken, pred::IULT);
+                    let abort = self.abort_block();
+                    Term::CondBr(ok, self.block[taken].expect("reachable"), abort)
+                } else {
+                    self.enter_loop(b, taken, self.cur);
+                    Term::Br(self.block[taken].expect("reachable"))
+                }
+            }
+            LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
             } => {
                 // A negated condition branches the other way round.
                 let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
@@ -9519,7 +10025,7 @@ fn wave_lane(m: &mut Module, block: usize, lane: V, wave64: bool) -> V {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, buffer_format, f16_nan_widen_bits, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -9638,6 +10144,35 @@ mod tests {
         );
     }
 
+    /// VOP3 `v_add_f32` with output modifier `omod` in bits 28:27 of word 1.
+    fn v_add_f32_omod(omod: u8) -> [u32; 3] {
+        let src0 = 256 + 1u32;
+        let src1 = 256 + 2u32;
+        [
+            // VOP3 opcode 0x103 = VOP2 v_add_f32 (0x003) at the VOP2 base.
+            0x35 << 26 | (0x103u32 << 16),
+            src0 | (src1 << 9) | (u32::from(omod) & 3) << 27,
+            S_ENDPGM,
+        ]
+    }
+
+    #[test]
+    fn write_f_omod_flushes_neg_zero_with_fcmp_oeq() {
+        // Plain add has no signed-zero flush; omod must compare against +0.
+        let plain = lower_words(&v_add_f32_omod(0), 0).unwrap();
+        assert!(
+            !plain.has_fcmp_oeq,
+            "v_add_f32 without omod must not emit fcmp oeq"
+        );
+        for omod in 1..=3 {
+            let lowered = lower_words(&v_add_f32_omod(omod), 0).unwrap();
+            assert!(
+                lowered.has_fcmp_oeq,
+                "v_add_f32 omod={omod} must emit fcmp oeq to flush -0.0"
+            );
+        }
+    }
+
     /// A pixel shader that exports `v0` as a render-target colour, with
     /// `input_addr` enabling its input VGPRs.
     fn lower_ps(input_addr: u32) -> Result<Lowered, crate::ShaderError> {
@@ -9653,6 +10188,7 @@ mod tests {
             io: StageIo::Ps {
                 inputs: vec![],
                 input_addr,
+                rsrc2: Default::default(),
                 db_shader_control: 0,
                 patches: vec![],
             },
@@ -9774,6 +10310,7 @@ mod tests {
             io: StageIo::Ps {
                 inputs: vec![],
                 input_addr: 0,
+                rsrc2: Default::default(),
                 db_shader_control: 0,
                 patches: vec![],
             },
@@ -9971,6 +10508,73 @@ mod tests {
 
         for words in [add, sub] {
             lowers(&words, 0).unwrap();
+        }
+    }
+
+    /// `v_mad_u32_u16` / `v_mad_i32_i16` (with op_sel halves) and `v_lerp_u8`
+    /// lower (#405). An LDS store keeps the result live.
+    #[test]
+    fn mad_32_16_and_lerp_u8_lower() {
+        let vop3 = |op: u16, opsel: u8, vdst: u8, s0: u32, s1: u32, s2: u32| -> [u32; 2] {
+            [
+                0x35 << 26 | (op as u32 & 0x3FF) << 16 | (opsel as u32 & 0xF) << 11 | vdst as u32,
+                (s0 & 0x1FF) | (s1 & 0x1FF) << 9 | (s2 & 0x1FF) << 18,
+            ]
+        };
+        let (v0, v1, v2) = (256u32, 257, 258);
+        let store = |op_words: [u32; 2]| {
+            let mut words = vec![
+                0x7E00_0283, // v_mov_b32 v0, 3
+                0x7E02_0285, // v_mov_b32 v1, 5
+                0x7E04_0287, // v_mov_b32 v2, 7
+            ];
+            words.extend_from_slice(&op_words);
+            words.extend_from_slice(&[
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0xD834_0000,
+                0x0000_0003, // ds_write_b32 v3, v0
+                S_ENDPGM,
+            ]);
+            lowers_lds(&words).unwrap();
+        };
+        store(vop3(0x373, 0, 0, v0, v1, v2)); // v_mad_u32_u16
+        store(vop3(0x373, 0b0011, 0, v0, v1, v0)); // opsel hi halves
+        store(vop3(0x375, 0, 0, v0, v1, v2)); // v_mad_i32_i16
+        store(vop3(0x14d, 0, 0, v0, v1, v2)); // v_lerp_u8
+    }
+
+    /// VOP3 integer `clamp` is unsigned saturation on carry/non-carry add/sub
+    /// (VIC-BT-010). The LDS store forces the result live: without the fix,
+    /// `write_i` leaves it missing and the store refuses translation.
+    #[test]
+    fn integer_vop3_clamp_lowers_add_and_sub() {
+        let v1 = 256 + 1u32;
+        let v2 = 256 + 2u32;
+        let store = |op_words: [u32; 2]| {
+            let mut words = vec![
+                0x7E02_0281, // v_mov_b32 v1, 1
+                0x7E04_0282, // v_mov_b32 v2, 2
+            ];
+            words.extend_from_slice(&op_words);
+            words.extend_from_slice(&[
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0xD834_0000,
+                0x0000_0003, // ds_write_b32 v3, v0
+                S_ENDPGM,
+            ]);
+            lowers_lds(&words).unwrap();
+        };
+        // VOP2-as-VOP3: opcode + 0x100 (bare 0x025 is VOPC v_cmp_lg_f64).
+        // v_add_nc_u32 / v_sub_nc_u32 / v_subrev_nc_u32 with clamp.
+        for op in [0x125u16, 0x126, 0x127] {
+            store([0x35 << 26 | (op as u32) << 16 | 1 << 15, v1 | v2 << 9]);
+        }
+        // v_add_co_u32 / v_sub_co_u32 / v_subrev_co_u32 with clamp (carry → s16).
+        for op in [0x30fu16, 0x310, 0x319] {
+            store([
+                0x35 << 26 | (op as u32) << 16 | 1 << 15 | 16 << 8,
+                v1 | v2 << 9,
+            ]);
         }
     }
 
@@ -10246,7 +10850,9 @@ mod tests {
         let op_shift = if mtbuf { 16 } else { 18 };
         [
             class << 26
-                | u32::from(opcode & if mtbuf { 0x7 } else { 0x7F }) << op_shift
+                // MUBUF opcodes are 8 bits (0x00..0xff); MTBUF uses 4 bits
+                // split across the two words.
+                | u32::from(opcode & if mtbuf { 0x7 } else { 0xFF }) << op_shift
                 | u32::from(format) << 19
                 | u32::from(offen) << 12
                 | u32::from(idxen) << 13
@@ -10349,6 +10955,51 @@ mod tests {
     }
 
     #[test]
+    fn a_halfword_typed_fetch_at_byte_3_reads_the_next_dword() {
+        // `tbuffer_load_format_x` of 16_UINT at byte offset 3 straddles
+        // two dwords: `(lo >> 24) | (hi << 8)`. VIC-BT-019 / #440.
+        let odd = buffer(0x000, true, 11, 3, false, false, 0, 3, 8);
+        let (layout, used) = fetch_tables(0, 4);
+        let l = lower_with(&fetch_program(odd, 1), layout, used).unwrap();
+        assert_eq!(l.unaligned_typed_loads, 1);
+        let even = buffer(0x000, true, 11, 0, false, false, 0, 3, 8);
+        let (layout, used) = fetch_tables(0, 4);
+        let l = lower_with(&fetch_program(even, 1), layout, used).unwrap();
+        assert_eq!(l.unaligned_typed_loads, 0);
+    }
+
+    #[test]
+    fn a_typed_fetch_fills_missing_channels_with_zero() {
+        // `tbuffer_load_format_xyzw` of 32_FLOAT has one format channel;
+        // the other three are 0 (not (0,0,0,1)). VIC-BT-019 / #440.
+        let fetch = buffer(0x003, true, 22, 0, false, false, 0, 3, 8);
+        let (layout, used) = fetch_tables(0, 4);
+        let l = lower_with(&fetch_program(fetch, 4), layout, used).unwrap();
+        assert!(!l.dxil.is_empty());
+        // The old path wrote float 1.0 into W; a single-channel 32_FLOAT
+        // fetch has no other reason to emit that constant.
+        assert!(
+            !l.dxil
+                .windows(4)
+                .any(|w| w == 1.0f32.to_bits().to_le_bytes()),
+            "missing-channel fill must not be float 1.0"
+        );
+    }
+
+    #[test]
+    fn typed_float_widen_keeps_snan_payload() {
+        // 16_FLOAT sNaN 0x7C01 widens to 0x7F802000, not quieted
+        // 0x7FC02000. VIC-BT-019 / #440.
+        assert_eq!(f16_nan_widen_bits(0x7C01), 0x7F80_2000);
+        assert_eq!(f16_nan_widen_bits(0xFC01), 0xFF80_2000);
+        // A 16_FLOAT typed fetch lowers through the keep-sNaN path.
+        let fetch = buffer(0x000, true, 13, 0, false, false, 0, 3, 8);
+        let (layout, used) = fetch_tables(0, 4);
+        let l = lower_with(&fetch_program(fetch, 1), layout, used).unwrap();
+        assert!(l.widens_f16, "non-NaN values still use legacyF16ToF32");
+    }
+
+    #[test]
     fn a_typed_fetch_of_no_format_is_refused() {
         // Format 0 is not a format: the fetch must stop rather than read
         // whatever the descriptor holds.
@@ -10368,6 +11019,147 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    /// `v_mov_b32 vdst, literal`.
+    fn v_mov_lit(vdst: u8, lit: u32) -> [u32; 2] {
+        [0x7E00_0000 | (vdst as u32) << 17 | 0x01 << 9 | 255, lit]
+    }
+
+    /// Seeds `v[reg]` then runs a d16 buffer load into it, writing the
+    /// packed result VGPRs to LDS so they stay live.
+    fn d16_buffer_program(opcode: u16, mtbuf: bool, format: u8, reg: u8, seed: u32) -> Vec<u32> {
+        let channels = match opcode & 3 {
+            0 => 1u8, // x
+            1 => 1,   // xy → one packed VGPR
+            2 => 2,   // xyz → two packed VGPRs
+            _ => 2,   // xyzw
+        };
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+        ];
+        words.extend_from_slice(&v_mov_lit(reg, seed));
+        words.push(v_mov(3, 128)); // v3 = 0 (address / index)
+        words.extend_from_slice(&buffer(opcode, mtbuf, format, 0, false, !mtbuf, reg, 3, 8));
+        words.push(v_mov(5, 128)); // LDS address
+        for k in 0..channels {
+            words.extend_from_slice(&ds_write_b32(5, reg + k));
+        }
+        words.push(S_ENDPGM);
+        words
+    }
+
+    #[test]
+    fn packed_d16_buffer_loads_keep_an_odd_high_half() {
+        // VIC-BT-015: buffer_load_format_d16_x / _xyz leave vdst[31:16] intact
+        // on the trailing VGPR; a full pair (xy) replaces the whole dword.
+        // MTBUF names the format; MUBUF typed d16 uses the same odd-half merge
+        // (covered end-to-end on Windows by the waterfall host test).
+        let (layout, used) = fetch_tables(0, 4);
+        for (label, opcode, format) in [
+            ("d16_x", 0x008u16, 13u8), // 16_FLOAT
+            ("d16_xy", 0x009, 29),     // 16_16_FLOAT
+            ("d16_xyz", 0x00a, 65),    // 16_16_16_16_UNORM
+        ] {
+            let want = u32::from(opcode != 0x009);
+            let l = lower_with(
+                &d16_buffer_program(opcode, true, format, 0, 0xDEAD_0000),
+                layout.clone(),
+                used.clone(),
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(l.d16_kept_high_halves, want, "{label}");
+        }
+        // MUBUF buffer_load_format_d16_*: same merge on the float typed view.
+        for (label, opcode) in [("d16_x", 0x080u16), ("d16_xy", 0x081), ("d16_xyz", 0x082)] {
+            let want = u32::from(opcode != 0x081);
+            let l = lower_with(
+                &d16_buffer_program(opcode, false, 0, 0, 0xDEAD_0000),
+                layout.clone(),
+                used.clone(),
+            )
+            .unwrap_or_else(|e| panic!("mubuf {label}: {e}"));
+            assert_eq!(l.d16_kept_high_halves, want, "mubuf {label}");
+        }
+    }
+
+    #[test]
+    fn tbuffer_d16_integer_formats_saturate_to_16_bits() {
+        // VIC-BT-015: tbuffer_load_format_d16_x of 32_UINT / 32_SINT saturates
+        // to 16 bits rather than converting through f16.
+        let (layout, used) = fetch_tables(0, 4);
+        for format in [20u8, 21] {
+            // Seed the high half so the odd-channel merge is exercised too.
+            let l = lower_with(
+                &d16_buffer_program(0x008, true, format, 0, 0xDEAD_0000),
+                layout.clone(),
+                used.clone(),
+            )
+            .unwrap_or_else(|e| panic!("d16_x format {format}: {e}"));
+            assert_eq!(
+                l.d16_kept_high_halves, 1,
+                "format {format}: odd d16 channel keeps the high half"
+            );
+        }
+    }
+
+    /// `image_load` with `dmask` and optional `d16` into `v[vdata]`, address in
+    /// `v[vaddr]`, resource `s[srsrc:srsrc+7]`.
+    fn image_load(dmask: u8, d16: bool, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+        let dim = 1u32; // SQ_RSRC_IMG_2D
+        [
+            0xF000_0000 | u32::from(dmask) << 8 | dim << 3,
+            u32::from(d16) << 31
+                | (u32::from(srsrc) >> 2 & 0x1F) << 16
+                | u32::from(vdata) << 8
+                | u32::from(vaddr),
+        ]
+    }
+
+    /// Seeds `v[reg]` then `image_load` d16 with `dmask` into it; writes the
+    /// packed result to LDS so it stays live.
+    fn d16_image_load_program(dmask: u8, reg: u8, seed: u32) -> Vec<u32> {
+        let channels = dmask.count_ones().div_ceil(2);
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0
+        ];
+        // v_mov_b32 v[reg], seed
+        words.extend_from_slice(&[0x7E00_0000 | (reg as u32) << 17 | 0x01 << 9 | 255, seed]);
+        words.push(v_mov(2, 128)); // v2 = 0 (x)
+        words.push(v_mov(3, 128)); // v3 = 0 (y)
+        words.extend_from_slice(&image_load(dmask, true, reg, 2, 12));
+        words.push(v_mov(5, 128)); // LDS address
+        for k in 0..channels as u8 {
+            words.extend_from_slice(&ds_write_b32(5, reg + k));
+        }
+        words.push(S_ENDPGM);
+        words
+    }
+
+    #[test]
+    fn packed_d16_image_loads_keep_an_odd_high_half() {
+        // VIC-BT-017: a one-channel d16 image_load leaves vdst[31:16] intact;
+        // a full pair (dmask:0x3) replaces the whole dword.
+        let (layout, used) = texture_tables();
+        for (label, dmask, want) in [
+            ("dmask1", 0x1u8, 1u32),
+            ("dmask3", 0x3, 0),
+            ("dmask7", 0x7, 1),
+        ] {
+            let l = lower_with(
+                &d16_image_load_program(dmask, 0, 0x5A5A_0000),
+                layout.clone(),
+                used.clone(),
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(l.d16_kept_high_halves, want, "{label}");
+        }
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
@@ -10594,6 +11386,96 @@ mod tests {
         }
     }
 
+    /// VIC-BT-009: the same immediate sampler words used non-comparison first
+    /// then comparison (or the reverse) allocate two static slots so each
+    /// annotateHandle matches `dx.resources` sampler kind.
+    #[test]
+    fn immediate_sampler_comparison_and_plain_get_distinct_slots() {
+        let setup = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0xBE88_03FF,
+            0x0000_0092, // s_mov_b32 s8, 0x92 (an immediate sampler)
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ];
+        // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+        let sample_lz = [0x7E04_02F0, 0x7E06_02F0, 0xF09C_0F08, 0x0043_0C02];
+        // image_sample_c_lz v12, v[2:4], … dmask:0x1 (z-ref then coords)
+        let sample_c_lz = [
+            0x7E04_02F0,
+            0x7E06_02F0,
+            0x7E08_02F0,
+            0xF0BC_0108,
+            0x0043_0C02,
+        ];
+        let store = [
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ];
+        let lower_mix = |plain_first: bool| {
+            let mut words = setup.to_vec();
+            if plain_first {
+                words.extend_from_slice(&sample_lz);
+                words.extend_from_slice(&sample_c_lz);
+            } else {
+                words.extend_from_slice(&sample_c_lz);
+                words.extend_from_slice(&sample_lz);
+            }
+            words.extend_from_slice(&store);
+            let (_, mut used) = texture_and_uav_tables();
+            used.retain(|u| u.user_data == 0);
+            let layout = vec![root(RootType::Table, 0, 0)];
+            lower_with(&words, layout, used).unwrap()
+        };
+        for plain_first in [true, false] {
+            let l = lower_mix(plain_first);
+            assert_eq!(
+                l.samplers.len(),
+                2,
+                "plain_first={plain_first}: need distinct static slots"
+            );
+            assert_eq!(l.samplers[0], l.samplers[1]);
+            assert_eq!(
+                l.cmp_samplers.count_ones(),
+                1,
+                "plain_first={plain_first}: one comparison slot"
+            );
+            let cmp_slot = l.cmp_samplers.trailing_zeros();
+            let plain_slot = if cmp_slot == 0 { 1 } else { 0 };
+            assert_eq!(
+                l.cmp_samplers >> plain_slot & 1,
+                0,
+                "plain_first={plain_first}"
+            );
+            #[cfg(windows)]
+            if let Ok(mut v) = super::super::validator::Validator::load(
+                super::super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut l.dxil.clone())
+                    .unwrap_or_else(|e| panic!("plain_first={plain_first}: {e}"));
+            }
+        }
+        // Same-kind reuse still shares one slot.
+        let mut words = setup.to_vec();
+        words.extend_from_slice(&sample_lz);
+        words.extend_from_slice(&sample_lz);
+        words.extend_from_slice(&store);
+        let (_, mut used) = texture_and_uav_tables();
+        used.retain(|u| u.user_data == 0);
+        let l = lower_with(&words, vec![root(RootType::Table, 0, 0)], used).unwrap();
+        assert_eq!(l.samplers.len(), 1);
+        assert_eq!(l.cmp_samplers, 0);
+    }
+
     /// A compute program that sets `defined` VGPRs from v2 on (`offsets` first:
     /// the texel offset word) and samples 2D with the MIMG opcode `op`.
     fn gradient_sample(op: u32, a16: bool, defined: usize, offsets: bool) -> Vec<u32> {
@@ -10749,6 +11631,313 @@ mod tests {
                     .expect("DXIL validation failed");
             }
         }
+    }
+
+    /// A compute program that loads the table of views at s0, sets the
+    /// listed VGPRs to literals, runs one MIMG instruction on the first view
+    /// (2D unless `dim` says otherwise) with the sampler `0x92` and stores
+    /// the first result dword. The address starts at v2.
+    fn image_words(op: u32, dmask: u32, dim: u32, a16: bool, addr: &[u32]) -> Vec<u32> {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0xBE88_03FF,
+            0x0000_0092, // s_mov_b32 s8, 0x92 (an immediate sampler)
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+        ];
+        for (k, &value) in addr.iter().enumerate() {
+            // v_mov_b32 v(2 + k), literal
+            words.extend([0x7E00_02FF | (2 + k as u32) << 17, value]);
+        }
+        words.extend([
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF000_0000 | op << 18 | dmask << 8 | dim << 3,
+            0x0043_0C02 | u32::from(a16) << 30, // v[12:15], v[2:], s[12:19], s[8:11]
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ]);
+        words
+    }
+
+    /// [`image_words`] lowered; on Windows with `dxil.dll`, also validated.
+    fn lower_image(words: &[u32]) -> Result<Lowered, crate::ShaderError> {
+        let (_, mut used) = texture_and_uav_tables();
+        used.retain(|u| u.user_data == 0);
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let l = lower_with(words, layout, used)?;
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut l.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+        Ok(l)
+    }
+
+    /// The integer-constant arguments of each call of `dx.op.<function>`.
+    fn calls<'a>(l: &'a Lowered, function: &str) -> Vec<&'a [Option<i32>]> {
+        let name = format!("dx.op.{function}");
+        l.dx_ops
+            .iter()
+            .filter(|(n, _)| *n == name)
+            .map(|(_, args)| args.as_slice())
+            .collect()
+    }
+
+    fn called(l: &Lowered, function: &str) -> bool {
+        !calls(l, function).is_empty()
+    }
+
+    fn refused(words: &[u32]) -> String {
+        match lower_image(words) {
+            Err(crate::ShaderError::Unsupported { what, .. }) => what.to_string(),
+            Err(e) => panic!("{e}"),
+            Ok(_) => panic!("lowered"),
+        }
+    }
+
+    const F_HALF: u32 = 0x3F00_0000;
+    const F_ONE: u32 = 0x3F80_0000;
+
+    #[test]
+    fn comparison_gathers_lower_to_gather_cmp() {
+        // image_gather4_c_lz: the reference, then the coordinates.
+        let words = image_words(0x4F, 0x1, 1, false, &[F_ONE, F_HALF, F_HALF]);
+        let l = lower_image(&words).unwrap();
+        assert!(called(&l, "textureGatherCmp.f32"));
+        assert!(!called(&l, "textureGather.f32"));
+        // Any one channel, through the same instruction.
+        for dmask in [0x2, 0x4, 0x8] {
+            let words = image_words(0x4F, dmask, 1, false, &[F_ONE, F_HALF, F_HALF]);
+            assert!(called(
+                &lower_image(&words).unwrap(),
+                "textureGatherCmp.f32"
+            ));
+        }
+        // 2D array: the slice is a third coordinate.
+        let words = image_words(0x4F, 0x1, 5, false, &[F_ONE, F_HALF, F_HALF, 0]);
+        assert!(called(
+            &lower_image(&words).unwrap(),
+            "textureGatherCmp.f32"
+        ));
+    }
+
+    #[test]
+    fn comparison_gathers_take_programmable_offsets_after_the_offset_word() {
+        // image_gather4_c_lz_o: offsets x 2, y -1, then the reference.
+        let words = image_words(0x5F, 0x1, 1, false, &[0x3F02, F_ONE, F_HALF, F_HALF]);
+        let l = lower_image(&words).unwrap();
+        assert!(called(&l, "textureGatherCmp.f32"));
+        // Any other offset word lowers the same way, in range or not
+        // (the host takes -8..7 and the title's are 6-bit).
+        let words = image_words(0x5F, 0x2, 1, false, &[0x3F3F, F_ONE, F_HALF, F_HALF]);
+        assert!(called(
+            &lower_image(&words).unwrap(),
+            "textureGatherCmp.f32"
+        ));
+    }
+
+    #[test]
+    fn comparison_gathers_of_unsupported_forms_are_refused() {
+        // Several channels, a cube with an offset and a 3D view.
+        let words = image_words(0x4F, 0x3, 1, false, &[F_ONE, F_HALF, F_HALF]);
+        assert_eq!(
+            refused(&words),
+            "a comparison sample of 16-bit coordinates or several channels"
+        );
+        let words = image_words(
+            0x5F,
+            0x1,
+            3,
+            false,
+            &[0x3F02, F_ONE, F_HALF, F_HALF, F_HALF],
+        );
+        assert_eq!(refused(&words), "a texel offset on a cube");
+        let words = image_words(0x4F, 0x1, 2, false, &[F_ONE, F_HALF, F_HALF, F_HALF]);
+        assert_eq!(refused(&words), "a gather of a view other than 2D or cube");
+    }
+
+    #[test]
+    fn sample_offset_variants_lower_with_the_offset_word_first() {
+        // Offset words (x 1, y -1) lead every address.
+        let off = 0x3F01;
+        let cases: [(u32, u32, &str, &[u32], &str); 5] = [
+            // image_sample_l_o: offset, coordinates, level.
+            (
+                0x34,
+                0xF,
+                "l_o",
+                &[off, F_HALF, F_HALF, F_ONE],
+                "sampleLevel.f32",
+            ),
+            // image_sample_c_lz_o: offset, reference, coordinates.
+            (
+                0x3F,
+                0x1,
+                "c_lz_o",
+                &[off, F_ONE, F_HALF, F_HALF],
+                "sampleCmpLevelZero.f32",
+            ),
+            // image_sample_lz_o: offset, coordinates.
+            (0x37, 0xF, "lz_o", &[off, F_HALF, F_HALF], "sampleLevel.f32"),
+            // image_sample_d_o: offset, x gradients, y gradients, coordinates.
+            (
+                0x32,
+                0xF,
+                "d_o",
+                &[off, 0, 0, 0, 0, F_HALF, F_HALF],
+                "sampleGrad.f32",
+            ),
+            // image_sample_o: offset, coordinates (the level from the quad).
+            (0x30, 0xF, "o", &[off, F_HALF, F_HALF], "sampleGrad.f32"),
+        ];
+        for (op, dmask, label, addr, function) in cases {
+            let words = image_words(op, dmask, 1, false, addr);
+            let l = lower_image(&words).unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert!(called(&l, function), "{label}");
+        }
+    }
+
+    #[test]
+    fn a16_leaves_the_offset_and_gradients_whole_and_packs_the_coordinates() {
+        // image_sample_d_o with a16: offset, four f32 gradients, then one
+        // dword of two f16 coordinates.
+        let packed = 0x3800_3800; // (0.5, 0.5) as f16
+        let words = image_words(0x32, 0xF, 1, true, &[0x3F01, 0, 0, 0, 0, packed]);
+        let l = lower_image(&words).unwrap();
+        assert_eq!(calls(&l, "sampleGrad.f32")[0][7..9], [Some(1), Some(-1)]);
+        // image_sample_l_o: offset, then coordinates and level packed in
+        // pairs, so three f16 values take two dwords.
+        let words = image_words(0x34, 0xF, 1, true, &[0x3F01, packed, 0x3C00]);
+        let l = lower_image(&words).unwrap();
+        assert_eq!(calls(&l, "sampleLevel.f32")[0][7..9], [Some(1), Some(-1)]);
+    }
+
+    #[test]
+    fn sample_offsets_must_be_constants_in_the_dxil_range() {
+        let at = |offset: u32| image_words(0x37, 0xF, 1, false, &[offset, F_HALF, F_HALF]);
+        for (offset, ok) in [
+            (0x0007, true),
+            (0x3F38, true),
+            (0x0008, false),
+            (0x3F37, false),
+        ] {
+            let r = lower_image(&at(offset));
+            assert_eq!(r.is_ok(), ok, "{offset:#x}");
+        }
+        // x from the thread id: not a constant.
+        let mut words = at(0);
+        let at_mov = words.iter().position(|&w| w == 0x7E04_02FF).unwrap();
+        words.splice(at_mov..at_mov + 2, [0x7E04_0300]); // v_mov_b32 v2, v0
+        assert_eq!(refused(&words), "a sample offset that is not constant");
+        // No texel offsets on cube samples.
+        let words = image_words(0x37, 0xF, 3, false, &[0x0001, F_HALF, F_HALF, F_HALF]);
+        assert_eq!(refused(&words), "a texel offset on a cube");
+    }
+
+    /// A pixel program: the view table at s0, literals in v2 on, one MIMG
+    /// instruction, and the result exported to the target.
+    fn lower_pixel_image(op: u32, dmask: u32, addr: &[u32]) -> Result<Lowered, crate::ShaderError> {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0xBE88_03FF,
+            0x0000_0092, // s_mov_b32 s8, 0x92 (an immediate sampler)
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+        ];
+        for (k, &value) in addr.iter().enumerate() {
+            words.extend([0x7E00_02FF | (2 + k as u32) << 17, value]);
+        }
+        words.extend([
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF000_0000 | op << 18 | dmask << 8 | 1 << 3,
+            0x0043_0C02, // v[12:15], v[2:], s[12:19], s[8:11]
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xF800_080F,
+            0x0F0E_0D0C, // exp mrt0 v12, v13, v14, v15 done
+            S_ENDPGM,
+        ]);
+        let (_, mut used) = texture_and_uav_tables();
+        used.retain(|u| u.user_data == 0);
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 32,
+            layout,
+            used,
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code,
+        };
+        let p = ir::build(&native.code, false, 32).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native).unwrap();
+        let target = crate::emit::container::SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let l = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![target],
+            prims: vec![],
+            mesh_stride: 0,
+        })?;
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut l.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+        Ok(l)
+    }
+
+    #[test]
+    fn implicit_level_sample_offsets_lower_in_pixel_shaders() {
+        let off = 0x3F01;
+        // image_sample_b_o: offset, bias, coordinates.
+        let l = lower_pixel_image(0x35, 0xF, &[off, 0, F_HALF, F_HALF]).unwrap();
+        assert!(called(&l, "sampleBias.f32"));
+        assert_eq!(calls(&l, "sampleBias.f32")[0][7..9], [Some(1), Some(-1)]);
+        // image_sample_c_o: offset, reference, coordinates.
+        let l = lower_pixel_image(0x38, 0x1, &[off, F_ONE, F_HALF, F_HALF]).unwrap();
+        assert!(called(&l, "sampleCmp.f32"));
+        // image_sample_o: offset, coordinates.
+        let l = lower_pixel_image(0x30, 0xF, &[off, F_HALF, F_HALF]).unwrap();
+        assert!(called(&l, "sample.f32"));
     }
 
     #[test]
@@ -11062,6 +12251,223 @@ mod tests {
                 .data;
             let features = u64::from_le_bytes(sfi0.try_into().unwrap());
             assert_eq!(features & 0x8000, 0, "unexpected INT64 feature bit");
+        }
+    }
+
+    /// `LaneExit::Branch` with `taken == not_taken` must lower as a jump.
+    /// Calling `edge` twice for the same `(from, to)` would overwrite the
+    /// first critical-edge block in the map and leave `fill_phis` missing a
+    /// CondBr predecessor (VIC-BT-007).
+    #[test]
+    fn identical_branch_arms_lower_as_a_jump() {
+        let words = [
+            0xBF06_0100u32, // s_cmp_eq_u32 s0, s1
+            0xBF85_0001,    // s_cbranch_scc1 -> end
+            0xBE82_0300,    // s_mov_b32 s2, s0
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code: code.clone(),
+        };
+        let p = ir::build(&code, false, 256).unwrap();
+        let mut st = structure::structure(&p).unwrap();
+        let mut collapsed = false;
+        for exit in &mut st.exits {
+            if let structure::LaneExit::Branch {
+                taken, not_taken, ..
+            } = exit
+            {
+                *not_taken = *taken;
+                collapsed = true;
+            }
+        }
+        assert!(
+            collapsed,
+            "fixture must expose a LaneExit::Branch to force identical arms"
+        );
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .expect("degenerate Branch arms must lower without PHI/edge map errors");
+        assert!(!lowered.dxil.is_empty());
+    }
+
+    /// Binary32 FMA with a round-to-odd sticky bit when the fused result is
+    /// not exact — the same sequence `fmad_round_to_odd` emits in IR.
+    fn f32_fma_round_to_odd(a: f32, b: f32, c: f32) -> f32 {
+        let r = a.mul_add(b, c);
+        let err = a.mul_add(b, -r) + c;
+        let mut bits = r.to_bits();
+        let sticky = err.to_bits() & 0x7FFF_FFFF != 0;
+        if sticky && bits & 0x7FFF_FFFF < 0x7F80_0000 && bits & 1 == 0 {
+            let abs = bits & 0x7FFF_FFFF;
+            if abs == 0 {
+                bits = if err.to_bits() & 0x8000_0000 == 0 {
+                    0x1
+                } else {
+                    0x8000_0001
+                };
+            } else {
+                // Same sign of residual and `r` → away from zero (+1 to bits).
+                let same_sign = (err.to_bits() ^ bits) & 0x8000_0000 == 0;
+                bits = if same_sign { bits + 1 } else { bits - 1 };
+            }
+        }
+        f32::from_bits(bits)
+    }
+
+    /// Nearest-even binary16 of an f64, by search over the half values so it
+    /// does not share the lowering's bit arithmetic.
+    fn f16_nearest_f64(x: f64) -> u16 {
+        if x.is_nan() {
+            return 0x7E00;
+        }
+        let sign = if x.is_sign_negative() { 0x8000 } else { 0 };
+        let a = x.abs();
+        if a >= 65520.0 {
+            return sign | 0x7C00;
+        }
+        let f16_to_f64 = |h: u16| -> f64 {
+            let exp = (h >> 10) & 0x1F;
+            let mant = h & 0x3FF;
+            match exp {
+                0 => {
+                    if mant == 0 {
+                        0.0
+                    } else {
+                        (mant as f64) * f64::from(2f32.powi(-24))
+                    }
+                }
+                31 => f64::INFINITY,
+                e => (1.0 + (mant as f64) / 1024.0) * 2f64.powi(e as i32 - 15),
+            }
+        };
+        let (mut lo, mut hi) = (0u16, 0x7BFF);
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if f16_to_f64(mid) <= a {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let below = f16_to_f64(lo);
+        let above = if lo == 0x7BFF {
+            65536.0
+        } else {
+            f16_to_f64(lo + 1)
+        };
+        let pick = if a - below < above - a || (a - below == above - a && lo % 2 == 0) {
+            lo
+        } else {
+            lo + 1
+        };
+        sign | pick
+    }
+
+    /// Single-round `a*b + c` to binary16 (f64 FMA is exact enough here:
+    /// every finite f32 product fits in f64, and the addend is f32).
+    fn fma_f16_single_round(a: f32, b: f32, c: f32) -> u16 {
+        let exact = f64::from(a).mul_add(f64::from(b), f64::from(c));
+        f16_nearest_f64(exact)
+    }
+
+    /// Nearest-even binary16 of an f32 (via f64, which is exact for f32).
+    fn f16_nearest_f32(x: f32) -> u16 {
+        f16_nearest_f64(f64::from(x))
+    }
+
+    #[test]
+    fn fma_mix_f16_round_to_odd_matches_single_round() {
+        // Midpoint ties where f32 FMA alone then f16 RNE double-rounds the
+        // wrong way (VIC-BT-041): exact is just above 1 + 2^-11.
+        let above_mid = [
+            (1.0f32, 1.0f32, f32::from_bits(0x3A00_0001)),
+            (1.0, 1.0, 2.0f32.powi(-11) + 2.0f32.powi(-30)),
+            (-1.0, 1.0, -(2.0f32.powi(-11) + 2.0f32.powi(-30))),
+            (2.0, 0.5, f32::from_bits(0x3A00_0001)),
+        ];
+        for (a, b, c) in above_mid {
+            let want = fma_f16_single_round(a, b, c);
+            let got = f16_nearest_f32(f32_fma_round_to_odd(a, b, c));
+            let double = f16_nearest_f32(a.mul_add(b, c));
+            assert_ne!(
+                double, want,
+                "case should exercise double-rounding: {a:?}*{b:?}+{c:?}"
+            );
+            assert_eq!(
+                got, want,
+                "RTO path {a:?}*{b:?}+{c:?} = {got:#06x}, want {want:#06x} (double-round {double:#06x})"
+            );
+        }
+        // Just below the same midpoint: f32 FMA alone already ties correctly,
+        // but always-OR-1 sticky would cross the midpoint the wrong way.
+        let below_mid = [
+            (1.0f32, 1.0f32, 2.0f32.powi(-11) - 2.0f32.powi(-30)),
+            (-1.0, 1.0, -(2.0f32.powi(-11) - 2.0f32.powi(-30))),
+            (2.0, 0.5, 2.0f32.powi(-11) - 2.0f32.powi(-30)),
+        ];
+        for (a, b, c) in below_mid {
+            let want = fma_f16_single_round(a, b, c);
+            let got = f16_nearest_f32(f32_fma_round_to_odd(a, b, c));
+            let naive = f16_nearest_f32(f32::from_bits(a.mul_add(b, c).to_bits() | 1));
+            assert_ne!(
+                naive, want,
+                "case should catch always-OR-1: {a:?}*{b:?}+{c:?}"
+            );
+            assert_eq!(
+                got, want,
+                "below-mid RTO {a:?}*{b:?}+{c:?} = {got:#06x}, want {want:#06x} (naive {naive:#06x})"
+            );
+        }
+        // Exact and ordinary results still match single-round.
+        let ordinary = [
+            (2.0f32, 3.0f32, 1.0f32),
+            (1.0, 1.0, 1.0),
+            (0.0, 5.0, 1.5),
+            (-2.0, 3.0, 0.25),
+            (1.0, 1.0, 0.0),
+        ];
+        for (a, b, c) in ordinary {
+            let want = fma_f16_single_round(a, b, c);
+            let got = f16_nearest_f32(f32_fma_round_to_odd(a, b, c));
+            assert_eq!(got, want, "ordinary {a:?}*{b:?}+{c:?}");
+        }
+    }
+
+    #[test]
+    fn fma_mix_f16_lowers() {
+        // VOP3P v_fma_mixlo_f16 / v_fma_mixhi_f16 v0, v1, v2, v3 (all f32).
+        let src0 = 256 + 1u32;
+        let src1 = 256 + 2u32;
+        let src2 = 256 + 3u32;
+        for op in [0x021u32, 0x022] {
+            let words = [
+                0x33 << 26 | (op << 16),
+                src0 | (src1 << 9) | (src2 << 18),
+                S_ENDPGM,
+            ];
+            lowers(&words, 0).unwrap_or_else(|e| panic!("op {op:#x}: {e}"));
         }
     }
 }
