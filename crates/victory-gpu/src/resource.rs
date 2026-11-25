@@ -1724,15 +1724,18 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
+    // Register before the first host() so mip-drop pressure does not shrink
+    // placed views that may alias a full-mip RT/UAV.
+    placed_views().insert(out as usize);
     // create_at_address can succeed with no host texture (unsupported
     // format/flags): do not cache that failure, or the next call would
     // return Some with host == None (VIC-BT-027).
     if resource(out).host(out).is_none() {
+        placed_views().remove(&(out as usize));
         object::release_boxed::<Resource>(out);
         return None;
     }
     map.insert((address, *desc), out as usize);
-    placed_views().insert(out as usize);
     Some(out)
 }
 
