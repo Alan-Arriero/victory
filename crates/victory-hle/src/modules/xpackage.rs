@@ -563,6 +563,9 @@ mod tests {
 
     #[test]
     fn estimate_with_null_bytes_fails_before_writing_confirm() {
+        // Hold the title across identifier() and both estimate calls so a
+        // parallel storage test cannot rewrite it mid-flight.
+        let _title = crate::runtime::title_test_lock();
         let this: This = &OBJECT;
         let ours = format!("{}\0", identifier());
         type Estimate = extern "system" fn(
