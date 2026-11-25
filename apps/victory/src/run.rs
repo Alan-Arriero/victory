@@ -122,7 +122,12 @@ pub fn run(
         .map(|m| m.dll.as_str())
         .collect();
     let mapped: Vec<&str> = dlls.iter().map(|(name, _)| name.as_str()).collect();
-    let absent = absent_title_dlls(&imported, &mapped, &wanted);
+    // Package completeness is independent of `--strict`: host-pass-through
+    // DLLs (bcrypt, etc.) are not title DLLs just because strict disabled
+    // the host for binding.
+    let package = HostPolicy::default();
+    let from_package = |dll: &str| title_dll(&package, dll);
+    let absent = absent_title_dlls(&imported, &mapped, &from_package);
     if !absent.is_empty() {
         let message = format!(
             "{} not in {}, and neither the host nor VIctory provides {}: the package is \
@@ -465,6 +470,25 @@ mod absent_tests {
         let wanted = |dll: &str| dll.starts_with("Title");
         assert!(absent_title_dlls(&["Title.dll", "Host.dll"], &["TITLE.DLL"], &wanted).is_empty());
         assert!(absent_title_dlls(&[], &[], &wanted).is_empty());
+    }
+
+    #[test]
+    fn host_pass_through_dlls_are_not_treated_as_missing_title_dlls() {
+        // Mirrors HostPolicy::default for the completeness check: strict mode
+        // may refuse host binding, but bcrypt is not a package file.
+        let from_package = |dll: &str| {
+            !["bcrypt.dll", "KERNEL32.dll"]
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(dll))
+        };
+        assert_eq!(
+            absent_title_dlls(
+                &["bcrypt.dll", "KERNEL32.dll", "XboxBvhBuilder.dll"],
+                &[],
+                &from_package
+            ),
+            ["XboxBvhBuilder.dll"]
+        );
     }
 }
 
