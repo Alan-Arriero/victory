@@ -903,10 +903,66 @@ mod tests {
                 ..
             })
         ));
-        let mut pixel = super::shader::Shader::new(true);
-        pixel.inputs = vec![varying("value", 8, 8), varying("value", 10, 9)];
-        pixel.m.terminate(pixel.entry, super::bitcode::Term::Ret);
-        let ps = pixel.finish();
+        // The pixel program declares all ten varyings but reads only the
+        // eighth and tenth. The translated loads must follow their new IDs.
+        let inputs: Vec<_> = (1..=10).map(|n| varying("value", n, n - 1)).collect();
+        let mut target = varying("SV_Target", 0, 0);
+        target.kind = 16;
+        let isg1 = container::signature(&inputs, true);
+        let target = container::signature(&[target], false);
+        let pixel_bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &target)]);
+        let pixel = NativeProgram {
+            stage: HwStage::Ps,
+            vgprs: 4,
+            io: StageIo::Ps {
+                inputs: [7, 9]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(attr, row)| crate::native::PsInput {
+                        usage: Usage::Generic,
+                        row,
+                        mask: 15,
+                        attr: attr as u8,
+                        flat: true,
+                        fp16: false,
+                        pack2: false,
+                        row2: row,
+                    })
+                    .collect(),
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: Vec::new(),
+            },
+            code: [
+                0xC80A_0002u32, // v_interp_mov_f32 v2, p0, attr0.x
+                0xC80E_0402,    // v_interp_mov_f32 v3, p0, attr1.x
+                0xF800_180F,
+                0x0302_0302, // exp mrt0, v2, v3, v2, v3
+                0xBF81_0000,
+            ]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect(),
+            ..native.clone()
+        };
+        let ps = translate_native(
+            &Container::parse(&pixel_bytes).unwrap(),
+            &pixel,
+            true,
+            None,
+            None,
+        )
+        .unwrap()
+        .dxil;
+        let consumer = Container::parse(&ps).unwrap();
+        assert_eq!(
+            signature_part(&consumer, FourCC::ISG1)
+                .unwrap()
+                .iter()
+                .map(|e| e.index)
+                .collect::<Vec<_>>(),
+            [8, 10]
+        );
         let linked = translate_mesh_for_pixel(&c, &native, Some(&ps))
             .unwrap()
             .unwrap();
