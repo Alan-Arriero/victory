@@ -4619,9 +4619,12 @@ impl<'a> Lower<'a> {
                 // sampler slots (D3D12 SamplerComparisonState vs SamplerState):
                 // annotateHandle props must match dx.resources sampler kind.
                 let cmp = props.0 & 0x8000 != 0;
-                let n = match self.samplers.iter().enumerate().find(|(n, w)| {
-                    **w == words && (self.s.cmp_samplers >> *n & 1 != 0) == cmp
-                }) {
+                let n = match self
+                    .samplers
+                    .iter()
+                    .enumerate()
+                    .find(|(n, w)| **w == words && (self.s.cmp_samplers >> *n & 1 != 0) == cmp)
+                {
                     Some((n, _)) => n,
                     None => {
                         let n = self.samplers.len();
