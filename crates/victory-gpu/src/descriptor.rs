@@ -13,6 +13,32 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(windows)]
 pub(crate) mod host;
 
+/// The first index of `n` (non-zero) consecutive free slots in `taken`,
+/// searching from `cursor` on and then from the start. A run may cross the
+/// cursor but not the end of `taken`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn find_free_run(taken: &[bool], cursor: usize, n: usize) -> Option<usize> {
+    let end = taken.len();
+    let cursor = cursor.min(end);
+    // The second pass reaches n - 1 slots past the cursor, so a run starting
+    // before it is not cut short there.
+    let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
+    let mut run = 0;
+    let mut last = usize::MAX;
+    for at in (cursor..end).chain(0..second_end) {
+        // A run cannot wrap past the end.
+        if at != last.wrapping_add(1) {
+            run = 0;
+        }
+        last = at;
+        run = if taken[at] { 0 } else { run + 1 };
+        if run == n {
+            return Some(at + 1 - n);
+        }
+    }
+    None
+}
+
 const HEAP_IIDS: [Iid; 4] = [
     guid(
         0x8efb471d,
@@ -733,6 +759,25 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    #[test]
+    fn free_run_may_cross_the_search_cursor() {
+        // Free slots 1..=4 around a cursor of 3.
+        let mut taken = [true; 8];
+        taken[1..5].fill(false);
+        assert_eq!(find_free_run(&taken, 3, 4), Some(1));
+        assert_eq!(find_free_run(&taken, 3, 5), None);
+    }
+
+    #[test]
+    fn free_run_does_not_wrap_past_the_end() {
+        let mut taken = [true; 8];
+        taken[0] = false;
+        taken[7] = false;
+        assert_eq!(find_free_run(&taken, 5, 2), None);
+        assert_eq!(find_free_run(&[false; 8], 5, 8), Some(0));
+        assert_eq!(find_free_run(&[false; 8], 8, 3), Some(0));
     }
 
     #[test]
