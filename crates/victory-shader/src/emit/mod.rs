@@ -90,6 +90,8 @@ mod half_src_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
+mod image_tests;
+#[cfg(all(test, windows))]
 mod lane_mask_tests;
 #[cfg(test)]
 mod lds_tests;
