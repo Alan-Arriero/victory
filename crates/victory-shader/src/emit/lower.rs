@@ -1594,12 +1594,7 @@ impl<'a> Lower<'a> {
             Operand::Const(239) if self.s.rov => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
-                .ok_or_else(|| {
-                    if std::env::var_os("VICTORY_PED_DEBUG").is_some() {
-                        eprintln!("HWSPECIAL {} code={c} at={:#x}", inst.name(), inst.machine.offset);
-                    }
-                    "a special operand (vccz, execz, scc, lds_direct)"
-                }),
+                .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
             Operand::Literal(x) => Ok(self.s.m.i32(x)),
             Operand::Attr { .. } => Err("an attribute operand"),
         }
@@ -8787,6 +8782,7 @@ mod tests {
             used: vec![],
             io: StageIo::Ps {
                 inputs: vec![],
+                rsrc2: Default::default(),
                 input_addr: 0,
                 db_shader_control: 0,
                 patches: vec![],

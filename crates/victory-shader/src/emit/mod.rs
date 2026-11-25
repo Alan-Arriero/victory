@@ -831,6 +831,7 @@ mod tests {
             used: vec![],
             io: StageIo::Ps {
                 inputs: vec![],
+                rsrc2: Default::default(),
                 input_addr: 0,
                 db_shader_control: 0,
                 patches: vec![],
@@ -1114,14 +1115,16 @@ mod tests {
         pixel_uav_store(1 << 1, &body).unwrap();
     }
 
-    /// Without `LOAD_COLLISION_WAVEID` the same store is no ROV, and s2,
-    /// above the SGPRs the hardware initializes, reads zero.
+    /// Without `LOAD_COLLISION_WAVEID` the same store is no ROV. s2 is then
+    /// above the SGPRs the hardware initializes, and since no instruction
+    /// writes it, reading it stays refused, as in compute programs.
     #[test]
     fn a_pixel_program_without_pops_keeps_plain_uavs() {
-        let body = [0x9004_9F02]; // s_lshr_b32 s4, s2, 31
-        let dxil = pixel_uav_store(1 << 1, &body).unwrap();
+        let dxil = pixel_uav_store(1 << 1, &[0xBE84_0380]).unwrap(); // s_mov_b32 s4, 0
         let features = sfi0_features(&dxil);
         assert_eq!(features & 0x1000, 0, "SFI0 {features:#x}: ROVs");
+        let body = [0x9004_9F02]; // s_lshr_b32 s4, s2, 31
+        assert!(pixel_uav_store(1 << 1, &body).is_err());
         // src_pops_exiting_wave_id has no value there.
         let body = [0x8104_03EF]; // s_add_i32 s4, src_pops_exiting_wave_id, s3
         assert!(pixel_uav_store(1 << 1, &body).is_err());
@@ -1476,6 +1479,7 @@ mod tests {
                         pack2: false,
                         row2: 0,
                     }],
+                    rsrc2: Default::default(),
                     input_addr: 1 << 1,
                     db_shader_control: 0,
                     patches: vec![],
