@@ -758,6 +758,42 @@ fn f32_to_f16_rounds_to_nearest_even() {
 }
 
 #[test]
+fn write_f_omod_flushes_neg_zero() {
+    // v_add_f32_e64 v0, v1, v2 with omod: RDNA2 flushes -0.0 after the scale.
+    // VOP3 opcode 0x103 = VOP2 v_add_f32 (0x003) at the VOP2-in-VOP3 base.
+    let f = f32::to_bits;
+    let nz = f(-0.0);
+    let pz = f(0.0);
+    for (omod, scale) in [(1u8, 2.0f32), (2, 4.0), (3, 0.5)] {
+        let shader = build_valu_cs(&vop3_omod(0x103, 0, vgpr(1), vgpr(2), 0, omod));
+        let cases: &[([u32; 4], u32)] = &[
+            // -0 + -0 = -0; omod must yield +0, not IEEE -0.
+            ([nz, nz, 0, 0], pz),
+            ([pz, pz, 0, 0], pz),
+            ([f(1.0), f(1.0), 0, 0], f(2.0 * scale)),
+            ([f(-1.0), f(0.0), 0, 0], f(-1.0 * scale)),
+        ];
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend}: v_add_f32 omod={omod}({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1]
+            );
+        });
+    }
+    // Without omod, -0 + -0 stays -0.
+    let plain = build_valu_cs(&vop3(0x103, 0, vgpr(1), vgpr(2), 0));
+    run_cases(&plain, &[[nz, nz, 0, 0]], |backend, _, _, got| {
+        assert_eq!(
+            got, nz,
+            "{backend}: v_add_f32(-0, -0) without omod must keep -0 ({got:#010x})"
+        );
+    });
+}
+
+#[test]
 fn v_fma_legacy_f32_follows_the_d3d9_zero_rule() {
     // v_fma_legacy_f32 v0, v1, v2, v3 (VOP3 opcode 0x140 on RDNA2)
     let shader = build_valu_cs(&vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3)));
