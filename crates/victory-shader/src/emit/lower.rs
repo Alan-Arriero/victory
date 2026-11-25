@@ -82,6 +82,10 @@ pub(crate) struct Lowered {
     /// Test builds: whether i32 immediate `0x3C00` (f16 1.0 bits) is present.
     #[cfg(test)]
     pub has_f16_one_imm: bool,
+    /// Test builds: ballots of active masks taken after the loop that wrote
+    /// them (issue #465), not at the write site inside the loop.
+    #[cfg(test)]
+    pub mask_ballots_after_loop: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -305,6 +309,9 @@ struct Lower<'a> {
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
     balloting: HashSet<Value>,
+    /// See [`Lowered::mask_ballots_after_loop`].
+    #[cfg(test)]
+    mask_ballots_after_loop: u32,
     /// Block writing each value.
     def_block: HashMap<Value, usize>,
     /// IR block being lowered.
@@ -706,6 +713,8 @@ impl<'a> Lower<'a> {
             mask_ok: false,
             ballots: HashMap::new(),
             balloting: HashSet::new(),
+            #[cfg(test)]
+            mask_ballots_after_loop: 0,
             def_block: p
                 .blocks
                 .iter()
@@ -1253,6 +1262,8 @@ impl<'a> Lower<'a> {
             has_f32_one_imm: self.s.m.has_i32_const(i64::from(0x3F80_0000u32 as i32)),
             #[cfg(test)]
             has_f16_one_imm: self.s.m.has_i32_const(0x3C00),
+            #[cfg(test)]
+            mask_ballots_after_loop: self.mask_ballots_after_loop,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -1600,8 +1611,12 @@ impl<'a> Lower<'a> {
         self.s.m.extract(entry, r, index % 4)
     }
 
-    /// A dword of a lane mask as a number: the ballot of the lanes' bits,
-    /// taken in the block that writes the mask (see [`MaskData`]).
+    /// A dword of a lane mask as a number: the ballot of the lanes' bits
+    /// (see [`MaskData`]). Taken where the mask is written, except an active
+    /// mask written inside a loop and read after that loop: balloting there
+    /// sees only the lanes still in the loop, so each lane's own bit of an
+    /// exit mask (issue #465); after the loop the wave has reconverged and
+    /// the ballot is the wave's mask.
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
         let (lo, high) = match self.x.st.highs.get(&v) {
             Some(&lo) => (lo, true),
@@ -1624,6 +1639,20 @@ impl<'a> Lower<'a> {
                     // Program inputs (EXEC on entry).
                     None => self.s.entry,
                     Some(&b) if b == self.cur_ir => self.cur,
+                    // After a loop its lanes leave at different iterations:
+                    // ballot at the reconverged post-loop block that dominates
+                    // this read (not inside a later divergent branch).
+                    Some(&b) if !outside => {
+                        if let Some(at) = self.after_loop_ballot_site(b, self.cur_ir) {
+                            #[cfg(test)]
+                            {
+                                self.mask_ballots_after_loop += 1;
+                            }
+                            at
+                        } else {
+                            self.tail[b].ok_or("a lane mask written after its use")?
+                        }
+                    }
                     Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
                 if !self.balloting.insert(lo) {
@@ -1657,6 +1686,98 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// Successors of IR block `b`.
+    fn block_successors(p: &Program, b: usize) -> impl Iterator<Item = usize> {
+        match p.blocks[b].exit {
+            Exit::Jump(t) => [Some(t), None],
+            Exit::Branch { taken, not_taken } => [Some(taken), Some(not_taken)],
+            Exit::End | Exit::Indirect => [None, None],
+        }
+        .into_iter()
+        .flatten()
+    }
+
+    /// Whether there is a nonempty path from `from` to `to`.
+    fn reaches(p: &Program, from: usize, to: usize) -> bool {
+        let mut seen = vec![false; p.blocks.len()];
+        let mut stack = vec![from];
+        while let Some(b) = stack.pop() {
+            if b == to {
+                return true;
+            }
+            if seen[b] {
+                continue;
+            }
+            seen[b] = true;
+            stack.extend(Self::block_successors(p, b));
+        }
+        false
+    }
+
+    /// Whether `from` lies on a cycle (a nonempty path back to itself).
+    fn in_cycle(p: &Program, from: usize) -> bool {
+        let mut seen = vec![false; p.blocks.len()];
+        let mut stack: Vec<usize> = Self::block_successors(p, from).collect();
+        while let Some(b) = stack.pop() {
+            if b == from {
+                return true;
+            }
+            if seen[b] {
+                continue;
+            }
+            seen[b] = true;
+            stack.extend(Self::block_successors(p, b));
+        }
+        false
+    }
+
+    /// Blocks of the natural loop containing `def` (reachable from `def` and
+    /// able to reach `def` again). Empty when `def` is not in a cycle.
+    fn natural_loop(p: &Program, def: usize) -> Vec<bool> {
+        let n = p.blocks.len();
+        if !Self::in_cycle(p, def) {
+            return vec![false; n];
+        }
+        (0..n)
+            .map(|b| Self::reaches(p, def, b) && Self::reaches(p, b, def))
+            .collect()
+    }
+
+    /// DXIL block for a ballot of a mask written in loop block `def` and
+    /// first read at `use_b` after leaving that loop: the earliest (RPO)
+    /// loop-exit target that reaches the use, so the ballot sees the
+    /// reconverged wave and dominates later reads.
+    fn after_loop_ballot_site(&self, def: usize, use_b: usize) -> Option<usize> {
+        let p = self.x.p;
+        if !Self::in_cycle(p, def) || Self::reaches(p, use_b, def) {
+            return None;
+        }
+        let in_loop = Self::natural_loop(p, def);
+        let mut best: Option<usize> = None;
+        for (b, &member) in in_loop.iter().enumerate() {
+            if !member {
+                continue;
+            }
+            for exit in Self::block_successors(p, b) {
+                if in_loop[exit] {
+                    continue;
+                }
+                if exit != use_b && !Self::reaches(p, exit, use_b) {
+                    continue;
+                }
+                if best.is_none_or(|cur| self.rpo[exit] < self.rpo[cur]) {
+                    best = Some(exit);
+                }
+            }
+        }
+        let exit = best?;
+        if exit == self.cur_ir {
+            Some(self.cur)
+        } else {
+            self.block[exit].or(self.tail[exit])
+        }
     }
 
     // ---- operands ----
@@ -3826,77 +3947,79 @@ impl<'a> Lower<'a> {
         // index) that vector buffer loads read, and none write, is an SRV in
         // the title's heap, not a constant buffer: reading its slot through
         // a constant buffer handle is a descriptor of the wrong type.
-        let buffer_view = kind.is_none() && self.buffer_loads_only(src);
-        let srv = kind.filter(|u| u.kind == ResourceType::Srv);
-        if buffer_view || srv.is_some() {
-            // A listed structured SRV in a table is read element by element;
-            // a heap view of no listed kind is read as raw bytes.
-            let stride = self.scalar_srv_stride(src, srv);
-            let h = match stride {
-                Some(stride) => self.handle(site, src, false, (12, stride))?,
-                None => self.handle(site, src, false, (11, 0))?,
-            };
-            let stride_v = stride.map(|stride| self.s.m.i32(stride));
+        if let Some((stride, uav)) = self.scalar_buffer_view(src, kind) {
+            let h = self.handle(site, src, false, Self::buffer_props(stride, uav))?;
             for k in 0..count {
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let al = self.s.m.i32(4);
-                let (index, elem_off) = match stride_v {
-                    Some(s) => (
-                        self.s.m.bin(c, Bin::UDiv, a, s),
-                        self.s.m.bin(c, Bin::URem, a, s),
-                    ),
-                    None => (a, self.s.m.undef(self.s.t.i32)),
+                let a = self.add_bytes(addr, 4 * k);
+                let x = match stride {
+                    Some(stride) => self.structured_load(h, a, stride, 4),
+                    None => {
+                        let iu = self.s.m.undef(self.s.t.i32);
+                        self.buffer_dword(h, a, iu)
+                    }
                 };
-                let r = self.s.op(
-                    c,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, index, elem_off, mask, al],
-                );
-                let x = self.s.m.extract(c, r, 0);
-                let x = self.as_int(x);
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
         }
         let h = self.handle(site, src, false, (13, 0x1_0000))?;
+        // shortcut: untyped heap-direct scalar CBV loads skip index 0. This
+        // title parks a null *texture* SRV at heap slot 0 that shaders also
+        // sample as an SRV; a single host descriptor cannot be both kinds,
+        // and a raw-buffer handle would still mismatch that texture null
+        // (#485). On the console a CBV read through that null returns zeros.
+        // Listed ResourceHeap CBVs (used-resource metadata) keep a live load
+        // at index 0. Table CBVs and heap slots that vector buffer loads
+        // already classify as SRVs are unchanged (paths above).
+        let live = if kind.is_none() && self.is_heap_direct(src) {
+            let index = self
+                .uniform_heap_index(src, false)
+                .or_else(|_| self.lane_heap_index(src, false))?;
+            let zero = self.s.m.i32(0);
+            Some(self.s.m.cmp(self.cur, pred::NE, index, zero))
+        } else {
+            None
+        };
         let constant = self.s.m.int_value(addr).map(|v| v as u32);
         let mut rows: HashMap<u32, V> = HashMap::new();
+        let zero = self.s.m.i32(0);
         for k in 0..count {
+            let at = self.begin_guarded(live);
             let x = match constant {
                 Some(base) => {
                     // Shader byte arithmetic wraps; debug builds must not
                     // panic when a near-end constant address expands to
                     // dwordxN (e.g. soffset 0xfffffffc, dwordx2).
                     let byte = base.wrapping_add(4 * k);
-                    let row = match rows.get(&(byte >> 4)) {
+                    // Row loads are emitted inside the guard so a null-slot
+                    // index never executes cbufferLoadLegacy.
+                    let ri = self.s.m.i32(byte >> 4);
+                    let r = match rows.get(&(byte >> 4)) {
                         Some(&r) => r,
                         None => {
-                            let ri = self.s.m.i32(byte >> 4);
                             let r = self.s.op(
-                                c,
+                                self.cur,
                                 "cbufferLoadLegacy.i32",
                                 Attr::ReadOnly,
                                 self.s.t.cbuf_ret,
                                 59,
                                 &[h, ri],
                             );
-                            rows.insert(byte >> 4, r);
+                            if live.is_none() {
+                                rows.insert(byte >> 4, r);
+                            }
                             r
                         }
                     };
-                    self.s.m.extract(c, row, (byte >> 2) & 3)
+                    self.s.m.extract(self.cur, r, (byte >> 2) & 3)
                 }
                 None => {
                     let off = self.s.m.i32(4 * k);
-                    let a = self.s.m.bin(c, Bin::Add, addr, off);
+                    let a = self.s.m.bin(self.cur, Bin::Add, addr, off);
                     self.cbuffer_dword(h, a)
                 }
             };
+            let x = self.end_guarded(at, &[(x, zero)])[0];
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
@@ -4092,26 +4215,33 @@ impl<'a> Lower<'a> {
                     ((kind | u, 0x409), Some(kind))
                 }
                 Fields::Buffer { idxen, format, .. } => {
-                    let props = if un.starts_with("buffer_load_format")
-                        || un.starts_with("buffer_store_format")
+                    let props = if format.is_none()
+                        && (un.starts_with("buffer_load_format")
+                            || un.starts_with("buffer_store_format"))
                     {
                         (10 | u, 0x409)
-                    } else if *idxen && format.is_none() {
-                        (12 | u, self.structured_stride(&src, uav)?)
                     } else {
-                        (11 | u, 0)
+                        let uav = uav
+                            || (*idxen
+                                && format.is_none()
+                                && used.is_none()
+                                && self
+                                    .descriptors
+                                    .get(&(at, false))
+                                    .is_some_and(|src| !self.buffer_loads_only(src)));
+                        let stride = if *idxen && format.is_none() {
+                            Some(self.buffer_stride(&src, uav)?)
+                        } else {
+                            self.table_buffer_stride(&src, used, uav)
+                        };
+                        Self::buffer_props(stride, uav)
                     };
                     if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
                         return Err("a constant buffer's descriptor read as data");
                     }
                     (props, None)
                 }
-                Fields::Smem { .. }
-                    if un.starts_with("s_buffer_load_dword")
-                        && used.is_some_and(|u| {
-                            u.kind == ResourceType::Srv && u.root == RootType::Table
-                        }) =>
-                {
+                Fields::Smem { .. } if un.starts_with("s_buffer_load_dword") => {
                     // A scalar buffer load consumes its descriptor without
                     // reading word 2 as a count. Keep that path free of a
                     // dimensions query unless another operand needs the count.
@@ -4123,31 +4253,32 @@ impl<'a> Lower<'a> {
                     {
                         return Err("a scalar memory read as data");
                     }
-                    let stride = self
-                        .scalar_srv_stride(&src, used)
+                    let (stride, uav) = self
+                        .scalar_buffer_view(&src, used)
                         .ok_or("a scalar memory read as data")?;
-                    ((12, stride), None)
+                    (Self::buffer_props(stride, uav), None)
                 }
                 _ => return Err("a scalar memory read as data"),
             };
             (first, src, props, image, uav)
         } else {
-            // An image the program only measures (it reads the size bits and
-            // samples the image in other programs): eight dwords are an image
-            // descriptor, taken here as a 2D texture.
-            // shortcut: a 3D or array image would report depth or layers 1.
             let src = Source::Loaded {
                 load: site,
                 first: 0,
             };
-            if count != 8
-                || self
-                    .used_kind(&src)
-                    .is_some_and(|u| u.kind != ResourceType::Srv)
+            let used = self.used_kind(&src);
+            let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
+            if let Some(stride) = (count == 4)
+                .then(|| self.table_buffer_stride(&src, used, uav))
+                .flatten()
             {
+                (0, src, Self::buffer_props(Some(stride), uav), None, uav)
+            } else if count == 8 && used.is_none_or(|u| u.kind == ResourceType::Srv) {
+                // shortcut: a size-only image descriptor is taken as a 2D texture.
+                (0, src, (2, 0x409), Some(2), false)
+            } else {
                 return Err("a descriptor read only as data");
             }
-            (0, src, (2, 0x409), Some(2), false)
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
@@ -4360,13 +4491,270 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, is_zero, zero, rounded)
     }
 
-    /// `channels` channels of the element at byte `off` of raw buffer `h`,
+    fn table_buffer_stride(
+        &self,
+        src: &Source,
+        used: Option<&UsedResource>,
+        uav: bool,
+    ) -> Option<u32> {
+        let listed = used.filter(|u| {
+            u.root == RootType::Table && matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
+        });
+        match listed.map(|u| u.stride) {
+            None | Some(0) => self.bound_structured_stride(src, uav, false),
+            // Raw table buffers can declare a stride of four. Only a bound
+            // structured view establishes a four-byte stride for flat access.
+            Some(stride) => Some(stride).filter(|s| *s > 4 && Self::valid_buffer_stride(s)),
+        }
+    }
+
+    /// Whether a descriptor is read by SMEM through a buffer handle.
+    fn scalar_buffer_view(
+        &self,
+        src: &Source,
+        used: Option<&UsedResource>,
+    ) -> Option<(Option<u32>, bool)> {
+        match used.map(|u| u.kind) {
+            Some(ResourceType::Srv) => Some((self.scalar_srv_stride(src, used), false)),
+            Some(ResourceType::Uav) => {
+                Some((Some(self.table_buffer_stride(src, used, true)?), true))
+            }
+            None if self.buffer_loads_only(src) => {
+                Some((self.table_buffer_stride(src, used, false), false))
+            }
+            _ => None,
+        }
+    }
+
+    fn buffer_props(stride: Option<u32>, uav: bool) -> (u32, u32) {
+        let flag = if uav { 0x1000 } else { 0 };
+        stride.map_or((11 | flag, 0), |stride| {
+            // Match DXC's scalar dword and wider dword-record annotations.
+            // Queries and accesses share the annotation for the same view.
+            let alignment = if stride == 4 { 0 } else { 2 << 8 };
+            (12 | alignment | flag, stride)
+        })
+    }
+
+    fn add_bytes(&mut self, addr: V, bytes: u32) -> V {
+        if bytes == 0 {
+            addr
+        } else if let Some(addr) = self.s.m.int_value(addr) {
+            self.s.m.i32((addr as u32).wrapping_add(bytes))
+        } else {
+            let bytes = self.s.m.i32(bytes);
+            self.s.m.bin(self.cur, Bin::Add, addr, bytes)
+        }
+    }
+
+    fn structured_coords(&mut self, addr: V, stride: u32) -> (V, V) {
+        if let Some(addr) = self.s.m.int_value(addr) {
+            let addr = addr as u32;
+            return (self.s.m.i32(addr / stride), self.s.m.i32(addr % stride));
+        }
+        let stride = self.s.m.i32(stride);
+        let c = self.cur;
+        (
+            self.s.m.bin(c, Bin::UDiv, addr, stride),
+            self.s.m.bin(c, Bin::URem, addr, stride),
+        )
+    }
+
+    fn buffer_dword(&mut self, h: V, index: V, off: V) -> V {
+        let c = self.cur;
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, index, off, mask, align],
+        );
+        let x = self.s.m.extract(c, r, 0);
+        self.as_int(x)
+    }
+
+    fn structured_dword(&mut self, h: V, addr: V, stride: u32) -> V {
+        let (index, off) = self.structured_coords(addr, stride);
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let ret = self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.i32",
+            Attr::ReadOnly,
+            ret,
+            139,
+            &[h, index, off, mask, align],
+        );
+        self.s.m.extract(c, r, 0)
+    }
+
+    /// The aligned word address and the number of bits preceding the access.
+    fn buffer_word(&mut self, addr: V) -> (V, V) {
+        if let Some(addr) = self.s.m.int_value(addr) {
+            let addr = addr as u32;
+            return (self.s.m.i32(addr & !3), self.s.m.i32((addr & 3) * 8));
+        }
+        let c = self.cur;
+        let aligned = self.s.m.i32(!3);
+        let three = self.s.m.i32(3);
+        let word = self.s.m.bin(c, Bin::And, addr, aligned);
+        let byte = self.s.m.bin(c, Bin::And, addr, three);
+        (word, self.s.m.bin(c, Bin::Shl, byte, three))
+    }
+
+    /// Aligned, single-dword reads stay inside their structured element. If
+    /// the value straddles a dword, split the second address independently.
+    fn structured_load(&mut self, h: V, addr: V, stride: u32, bytes: u32) -> V {
+        let c = self.cur;
+        let (first, shift) = self.buffer_word(addr);
+        let lo = self.structured_dword(h, first, stride);
+        let lo = if self.s.m.int_value(shift) == Some(0) {
+            lo
+        } else {
+            self.s.m.bin(c, Bin::LShr, lo, shift)
+        };
+        if bytes == 1 {
+            return lo;
+        }
+        let end = self.add_bytes(addr, bytes - 1);
+        let (last, _) = self.buffer_word(end);
+        if first == last {
+            return lo;
+        }
+        let hi = self.structured_dword(h, last, stride);
+        let zero = self.s.m.i32(0);
+        let mask = self.s.m.i32(31);
+        let reverse = self.s.m.bin(c, Bin::Sub, zero, shift);
+        let reverse = self.s.m.bin(c, Bin::And, reverse, mask);
+        let hi = self.s.m.bin(c, Bin::Shl, hi, reverse);
+        let joined = self.s.m.bin(c, Bin::Or, lo, hi);
+        let crosses = self.s.m.cmp(c, pred::NE, first, last);
+        self.s.m.select(c, crosses, joined, lo)
+    }
+
+    fn structured_store_word(&mut self, h: V, addr: V, stride: u32, val: V) {
+        let (index, off) = self.structured_coords(addr, stride);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        self.s.op(
+            self.cur,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            self.s.t.void,
+            140,
+            &[h, index, off, val, iu, iu, iu, mask, align],
+        );
+    }
+
+    fn structured_store_masked(&mut self, h: V, addr: V, stride: u32, val: V, mask: V) {
+        // Retry with the observed value so another lane's writes to the
+        // other bytes survive. Keep the compare-exchange and its backedge
+        // in a separate latch from the loop-carried value.
+        let start = self.cur;
+        let (index, off) = self.structured_coords(addr, stride);
+        let retry = self.s.m.new_block();
+        let latch = self.s.m.new_block();
+        let done = self.s.m.new_block();
+        let iu = self.s.m.undef(self.s.t.i32);
+        let zero = self.s.m.i32(0);
+        let ones = self.s.m.i32(u32::MAX);
+        let keep = self.s.m.bin(start, Bin::Xor, mask, ones);
+        self.s.m.terminate(start, Term::Br(retry));
+        let old = self.s.m.phi(retry, self.s.t.i32);
+        let rest = self.s.m.bin(retry, Bin::And, old, keep);
+        let new = self.s.m.bin(retry, Bin::Or, rest, val);
+        self.s.m.terminate(retry, Term::Br(latch));
+        let seen = self.s.op(
+            latch,
+            "atomicCompareExchange.i32",
+            Attr::NoUnwind,
+            self.s.t.i32,
+            79,
+            &[h, index, off, iu, old, new],
+        );
+        self.s.m.set_phi(old, vec![(zero, start), (seen, latch)]);
+        let success = self.s.m.cmp(latch, pred::EQ, old, seen);
+        self.s
+            .m
+            .terminate(latch, Term::CondBr(success, done, retry));
+        self.cur = done;
+    }
+
+    fn structured_store(&mut self, h: V, addr: V, stride: u32, val: V, bytes: u32) {
+        let (first, shift) = self.buffer_word(addr);
+        if bytes == 4 && self.s.m.int_value(shift) == Some(0) {
+            self.structured_store_word(h, first, stride, val);
+            return;
+        }
+        // The aligned case is common even when the address is computed.
+        let full = if bytes == 4 && self.s.m.int_value(shift).is_none() {
+            let zero = self.s.m.i32(0);
+            let aligned = self.s.m.cmp(self.cur, pred::EQ, shift, zero);
+            let (full, partial) = (self.s.m.new_block(), self.s.m.new_block());
+            self.s
+                .m
+                .terminate(self.cur, Term::CondBr(aligned, full, partial));
+            self.cur = full;
+            self.structured_store_word(h, first, stride, val);
+            self.cur = partial;
+            Some(full)
+        } else {
+            None
+        };
+        let c = self.cur;
+        let mask = self.s.m.i32(u32::MAX >> (32 - 8 * bytes));
+        let val = self.s.m.bin(c, Bin::And, val, mask);
+        let lo = self.s.m.bin(c, Bin::Shl, val, shift);
+        let lo_mask = self.s.m.bin(c, Bin::Shl, mask, shift);
+        let end = self.add_bytes(addr, bytes - 1);
+        let (last, _) = self.buffer_word(end);
+        self.structured_store_masked(h, first, stride, lo, lo_mask);
+        if bytes > 1 && first != last {
+            let head = self.cur;
+            let crosses = self.s.m.cmp(head, pred::NE, first, last);
+            let c = self.s.m.new_block();
+            self.cur = c;
+            let zero = self.s.m.i32(0);
+            let bits = self.s.m.i32(31);
+            let reverse = self.s.m.bin(c, Bin::Sub, zero, shift);
+            let reverse = self.s.m.bin(c, Bin::And, reverse, bits);
+            let hi = self.s.m.bin(c, Bin::LShr, val, reverse);
+            let hi_mask = self.s.m.bin(c, Bin::LShr, mask, reverse);
+            self.structured_store_masked(h, last, stride, hi, hi_mask);
+            let join = self.s.m.new_block();
+            self.s.m.terminate(head, Term::CondBr(crosses, c, join));
+            self.s.m.terminate(self.cur, Term::Br(join));
+            self.cur = join;
+        }
+        if let Some(full) = full {
+            let join = self.s.m.new_block();
+            self.s.m.terminate(full, Term::Br(join));
+            self.s.m.terminate(self.cur, Term::Br(join));
+            self.cur = join;
+        }
+    }
+
+    /// `channels` channels of the element at byte `off` of buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
     /// typed loads do (channels past the format's read 0, 0, 0, 1).
     // shortcut: the descriptor's channel swizzle is taken as the identity
-    // (it is for raw views and the descriptors code builds), elements of 4
-    // bytes or more as dword-aligned.
-    fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
+    // (it is for raw views and the descriptors code builds). A dynamic raw
+    // address for elements of 4 bytes or more is taken as dword-aligned.
+    fn format_load(
+        &mut self,
+        h: V,
+        off: V,
+        format: u8,
+        channels: u32,
+        stride: Option<u32>,
+    ) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
         let total: u32 = bits.iter().sum();
@@ -4390,7 +4778,14 @@ impl<'a> Lower<'a> {
                 })
                 .collect()
         };
-        let words = if total < 32 {
+        let words = if let Some(stride) = stride {
+            (0..total.div_ceil(32))
+                .map(|k| {
+                    let at = self.add_bytes(off, 4 * k);
+                    self.structured_load(h, at, stride, (total - 32 * k).min(32) / 8)
+                })
+                .collect()
+        } else if total < 32 {
             // A byte or half inside the dword that holds it.
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
             let at = self.s.m.bin(c, Bin::And, off, not3);
@@ -4650,6 +5045,19 @@ impl<'a> Lower<'a> {
         loads
     }
 
+    /// Whether a descriptor comes from the resource heap itself (root type
+    /// 5, not a table) on some path.
+    fn is_heap_direct(&self, src: &Source) -> bool {
+        src.leaves().iter().any(|l| match l {
+            Source::Loaded { load, .. } | Source::Fetched { load, .. } => self
+                .scalar
+                .get(load)
+                .and_then(|a| self.x.native.layout.get(a.param))
+                .is_some_and(|p| p.root == RootType::ResourceHeap),
+            _ => false,
+        })
+    }
+
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
@@ -4690,13 +5098,20 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
-    fn structured_stride(&self, src: &Source, uav: bool) -> Result<u32, Why> {
-        let valid = |stride: &u32| (4..=2048).contains(stride) && stride.is_multiple_of(4);
-        if let Some(stride) = self.used_kind(src).map(|u| u.stride).filter(valid) {
+    fn buffer_stride(&self, src: &Source, uav: bool) -> Result<u32, Why> {
+        if let Some(stride) = self
+            .used_kind(src)
+            .map(|u| u.stride)
+            .filter(Self::valid_buffer_stride)
+        {
             return Ok(stride);
         }
         self.bound_structured_stride(src, uav, true)
             .ok_or(UNKNOWN_STRUCTURED_STRIDE)
+    }
+
+    fn valid_buffer_stride(stride: &u32) -> bool {
+        (4..=2048).contains(stride) && stride.is_multiple_of(4)
     }
 
     fn bound_structured_stride(&self, src: &Source, uav: bool, required: bool) -> Option<u32> {
@@ -4721,7 +5136,7 @@ impl<'a> Lower<'a> {
                 },
                 required,
             )
-            .filter(|stride| (4..=2048).contains(stride) && stride.is_multiple_of(4))
+            .filter(Self::valid_buffer_stride)
         };
         // A selected handle has one DXIL annotation. Every possible view must
         // supply the same stride for that instruction.
@@ -8411,12 +8826,19 @@ impl<'a> Lower<'a> {
         // d16: two 16-bit channels per VGPR, low half first (MUBUF and MTBUF).
         let d16 = name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
+        let sub_name = name.trim_end_matches("_hi").trim_end_matches("_d16");
+        let sub = match sub_name {
+            "buffer_load_ubyte" | "buffer_load_sbyte" | "buffer_store_byte" => Some(1),
+            "buffer_load_ushort" | "buffer_load_sshort" | "buffer_load_short"
+            | "buffer_store_short" => Some(2),
+            _ => None,
+        };
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
             .or(plain.strip_prefix("buffer_store_"))
             .or(plain.strip_prefix("tbuffer_load_"))
         {
-            _ if atomic.is_some() || narrow_format.is_some() => (false, 1),
+            _ if atomic.is_some() || sub.is_some() => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -8461,12 +8883,10 @@ impl<'a> Lower<'a> {
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
         }
-        if narrow_format.is_some()
-            && used.is_some_and(|u| u.kind == ResourceType::Cbv || u.stride > 1)
-        {
-            return Err("a byte or halfword load through a constant or structured buffer");
-        }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
+            if sub.is_some() {
+                return Err("a byte or halfword load through a constant or structured buffer");
+            }
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
@@ -8494,24 +8914,36 @@ impl<'a> Lower<'a> {
             || atomic.is_some()
             || used.is_some_and(|u| u.kind == ResourceType::Uav)
             || (index.is_some() && !typed && used.is_none() && !self.buffer_loads_only(src));
-        if index.is_none() && !typed && self.bound_structured_stride(src, uav, false).is_some() {
-            // shortcut: byte addressing can cross structure boundaries.
-            // Indexed accesses use a matching structured view.
-            return Err("byte addressing of a buffer with a view-supplied stride");
-        }
         let u = if uav { 0x1000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
+        let flat_stride = if index.is_none() && (!typed || format.is_some()) {
+            self.table_buffer_stride(src, used, uav)
+        } else {
+            None
+        };
+        if sub.is_some() && flat_stride.is_none() {
+            if narrow_format.is_none() {
+                return Err(name);
+            }
+            if used.is_some_and(|u| u.stride > 1) {
+                return Err("a byte or halfword load through a constant or structured buffer");
+            }
+        }
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
-            let (h, coords) = match index {
-                Some(index) => {
-                    let stride = self.structured_stride(src, uav)?;
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    (h, [index, off, iu])
-                }
-                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
+            let stride = if index.is_some() {
+                Some(self.buffer_stride(src, uav)?)
+            } else {
+                flat_stride
             };
+            let h = self.handle(site, src, false, Self::buffer_props(stride, uav))?;
+            let (index, off) = match (index, stride) {
+                (Some(index), _) => (index, off),
+                (None, Some(stride)) => self.structured_coords(off, stride),
+                (None, None) => (off, iu),
+            };
+            let coords = [index, off, iu];
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
             };
@@ -8570,6 +9002,20 @@ impl<'a> Lower<'a> {
                 }
                 vals = wide;
             }
+            if let Some(stride) = flat_stride.filter(|_| !typed) {
+                let h = self.handle(site, src, false, Self::buffer_props(Some(stride), uav))?;
+                let at = self.begin_guarded(guard);
+                for (k, mut val) in vals.into_iter().enumerate() {
+                    let addr = self.add_bytes(off, 4 * k as u32);
+                    if name.ends_with("_hi") {
+                        let half = self.s.m.i32(16);
+                        val = self.s.m.bin(self.cur, Bin::LShr, val, half);
+                    }
+                    self.structured_store(h, addr, stride, val, sub.unwrap_or(4));
+                }
+                self.end_guarded(at, &[]);
+                return Ok(());
+            }
             let mut args = Vec::new();
             let (op, name) = if typed {
                 // shortcut: typed stores are taken to write all four channels
@@ -8586,8 +9032,13 @@ impl<'a> Lower<'a> {
             } else {
                 match index {
                     Some(index) => {
-                        let stride = self.structured_stride(src, uav)?;
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
+                        let stride = self.buffer_stride(src, uav)?;
+                        args.push(self.handle(
+                            site,
+                            src,
+                            false,
+                            Self::buffer_props(Some(stride), uav),
+                        )?);
                         args.extend([index, off]);
                     }
                     None => {
@@ -8609,15 +9060,15 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
             return Ok(());
         }
-        if let Some(f) = format.or(narrow_format) {
+        if let Some(f) = format.or(narrow_format.filter(|_| flat_stride.is_none())) {
             if index.is_some() {
                 return Err("a typed-format load by index");
             }
-            let h = self.handle(site, src, false, (11 | u, 0))?;
+            let h = self.handle(site, src, false, Self::buffer_props(flat_stride, uav))?;
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            let mut xs = self.format_load(h, off, f, count)?;
+            let mut xs = self.format_load(h, off, f, count, flat_stride)?;
             if d16 {
                 xs = self.d16_channels(f, xs)?;
             }
@@ -8633,6 +9084,35 @@ impl<'a> Lower<'a> {
                 } else {
                     x
                 };
+                self.write(inst, Reg::V(reg), x, guard);
+            }
+            return Ok(());
+        }
+        if let Some(stride) = flat_stride.filter(|_| !typed) {
+            let h = self.handle(site, src, false, Self::buffer_props(Some(stride), uav))?;
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            for k in 0..count {
+                let addr = self.add_bytes(off, 4 * k);
+                let mut x = self.structured_load(h, addr, stride, sub.unwrap_or(4));
+                let reg = reg + k as u8;
+                if let Some(bytes) = sub {
+                    let bits = 8 * bytes;
+                    if matches!(sub_name, "buffer_load_sbyte" | "buffer_load_sshort") {
+                        let shift = self.s.m.i32(32 - bits);
+                        let lo = self.s.m.bin(c, Bin::Shl, x, shift);
+                        x = self.s.m.bin(c, Bin::AShr, lo, shift);
+                    } else {
+                        let mask = self.s.m.i32((1 << bits) - 1);
+                        x = self.s.m.bin(c, Bin::And, x, mask);
+                    }
+                    if name.ends_with("_hi") {
+                        x = self.high_half(inst, reg, x);
+                    } else if name.ends_with("_d16") {
+                        x = self.low_half(inst, reg, x);
+                    }
+                }
                 self.write(inst, Reg::V(reg), x, guard);
             }
             return Ok(());
@@ -8691,8 +9171,8 @@ impl<'a> Lower<'a> {
                     )
                 }
                 (Some(index), None) => {
-                    let stride = self.structured_stride(src, uav)?;
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
+                    let stride = self.buffer_stride(src, uav)?;
+                    let h = self.handle(site, src, false, Self::buffer_props(Some(stride), uav))?;
                     self.s.op(
                         c,
                         "rawBufferLoad.f32",
@@ -9607,6 +10087,20 @@ mod tests {
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
+    #[test]
+    fn structured_buffer_properties_match_dword_record_alignment() {
+        for (stride, srv) in [(4, 0x000c), (12, 0x020c), (16, 0x020c)] {
+            assert_eq!(
+                super::Lower::buffer_props(Some(stride), false),
+                (srv, stride)
+            );
+            assert_eq!(
+                super::Lower::buffer_props(Some(stride), true),
+                (srv | 0x1000, stride)
+            );
+        }
+    }
+
     /// The blocks of `words` (a wave32 program) whose `s_barrier` loses its
     /// thread-group sync.
     fn fence_only(words: &[u32]) -> Vec<usize> {
@@ -9656,6 +10150,134 @@ mod tests {
             S_ENDPGM,
         ];
         assert_eq!(fence_only(&words), Vec::<usize>::new());
+    }
+
+    /// A wave32 exit mask grown while lanes leave a loop at different
+    /// iterations, counted after the loop: every lane is in the mask (32),
+    /// not each lane's own bit (1). Issue #465.
+    #[test]
+    fn loop_exit_mask_counted_after_the_loop_is_wave_wide() {
+        let words: &[u32] = &[
+            0x4A02_0081, // v_add_nc_u32 v1, 1, v0  (lane i loops i + 1 times)
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0x4E02_0281, // loop: v_subrev_nc_u32 v1, 1, v1
+            0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+            0x880A_0A6A, // s_or_b32 s10, vcc_lo, s10
+            0x8A7E_0A7E, // s_andn2_b32 exec_lo, exec_lo, s10
+            0xBF89_FFFB, // s_cbranch_execnz loop
+            0x887E_0A7E, // s_or_b32 exec_lo, exec_lo, s10
+            0xBE89_0F0A, // s_bcnt1_i32_b32 s9, s10
+            0x7E04_0209, // v_mov_b32 v2, s9
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1,
+                threads: [32, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .expect("lower");
+        // The count is a ballot of the reconverged wave, not a per-lane 0/1.
+        assert!(lowered.wave_ops, "exit-mask count must ballot the wave");
+        assert!(
+            lowered.mask_ballots_after_loop > 0,
+            "exit-mask count must ballot after the loop, not inside it"
+        );
+    }
+
+    /// A mask written before a branch and counted inside it still ballots at
+    /// the definition: `reaches(def, def)` alone must not count as a loop.
+    #[test]
+    fn a_mask_before_a_branch_is_not_balloted_as_after_a_loop() {
+        let words: &[u32] = &[
+            0x7D88_008A, // v_cmp_gt_u32 vcc_lo, 10, v0
+            0xBE94_036A, // s_mov_b32 s20, vcc_lo
+            0xBE86_3C6A, // s_and_saveexec_b32 s6, vcc_lo
+            0xBF88_0001, // s_cbranch_execz over the count
+            0xBE89_0F14, // s_bcnt1_i32_b32 s9, s20
+            0x7E04_0209, // v_mov_b32 v2, s9
+            0x881E_067E, // s_or_b32 exec_lo, exec_lo, s6
+            S_ENDPGM,
+        ];
+        let lowered = lower_words(words, 1 << 1).expect("lower");
+        assert_eq!(
+            lowered.mask_ballots_after_loop, 0,
+            "acyclic mask defs must keep definition-site ballots"
+        );
+    }
+
+    /// Wave64 form of [`loop_exit_mask_counted_after_the_loop_is_wave_wide`].
+    #[test]
+    fn wave64_loop_exit_mask_counted_after_the_loop_is_wave_wide() {
+        let words: &[u32] = &[
+            0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+            0xBE8A_0480, // s_mov_b64 s[10:11], 0
+            0x4E02_0281, // loop: v_subrev_nc_u32 v1, 1, v1
+            0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+            0x888A_0A6A, // s_or_b64 s[10:11], vcc, s[10:11]
+            0x8AFE_0A7E, // s_andn2_b64 exec, exec, s[10:11]
+            0xBF89_FFFB, // s_cbranch_execnz loop
+            0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+            0xBE89_100A, // s_bcnt1_i32_b64 s9, s[10:11]
+            0x7E04_0209, // v_mov_b32 v2, s9
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1,
+                threads: [64, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, true, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .expect("lower");
+        assert!(lowered.wave_ops, "exit-mask count must ballot the wave");
+        assert!(
+            lowered.mask_ballots_after_loop > 0,
+            "exit-mask count must ballot after the loop, not inside it"
+        );
     }
 
     /// Lowers a synthetic compute program with these input registers and
@@ -10301,6 +10923,8 @@ mod tests {
         // load must not read it through a constant buffer handle (a
         // descriptor of the wrong type). A store makes it a UAV, which a
         // read-only view would not match either: that case is unchanged.
+        // Heap-direct scalar loads alone still use a CBV handle; index 0 is
+        // skipped (shortcut: this title's dual-read null texture SRV; #485).
         #[derive(Clone, Copy)]
         enum Also {
             Nothing,
@@ -10354,6 +10978,29 @@ mod tests {
         assert_eq!(cbuffers(Also::Nothing), 1, "no other use: a CBV");
         assert_eq!(cbuffers(Also::Load), 0, "buffer_load: an SRV");
         assert_eq!(cbuffers(Also::Store), 1, "buffer_store: unchanged");
+        // Untyped heap-direct (#485 null-slot skip) must still lower.
+        assert!(
+            lower_with(&program(Also::Nothing), layout(), vec![]).is_ok(),
+            "heap-direct scalar CBV with null-slot skip"
+        );
+        // A listed ResourceHeap CBV keeps a live load at index 0 (no skip).
+        let listed = vec![UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::ResourceHeap,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 0,
+            user_data: 0,
+            slot: 0,
+        }];
+        assert_eq!(
+            lower_with(&program(Also::Nothing), layout(), listed)
+                .unwrap()
+                .cbuffer_handles,
+            1,
+            "listed ResourceHeap CBV at slot 0 stays a CBV"
+        );
     }
 
     #[test]
@@ -11457,6 +12104,7 @@ mod tests {
             io: StageIo::Ps {
                 inputs: vec![],
                 input_addr: 0,
+                rsrc2: Default::default(),
                 db_shader_control: 0,
                 patches: vec![],
             },
