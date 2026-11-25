@@ -341,6 +341,104 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
     }
 }
 
+/// Most mip levels the host gives up on a texture it cannot allocate.
+const MAX_MIP_DROP: u32 = 3;
+
+/// The mip levels every later host texture gives up, raised by each
+/// allocation the host refuses with `E_OUTOFMEMORY`. A process that has
+/// run out of memory for one texture will for the next (the failures
+/// arrive in runs), so later textures start smaller instead of failing
+/// first.
+static PRESSURE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// How many top mip levels a host copy of `desc` can lose, at most `wanted`:
+/// only plain sampled 2D textures lose any (render targets, depth and
+/// unordered access keep their size, which draws and clears rely on), and
+/// never the last level. Block-compressed textures keep a whole number of
+/// blocks.
+fn droppable_mips(desc: &ResourceDesc, wanted: u32) -> u32 {
+    const PC_FLAGS: u32 = 0xf;
+    const TEXTURE_2D: u32 = 3;
+    if desc.dimension != TEXTURE_2D || desc.sample_count > 1 || desc.flags & PC_FLAGS != 0 {
+        return 0;
+    }
+    let Some((_, block)) = element(desc.format) else {
+        return 0;
+    };
+    let most = wanted.min(mip_count(desc).saturating_sub(1));
+    (1..=most)
+        .rev()
+        .find(|&n| {
+            let (w, h) = ((desc.width >> n).max(1), u64::from(desc.height >> n).max(1));
+            block == 1 || (w % block == 0 && h % block == 0)
+        })
+        .unwrap_or(0)
+}
+
+/// A view's `(most_detailed, levels)` of a title texture, as the same
+/// levels of a host copy that lacks the title's top `dropped` ones. A view
+/// of every level (`u32::MAX`) stays one; one that named only dropped levels
+/// shows the host's largest.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn rebase_mip_range(most_detailed: u32, levels: u32, dropped: u32) -> (u32, u32) {
+    let first = most_detailed.saturating_sub(dropped);
+    if levels == u32::MAX {
+        return (first, levels);
+    }
+    let end = most_detailed.saturating_add(levels).saturating_sub(dropped);
+    (first, end.saturating_sub(first).max(1))
+}
+
+/// `desc` without its `dropped` largest mip levels.
+fn without_top_mips(desc: &ResourceDesc, dropped: u32) -> ResourceDesc {
+    if dropped == 0 {
+        return *desc;
+    }
+    ResourceDesc {
+        width: (desc.width >> dropped).max(1),
+        height: (desc.height >> dropped).max(1),
+        mip_levels: (mip_count(desc) - dropped) as u16,
+        ..*desc
+    }
+}
+
+/// Makes a host texture through `create`, which answers `Err` with the
+/// host's HRESULT. When the host refuses for lack of memory
+/// (`E_OUTOFMEMORY`), drops another top mip level of an eligible texture
+/// (up to [`MAX_MIP_DROP`]) and tries again, raising the process-wide
+/// [`PRESSURE`] so later textures start already smaller. Returns what
+/// `create` made, the description it made it from, and how many levels
+/// that lost against `desc`.
+fn create_texture_with_auto_mip_drop<T>(
+    desc: &ResourceDesc,
+    mut create: impl FnMut(&ResourceDesc) -> Result<T, HRESULT>,
+) -> Result<(T, ResourceDesc, u32), HRESULT> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut dropped = droppable_mips(desc, PRESSURE.load(Relaxed).min(MAX_MIP_DROP));
+    loop {
+        let attempt = without_top_mips(desc, dropped);
+        match create(&attempt) {
+            Ok(made) => return Ok((made, attempt, dropped)),
+            Err(E_OUTOFMEMORY) => {
+                let more = droppable_mips(desc, (dropped + 1).min(MAX_MIP_DROP));
+                if more <= dropped {
+                    return Err(E_OUTOFMEMORY);
+                }
+                PRESSURE.fetch_max(more, Relaxed);
+                tracing::warn!(
+                    dropping = more,
+                    width = desc.width,
+                    height = desc.height,
+                    mip_levels = mip_count(desc),
+                    "host memory pressure: dropping {more} mips automatically"
+                );
+                dropped = more;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
@@ -812,11 +910,12 @@ impl Resource {
                 let clear = clear
                     .as_ref()
                     .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-                let texture = host_texture(&self.desc, state, clear)?;
+                let (texture, dropped) = host_texture(&self.desc, state, clear)?;
                 let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
                 Some(std::sync::Arc::new(HostTexture {
                     texture,
                     state: state.into(),
+                    dropped,
                 }))
             })
             .as_ref()
@@ -833,6 +932,10 @@ impl Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    /// Top mip levels of the title's texture the host copy does not have
+    /// (host memory pressure, see [`create_texture_with_auto_mip_drop`]):
+    /// its subresource `i` is the title's `i + dropped`, per layer.
+    pub(crate) dropped: u32,
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -867,14 +970,25 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     resource(this).host().cloned()
 }
 
+/// How many top mip levels of a title texture its host copy lacks (made
+/// now if this is its first use); 0 if it has none or no host copy.
+#[cfg(windows)]
+pub(crate) fn dropped_mips(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    resource(this).host().map_or(0, |h| h.dropped)
+}
+
 /// A host texture like the title's: same description, in GPU memory,
-/// without the console's layout and flags.
+/// without the console's layout and flags, and how many top mip levels it
+/// lost to host memory pressure.
 #[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -929,6 +1043,12 @@ fn host_texture(
     };
     let mut texture: Option<ID3D12Resource> = None;
     let create = |d: &ResourceDesc, texture: &mut Option<ID3D12Resource>| {
+        #[cfg(test)]
+        if d.width > SYNTHETIC_OOM_ABOVE.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(windows::core::Error::from(windows::core::HRESULT(
+                E_OUTOFMEMORY,
+            )));
+        }
         // A clear value is only legal on render targets and depth.
         let clear = clear_value
             .as_ref()
@@ -951,7 +1071,21 @@ fn host_texture(
             )
         }
     };
-    let mut made = create(&d, &mut texture);
+    let mut dropped = 0;
+    let mut made = match create_texture_with_auto_mip_drop(&d, |attempt| {
+        let mut made = None;
+        create(attempt, &mut made)
+            .map(|()| made)
+            .map_err(|e| e.code().0)
+    }) {
+        Ok((made, attempt, lost)) => {
+            texture = made;
+            d = attempt;
+            dropped = lost;
+            Ok(())
+        }
+        Err(code) => Err(windows::core::Error::from(windows::core::HRESULT(code))),
+    };
     // Not every host GPU offers every use of every format (NVIDIA: no
     // unordered access to BGRA8, no B4G4R4A4 render targets, where the
     // console's AMD GPU has both). Give up the uses the host refuses, UAV
@@ -983,8 +1117,14 @@ fn host_texture(
             )
         });
     }
-    texture
+    texture.map(|t| (t, dropped))
 }
+
+/// Tests: host textures wider than this fail with `E_OUTOFMEMORY` before
+/// reaching the host, as an exhausted adapter would refuse them.
+#[cfg(all(test, windows))]
+static SYNTHETIC_OOM_ABOVE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// A texture's console memory and description; `None` for buffers.
 pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
@@ -2692,5 +2832,225 @@ void main() {
             assert_eq!(view_format(out), None, "flags {flags}");
             assert_eq!(slot::<Release>(out, 0x10)(out), 0);
         }
+    }
+
+    /// Tests that read or raise the process-wide pressure run one at a time
+    /// and leave it as they found it.
+    static PRESSURE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_pressure<R>(level: u32, test: impl FnOnce() -> R) -> R {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _one_at_a_time = PRESSURE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        PRESSURE.store(level, Relaxed);
+        let result = test();
+        PRESSURE.store(0, Relaxed);
+        result
+    }
+
+    #[test]
+    fn only_plain_sampled_textures_lose_mips() {
+        const RGBA8: u32 = 28;
+        const BC1: u32 = 71;
+        let plain = texture(2048, 2048, BC1, 12);
+        assert_eq!(droppable_mips(&plain, 2), 2);
+        assert_eq!(droppable_mips(&plain, 0), 0);
+        let target = ResourceDesc { flags: 1, ..plain };
+        let depth = ResourceDesc { flags: 2, ..plain };
+        let unordered = ResourceDesc { flags: 4, ..plain };
+        let multisampled = ResourceDesc {
+            sample_count: 4,
+            ..plain
+        };
+        for kept in [target, depth, unordered, multisampled, buffer(1 << 20)] {
+            assert_eq!(droppable_mips(&kept, 3), 0, "{kept:?}");
+        }
+        // Never the last level.
+        assert_eq!(droppable_mips(&texture(64, 64, RGBA8, 2), 3), 1);
+        assert_eq!(droppable_mips(&texture(64, 64, RGBA8, 1), 3), 0);
+        // A full chain (0) counts its levels.
+        assert_eq!(droppable_mips(&texture(64, 64, RGBA8, 0), 3), 3);
+        // Block-compressed textures keep whole blocks: 16 >> 2 is one block.
+        assert_eq!(droppable_mips(&texture(16, 16, BC1, 5), 3), 2);
+        assert_eq!(droppable_mips(&texture(12, 12, BC1, 4), 3), 0);
+        assert_eq!(droppable_mips(&texture(12, 12, RGBA8, 4), 3), 3);
+        // Console-only formats with no host element size stay as they are.
+        assert_eq!(droppable_mips(&texture(64, 64, 0, 7), 3), 0);
+    }
+
+    #[test]
+    fn dropped_description_is_the_title_texture_without_its_top_levels() {
+        let d = without_top_mips(&texture(2048, 1024, 71, 12), 3);
+        assert_eq!((d.width, d.height, d.mip_levels), (256, 128, 9));
+        let full = without_top_mips(&texture(64, 8, 28, 0), 2);
+        assert_eq!((full.width, full.height, full.mip_levels), (16, 2, 5));
+        let same = without_top_mips(&texture(64, 8, 28, 4), 0);
+        assert_eq!((same.width, same.height, same.mip_levels), (64, 8, 4));
+    }
+
+    #[test]
+    fn views_of_a_dropped_texture_keep_naming_the_same_levels() {
+        assert_eq!(rebase_mip_range(0, u32::MAX, 2), (0, u32::MAX));
+        assert_eq!(rebase_mip_range(3, u32::MAX, 2), (1, u32::MAX));
+        assert_eq!(rebase_mip_range(2, 5, 2), (0, 5));
+        assert_eq!(rebase_mip_range(3, 5, 2), (1, 5));
+        // Levels 0 and 1 only: nothing of them is left, the largest stands in.
+        assert_eq!(rebase_mip_range(0, 2, 2), (0, 1));
+        // Level 1 to 4 loses level 1.
+        assert_eq!(rebase_mip_range(1, 4, 2), (0, 3));
+        assert_eq!(rebase_mip_range(0, 4, 0), (0, 4));
+    }
+
+    /// A synthetic host that refuses every texture wider than `limit`.
+    fn refuse_above(
+        limit: u64,
+        attempts: &mut Vec<ResourceDesc>,
+    ) -> impl FnMut(&ResourceDesc) -> Result<u64, HRESULT> + '_ {
+        move |d| {
+            attempts.push(*d);
+            if d.width > limit {
+                Err(E_OUTOFMEMORY)
+            } else {
+                Ok(d.width)
+            }
+        }
+    }
+
+    #[test]
+    fn out_of_memory_drops_mips_and_raises_pressure_for_later_textures() {
+        use std::sync::atomic::Ordering::Relaxed;
+        with_pressure(0, || {
+            let big = texture(2048, 2048, 71, 12);
+            let mut attempts = Vec::new();
+            let (made, d, dropped) =
+                create_texture_with_auto_mip_drop(&big, refuse_above(512, &mut attempts)).unwrap();
+            // 2048 and 1024 are refused; 512 (two levels down) fits.
+            assert_eq!((made, dropped), (512, 2));
+            assert_eq!((d.width, d.height, d.mip_levels), (512, 512, 10));
+            let widths: Vec<_> = attempts.iter().map(|a| a.width).collect();
+            assert_eq!(widths, [2048, 1024, 512]);
+            assert_eq!(PRESSURE.load(Relaxed), 2);
+            // The next texture starts at the raised level, so it is not
+            // refused first.
+            let mut attempts = Vec::new();
+            let (_, d, dropped) = create_texture_with_auto_mip_drop(
+                &texture(1024, 1024, 98, 11),
+                refuse_above(512, &mut attempts),
+            )
+            .unwrap();
+            assert_eq!((dropped, d.width, attempts.len()), (2, 256, 1));
+            // A texture too small for that level loses what it can.
+            let (_, d, dropped) = create_texture_with_auto_mip_drop(
+                &texture(4, 4, 28, 2),
+                refuse_above(u64::MAX, &mut Vec::new()),
+            )
+            .unwrap();
+            assert_eq!((dropped, d.width, d.mip_levels), (1, 2, 1));
+        });
+    }
+
+    #[test]
+    fn auto_mip_drop_gives_up_after_three_levels() {
+        use std::sync::atomic::Ordering::Relaxed;
+        with_pressure(0, || {
+            let mut attempts = Vec::new();
+            let refused = create_texture_with_auto_mip_drop(
+                &texture(2048, 2048, 71, 12),
+                refuse_above(0, &mut attempts),
+            );
+            assert_eq!(refused.err(), Some(E_OUTOFMEMORY));
+            assert_eq!(attempts.len(), 4, "the full size and three drops");
+            assert_eq!(PRESSURE.load(Relaxed), MAX_MIP_DROP);
+        });
+    }
+
+    #[test]
+    fn render_targets_and_other_errors_are_not_retried() {
+        use std::sync::atomic::Ordering::Relaxed;
+        with_pressure(0, || {
+            let target = ResourceDesc {
+                flags: 1,
+                ..texture(2048, 2048, 28, 12)
+            };
+            let mut attempts = Vec::new();
+            let refused =
+                create_texture_with_auto_mip_drop(&target, refuse_above(0, &mut attempts));
+            assert_eq!(refused.err(), Some(E_OUTOFMEMORY));
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(
+                PRESSURE.load(Relaxed),
+                0,
+                "no pressure from a texture that cannot lose"
+            );
+            let mut calls = 0;
+            let refused = create_texture_with_auto_mip_drop(
+                &texture(2048, 2048, 28, 12),
+                |_: &ResourceDesc| -> Result<(), HRESULT> {
+                    calls += 1;
+                    Err(E_INVALIDARG)
+                },
+            );
+            assert_eq!(refused.err(), Some(E_INVALIDARG));
+            assert_eq!(calls, 1);
+            assert_eq!(PRESSURE.load(Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn without_pressure_a_texture_is_made_as_the_title_describes_it() {
+        with_pressure(0, || {
+            let big = texture(2048, 2048, 71, 12);
+            let (_, d, dropped) =
+                create_texture_with_auto_mip_drop(&big, refuse_above(u64::MAX, &mut Vec::new()))
+                    .unwrap();
+            assert_eq!(dropped, 0);
+            assert_eq!((d.width, d.height, d.mip_levels), (2048, 2048, 12));
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_texture_out_of_memory_drops_mips_instead_of_failing() {
+        use std::sync::atomic::Ordering::Relaxed;
+        if crate::host::host().is_none() {
+            return;
+        }
+        with_pressure(0, || {
+            SYNTHETIC_OOM_ABOVE.store(16, Relaxed);
+            let make = |desc: &ResourceDesc| {
+                let mut out = std::ptr::null();
+                let hr = create_committed(
+                    std::ptr::null(),
+                    &PROPERTIES,
+                    0,
+                    desc,
+                    0,
+                    std::ptr::null(),
+                    &RESOURCE_IIDS[0],
+                    &mut out,
+                );
+                assert_eq!(hr, S_OK);
+                out
+            };
+            let image = make(&texture(64, 64, 28, 7));
+            let host = host_resource(image).expect("a host texture despite the refusals");
+            // SAFETY: a live host texture.
+            let d = unsafe { host.GetDesc() };
+            assert_eq!((d.Width, d.Height, d.MipLevels), (16, 16, 5));
+            assert_eq!(dropped_mips(image), 2);
+            assert_eq!(PRESSURE.load(Relaxed), 2);
+            // A render target keeps its size: it has no host copy to drop.
+            let target = make(&ResourceDesc {
+                flags: 1,
+                ..texture(8, 8, 28, 4)
+            });
+            let host = host_resource(target).expect("a small target fits");
+            // SAFETY: a live host texture.
+            let d = unsafe { host.GetDesc() };
+            assert_eq!((d.Width, d.MipLevels), (8, 4));
+            assert_eq!(dropped_mips(target), 0);
+            SYNTHETIC_OOM_ABOVE.store(u64::MAX, Relaxed);
+            assert_eq!(slot::<Release>(image, 0x10)(image), 0);
+            assert_eq!(slot::<Release>(target, 0x10)(target), 0);
+        });
     }
 }
