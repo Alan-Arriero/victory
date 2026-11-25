@@ -811,27 +811,9 @@ fn record_twin_copy(
 /// the host turns the same float into the same 24 bits. The step divided
 /// by 65535 is another float for 512 of the 65,536 steps (none under 257),
 /// and lands in another 24-bit step for 127 of them (none under 385).
-const PLANE_CORNERS: &str = r#"
-float4 corner(uint i : SV_VertexID) : SV_Position {
-    return float4(float(i & 1) * 4.0 - 1.0, float(i >> 1) * 4.0 - 1.0, 0.0, 1.0);
-}
-"#;
-const PLANE_STEPS: &str = r#"
-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
-Texture2DArray<uint> twin : register(t0);
-[RootSignature(RS)]
-float plane(float4 p : SV_Position) : SV_Depth {
-    return float(twin.Load(int4(int2(p.xy), 0, 0))) * asfloat(0x37800080);
-}
-"#;
-const PLANE_FLOATS: &str = r#"
-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
-Texture2DArray<float> twin : register(t0);
-[RootSignature(RS)]
-float plane(float4 p : SV_Position) : SV_Depth {
-    return twin.Load(int4(int2(p.xy), 0, 0));
-}
-"#;
+const PLANE_CORNERS: &str = include_str!("../shaders/plane_corners.hlsl");
+const PLANE_STEPS: &str = include_str!("../shaders/plane_steps.hlsl");
+const PLANE_FLOATS: &str = include_str!("../shaders/plane_floats.hlsl");
 
 /// Views of twins the pass reads, in a heap of ours used as a ring.
 /// shortcut: a view must last until its list has run; with one or two
@@ -4842,6 +4824,25 @@ mod wave_tests {
 
 #[cfg(test)]
 mod plane_shaders {
+    /// Build the actual pipelines so a blob without a usable root signature
+    /// cannot pass on the strength of a successfully compiled vertex shader.
+    #[cfg(victory_bundled_hlsl)]
+    #[test]
+    fn bundled_depth_helpers_build_both_pipelines() {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+        };
+        if super::host().is_none() {
+            return;
+        }
+        for (steps, format) in [
+            (true, DXGI_FORMAT_D24_UNORM_S8_UINT),
+            (false, DXGI_FORMAT_D32_FLOAT_S8X24_UINT),
+        ] {
+            super::PlanePass::make(steps, format).expect("depth plane pipeline");
+        }
+    }
+
     /// The pass's shaders compile with one of our two compilers, whichever
     /// this machine has (the system's `d3dcompiler` first, DXC when it
     /// refuses them: Wine's builtin refuses other helpers' source), and the

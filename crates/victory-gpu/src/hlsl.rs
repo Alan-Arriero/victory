@@ -10,7 +10,8 @@
 //! A shader's root signature comes from that attribute, and Wine's compiler
 //! is the one place that compiles the source and leaves the signature out
 //! (no `RDAT` part, no `RTS0`): `CreateRootSignature(0, blob)` then has
-//! nothing to read. Such a blob is compiled again with DXC here.
+//! nothing to read. Use the matching build-time DXC shader when available,
+//! then try the run-time DXC.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -24,7 +25,7 @@ pub(crate) fn compile_compute(name: &str, source: &str) -> windows::core::Result
 
 /// Compiles `source`, entry `entry`, as the shader model 5.1 stage
 /// `target` (`cs_5_1`, `vs_5_1`, `ps_5_1`): the system's compiler first,
-/// then DXC as the stage's `_6_0` profile.
+/// then the bundled or run-time DXC shader for that stage.
 pub(crate) fn compile_stage(
     name: &str,
     source: &str,
@@ -32,26 +33,20 @@ pub(crate) fn compile_stage(
     target: &str,
 ) -> windows::core::Result<Vec<u8>> {
     match system_compile_stage(name, source, entry, target) {
-        Ok(code) if !signature_left_out(source, &code) => Ok(code),
-        Ok(code) => {
-            tracing::info!(
-                "{name}: the system compiler left the root signature out of its shader; using DXC"
-            );
-            let profile = format!("{}_6_0", target.split('_').next().unwrap_or("cs"));
-            dxc_compile_stage(name, source, entry, &profile).or(Ok(code))
-        }
+        Ok(code) if !signature_left_out(source, &code) => return Ok(code),
+        Ok(_) => tracing::info!("{name}: the system compiler left out the root signature"),
         Err((e, msg)) => {
-            #[cfg(victory_bundled_hlsl)]
-            if let Some(bytes) = bundled_shader(source) {
-                tracing::info!("{name}: using build-time DXC shader");
-                return Ok(bytes.to_vec());
-            }
-            tracing::info!(error = %e, "{name}: the system compiler refused it ({}); trying DXC", msg.trim());
-            let profile = format!("{}_6_0", target.split('_').next().unwrap_or("cs"));
-            dxc_compile_stage(name, source, entry, &profile)
-                .inspect_err(|e| tracing::warn!(error = %e, "{name}: DXC failed too"))
+            tracing::info!(error = %e, "{name}: the system compiler refused it ({})", msg.trim())
         }
     }
+    #[cfg(victory_bundled_hlsl)]
+    if let Some(bytes) = bundled_shader(source, entry, target) {
+        tracing::info!("{name}: using build-time DXC shader");
+        return Ok(bytes.to_vec());
+    }
+    let profile = format!("{}_6_0", target.split('_').next().unwrap_or("cs"));
+    dxc_compile_stage(name, source, entry, &profile)
+        .inspect_err(|e| tracing::warn!(error = %e, "{name}: DXC failed too"))
 }
 
 /// Whether `source` declares a root signature and the compiled `code` does
@@ -70,16 +65,31 @@ fn signature_left_out(source: &str, code: &[u8]) -> bool {
 
 // Match the source so a changed shader can never pick up another helper's bytecode.
 #[cfg(victory_bundled_hlsl)]
-fn bundled_shader(source: &str) -> Option<&'static [u8]> {
+fn bundled_shader(source: &str, entry: &str, target: &str) -> Option<&'static [u8]> {
     macro_rules! bytecode {
         ($name:literal) => {
             include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".dxil"))
         };
     }
-    match source {
-        include_str!("../shaders/argument_clamp.hlsl") => Some(bytecode!("argument_clamp")),
-        include_str!("../shaders/rect_rewrite.hlsl") => Some(bytecode!("rect_rewrite")),
-        include_str!("../shaders/rect_expand.hlsl") => Some(bytecode!("rect_expand")),
+    match (source, entry, target) {
+        (include_str!("../shaders/argument_clamp.hlsl"), "main", "cs_5_1") => {
+            Some(bytecode!("argument_clamp"))
+        }
+        (include_str!("../shaders/rect_rewrite.hlsl"), "main", "cs_5_1") => {
+            Some(bytecode!("rect_rewrite"))
+        }
+        (include_str!("../shaders/rect_expand.hlsl"), "main", "cs_5_1") => {
+            Some(bytecode!("rect_expand"))
+        }
+        (include_str!("../shaders/plane_corners.hlsl"), "corner", "vs_5_1") => {
+            Some(bytecode!("plane_corners"))
+        }
+        (include_str!("../shaders/plane_steps.hlsl"), "plane", "ps_5_1") => {
+            Some(bytecode!("plane_steps"))
+        }
+        (include_str!("../shaders/plane_floats.hlsl"), "plane", "ps_5_1") => {
+            Some(bytecode!("plane_floats"))
+        }
         _ => None,
     }
 }
@@ -278,7 +288,7 @@ mod tests {
             include_str!("../shaders/rect_rewrite.hlsl"),
             include_str!("../shaders/rect_expand.hlsl"),
         ] {
-            let expected = bundled_shader(source).unwrap();
+            let expected = bundled_shader(source, "main", "cs_5_1").unwrap();
             let bytes = compile_compute("bundled helper", source).unwrap();
             if system_compile("bundled helper", source).is_err() {
                 assert_eq!(bytes, expected);
@@ -287,7 +297,7 @@ mod tests {
             assert!(container.part(FourCC::DXIL).is_some());
             assert!(container.part(FourCC::RTS0).is_some());
         }
-        assert!(bundled_shader(PROBE).is_none());
+        assert!(bundled_shader(PROBE, "main", "cs_5_1").is_none());
     }
 
     /// A raw-buffer compute shader compiles with one of the two compilers
