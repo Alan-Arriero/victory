@@ -396,7 +396,7 @@ fn gather4_with_a_level_far_outside_the_view_reads_the_nearest_edge() {
 #[test]
 fn explicit_cube_gradients_select_face_and_mip() {
     // Six faces, split into four groups of lanes with different derivatives.
-    // At width 8, ds/dx of 1/4 chooses mip 1 and dt/dy of 1/2 chooses mip 2.
+    // At width 8, ds/dx of 1/4 chooses mip 1; dt/dy of 1/2 or 1 chooses mip 2 or 3.
     let setup = [
         0xbe84_0300, // s_mov_b32 s4, s0
         0xbe85_0380, // s_mov_b32 s5, 0
@@ -419,8 +419,10 @@ fn explicit_cube_gradients_select_face_and_mip() {
         0x7e0a_0280, // v_mov_b32_e32 v5, 0
         0x7e0c_0280, // v_mov_b32_e32 v6, 0
         0x2c0e_0681, // v_lshrrev_b32_e32 v7, 1, v3
+        0x340e_0f03, // v_lshlrev_b32_e32 v7, v3, v7 (0, 0, 4, 8)
         0x7e0e_0d07, // v_cvt_f32_u32_e32 v7, v7
-        0x100e_0ef0, // v_mul_f32_e32 v7, 0.5, v7
+        0x100e_0eff,
+        0x3e00_0000, // v_mul_f32_e32 v7, 0.125, v7
         0x3420_0082, // v_lshlrev_b32 v16, 2, v0
     ];
     let ordinary = [
@@ -461,7 +463,7 @@ fn explicit_cube_gradients_select_face_and_mip() {
         let expected: Vec<_> = (0..32)
             .map(|lane| {
                 let face = (lane % 8).min(5);
-                let mip = [0, 1, 2, 2][lane / 8].max(min_lod);
+                let mip = [0, 1, 2, 3][lane / 8].max(min_lod);
                 ((face * 10 + mip) as f32).to_bits()
             })
             .collect();
