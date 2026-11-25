@@ -1994,17 +1994,20 @@ impl State {
     /// records `stride` bytes apart at title address `arguments`, and the
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
-    /// written them. False if it cannot run on the host.
+    /// written them. False if it cannot run on the host, with the reason in
+    /// `dropped` (the caller logs it once per signature).
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
         (kind, stride, max): (u32, u32, u32),
         arguments: u64,
         count: Option<u64>,
+        dropped: &mut &'static str,
     ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            *dropped = "skipped shader";
             crate::pipeline::note_drop(self.pipeline as This);
             self.frame_op(&format!("indirect kind {kind}"), kind == 2, false);
             return false;
@@ -2019,6 +2022,7 @@ impl State {
         let why = |_: &str| {};
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
+            *dropped = "arguments outside title buffers";
             why("arguments outside title buffers");
             #[cfg(feature = "diagnostics")]
             self.frame_op_why(
@@ -2033,6 +2037,7 @@ impl State {
             Some(at) => match crate::shadow::find(at, 4) {
                 Some(s) => Some((s, at)),
                 None => {
+                    *dropped = "count outside title buffers";
                     why("count outside title buffers");
                     #[cfg(feature = "diagnostics")]
                     self.frame_op_why(
@@ -2050,6 +2055,7 @@ impl State {
         // only from a finished pipeline, whose geometry stage is now known.
         let fallback = if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES {
             let Some(p) = self.bound_pipeline(false) else {
+                *dropped = "no host pipeline for the rectangle path";
                 #[cfg(feature = "diagnostics")]
                 crate::pipeline::note_drop(self.pipeline as This);
                 return false;
@@ -2061,10 +2067,12 @@ impl State {
         if let Some(p) = fallback {
             if kind == INDEXED {
                 once!(shaders = %p.name, "indirect indexed rectangles not drawn");
+                *dropped = "indexed rectangles not supported";
                 why("indexed rectangles not supported");
                 return false;
             }
             if p.compute || p.mesh {
+                *dropped = "pipeline mismatch";
                 why(&format!(
                     "pipeline mismatch (compute {}, mesh {}, topology {})",
                     p.compute, p.mesh, self.topology
@@ -2072,6 +2080,7 @@ impl State {
                 return false;
             }
             let Some(signature) = host_signature(DRAW, 16) else {
+                *dropped = "no host signature";
                 why("no host signature");
                 return false;
             };
@@ -2088,6 +2097,7 @@ impl State {
             ) {
                 Ok(p) => p,
                 Err(reason) => {
+                    *dropped = "rectangle expansion failed";
                     why(reason);
                     return false;
                 }
@@ -2095,6 +2105,7 @@ impl State {
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
             if !self.prepare(list, false) {
+                *dropped = "prepare failed for indirect rectangles";
                 why("prepare failed for indirect rectangles");
                 return false;
             }
@@ -2126,6 +2137,7 @@ impl State {
             .then(|| host_signature(kind, stride))
             .flatten()
         else {
+            *dropped = "no host signature";
             why("no host signature");
             #[cfg(feature = "diagnostics")]
             self.frame_op_why(
@@ -2139,6 +2151,7 @@ impl State {
         args.refresh_as(list, arguments, len, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+            *dropped = "not bounded (no clamp, or arguments not 4-byte aligned)";
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             #[cfg(feature = "diagnostics")]
             self.frame_op_why(
@@ -2166,9 +2179,22 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.frame_op("indirect", kind == DISPATCH, ran);
         if !ran {
+            let p = self.bound_pipeline(kind == DISPATCH);
+            *dropped = if p.is_none() {
+                "no host pipeline"
+            } else if kind == DISPATCH {
+                "prepare/bind failed (compute)"
+            } else {
+                "prepare/bind failed"
+            };
             #[cfg(feature = "diagnostics")]
-            match self.bound_pipeline(kind == DISPATCH) {
-                None => crate::pipeline::note_drop(self.pipeline as This),
+            match &p {
+                // Named so the frame's table says which drops are indirect
+                // executions, and which shader keeps them from running.
+                None => crate::pipeline::note_why(format!(
+                    "indirect kind {kind}: {}",
+                    crate::pipeline::drop_reason(self.pipeline as This)
+                )),
                 Some(p) => why(&format!(
                     "prepare failed (compute {}, mesh {})",
                     p.compute, p.mesh
