@@ -83,9 +83,24 @@ static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::ne
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    set.get_or_insert_with(Default::default)
-        .insert(resource as usize);
+    {
+        let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        set.get_or_insert_with(Default::default)
+            .insert(resource as usize);
+    }
+    // The host mip chain is complete; drop any CPU-streamed resident window
+    // so narrowed SRVs remake to the title's full range (#616).
+    note_resident(resource, None);
+}
+
+/// Whether the host GPU wrote `resource` (copy/resolve), so its contents are
+/// on the host rather than in title memory.
+pub(crate) fn is_host_written(resource: This) -> bool {
+    HOST_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&(resource as usize)))
 }
 
 /// The buffer a texture the host writes is copied through into the texture
@@ -1350,7 +1365,7 @@ void read(uint3 id : SV_DispatchThreadID) {
 
 #[cfg(test)]
 mod resident_tests {
-    use super::{note_resident, resident};
+    use super::{host_written, is_host_written, note_resident, resident};
 
     #[test]
     fn noted_resident_window_updates_when_more_arrive() {
@@ -1361,5 +1376,17 @@ mod resident_tests {
         assert_eq!(resident(resource), Some((2, 7)));
         note_resident(resource, None);
         assert_eq!(resident(resource), None);
+    }
+
+    #[test]
+    fn host_written_clears_resident_window() {
+        let resource = 0x617u64 as _;
+        note_resident(resource, Some((3, 5)));
+        assert_eq!(resident(resource), Some((3, 5)));
+        host_written(resource);
+        assert!(is_host_written(resource));
+        assert_eq!(resident(resource), None);
+        // Leave no cross-test residue in the process-wide sets.
+        forget(resource as usize);
     }
 }

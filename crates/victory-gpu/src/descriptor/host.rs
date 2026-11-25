@@ -878,6 +878,37 @@ impl HostHeap {
         mirrored
     }
 
+    /// Remakes host SRVs that were narrowed to a streamed mip suffix once more
+    /// (or all) levels have arrived, even when the title descriptor itself did
+    /// not change — bindless ResourceHeap draws never walk tables, and
+    /// write-watch sync only remirrors dirty heap pages (#616).
+    pub(crate) fn remirror_widened_srvs(&self, start: u64, step: u64, for_draw: bool) -> usize {
+        if !for_draw || self.sampler || step == 0 {
+            return 0;
+        }
+        let candidates: Vec<(u32, SrvMips)> = {
+            let map = self.srv_mips.lock().unwrap_or_else(|e| e.into_inner());
+            map.iter()
+                .filter(|&(&index, _)| index < self.count)
+                .map(|(&index, &entry)| (index, entry))
+                .collect()
+        };
+        let mut mirrored = 0;
+        for (index, (title, host_mips)) in candidates {
+            let handle = start + u64::from(index) * step;
+            // SAFETY: slot index is below `self.count`; each descriptor is ≥16 bytes.
+            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            let Some(view) = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten() else {
+                continue;
+            };
+            if residency_widened(&view, title, host_mips) {
+                self.mirror(index, handle, for_draw);
+                mirrored += 1;
+            }
+        }
+        mirrored
+    }
+
     /// Updates the leaf-only live texture tracker for slot `index`.
     fn track_slot(&self, index: u32, new_entry: Option<(usize, bool, u32)>) {
         if self.sampler {
@@ -1085,13 +1116,18 @@ macro_rules! once {
 /// Narrows a shader resource view of `texture` to the mips of `resource`
 /// whose memory is there: `MostDetailedMip` up to the most detailed resident
 /// one, `MipLevels` to what is left. Returns the mips the host view names,
-/// `None` if the view is left as the title asked (fully mapped, not a 2D
-/// view, or nothing known yet).
+/// `None` if the view is left as the title asked (fully mapped, host-written,
+/// not a 2D view, or nothing known yet).
 fn narrow_to_resident(
     resource: crate::object::This,
     texture: &ID3D12Resource,
     desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC,
 ) -> Option<(u32, u32)> {
+    // A copy/resolve filled the host mip chain; title-memory residency is
+    // stale and must not clamp the view (#616).
+    if crate::texture::is_host_written(resource) {
+        return None;
+    }
     // Prefer the window the last staging refresh noted; fall back to a live
     // mapped-prefix query so the first view before any upload is still clamped.
     let resident =
@@ -1153,23 +1189,69 @@ fn narrow_to_resident(
 /// Whether a host SRV made with `host_mips` for title view `view` should be
 /// remade because more (or all) streamed levels have arrived.
 fn residency_widened(view: &View, title: usize, host_mips: (u32, u32)) -> bool {
-    let words: [u32; 10] = match view {
-        View::Shader(_, Some(w)) => *w,
-        View::Placed(false, _, desc) => match desc[..10].try_into() {
-            Ok(w) => w,
-            Err(_) => return false,
+    let Some(texture) = crate::resource::host_resource(title as crate::object::This) else {
+        return false;
+    };
+    // SAFETY: a live resource when this slot still holds it.
+    let rd = unsafe { texture.GetDesc() };
+    let mips = u32::from(rd.MipLevels);
+    let asked = match view {
+        View::Shader(_, Some(w)) => match asked_srv_mips(&srv_desc(w), mips) {
+            Some(a) => a,
+            None => return false,
         },
+        View::Placed(false, _, desc) => {
+            let words: [u32; 10] = match desc[..10].try_into() {
+                Ok(w) => w,
+                Err(_) => return false,
+            };
+            match asked_srv_mips(&srv_desc(&words), mips) {
+                Some(a) => a,
+                None => return false,
+            }
+        }
+        // Typeless default SRVs synthesize a concrete desc at make time; rebuild
+        // that same asked window so a later widen can remake them (#616).
+        View::Shader(_, None) => {
+            let own = rd.Format.0 as u32;
+            if !is_typeless(own) {
+                return false;
+            }
+            let Some(fmt) = concrete_format_for(title as crate::object::This, own, false) else {
+                return false;
+            };
+            let Some(desc) = default_srv_desc(&rd, fmt) else {
+                return false;
+            };
+            match asked_srv_mips(&desc, mips) {
+                Some(a) => a,
+                None => return false,
+            }
+        }
         _ => return false,
     };
-    let desc = srv_desc(&words);
-    let mips = match crate::resource::host_resource(title as crate::object::This) {
-        Some(texture) => {
-            // SAFETY: a live resource when this slot still holds it.
-            u32::from(unsafe { texture.GetDesc() }.MipLevels)
+    let want = if crate::texture::is_host_written(title as crate::object::This) {
+        // Host copy owns the full chain; restore the title's asked range.
+        if host_mips != asked {
+            asked
+        } else {
+            return false;
         }
-        None => return false,
+    } else {
+        match crate::texture::resident(title as crate::object::This) {
+            Some(window) if window.1 > 0 => crate::texture::narrowed(asked, window, mips),
+            // Fully mapped (or no longer tracked as partial): the title's range.
+            _ if host_mips != asked => asked,
+            _ => return false,
+        }
     };
-    let asked = match desc.ViewDimension {
+    want != host_mips
+}
+
+/// `(MostDetailedMip, MipLevels)` a 2D / 2D-array SRV asks for, with `0` /
+/// [`u32::MAX`] levels expanded against the resource mip count.
+fn asked_srv_mips(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC, mips: u32) -> Option<(u32, u32)> {
+    match desc.ViewDimension {
         D3D12_SRV_DIMENSION_TEXTURE2D => {
             // SAFETY: Texture2D member.
             let t = unsafe { desc.Anonymous.Texture2D };
@@ -1178,7 +1260,7 @@ fn residency_widened(view: &View, title: usize, host_mips: (u32, u32)) -> bool {
             } else {
                 t.MipLevels
             };
-            (t.MostDetailedMip, levels)
+            Some((t.MostDetailedMip, levels))
         }
         D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
             // SAFETY: Texture2DArray member.
@@ -1188,17 +1270,10 @@ fn residency_widened(view: &View, title: usize, host_mips: (u32, u32)) -> bool {
             } else {
                 t.MipLevels
             };
-            (t.MostDetailedMip, levels)
+            Some((t.MostDetailedMip, levels))
         }
-        _ => return false,
-    };
-    let want = match crate::texture::resident(title as crate::object::This) {
-        Some(window) if window.1 > 0 => crate::texture::narrowed(asked, window, mips),
-        // Fully mapped (or no longer tracked as partial): the title's range.
-        _ if host_mips != asked => asked,
-        _ => return false,
-    };
-    want != host_mips
+        _ => None,
+    }
 }
 
 /// A view description from its words, with the format as the host has it.
