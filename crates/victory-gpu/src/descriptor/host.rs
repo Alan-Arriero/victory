@@ -2481,6 +2481,11 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Placed(false, resource, _) if resource[0] == 1 => return null_buffer_view(at),
         // Textures: a null view of the title's dimension (1D, arrays, 3D,
         // cubes), not always 2D.
+        // shortcut: the title's null SRV at heap slot 0 is one of these
+        // (resource 0 with a texture desc). Slot 0 is also read as a CBV
+        // through a computed heap index; a single host descriptor cannot be
+        // both an SRV and a CBV, so the translator skips heap-direct CBV
+        // loads at index 0 rather than asking for a null CBV here (#485).
         View::Shader(_, Some(desc)) => return null_like(desc, at),
         View::Placed(false, _, desc) => {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
@@ -2697,6 +2702,39 @@ mod tests {
             return;
         };
         let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
+        null_for(&view, heap.cpu(0));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// The title's null SRV at heap slot 0 is a texture view of no resource.
+    /// It must stay an SRV (not a null CBV): slot 0 is also sampled as an
+    /// SRV, and a single host descriptor cannot satisfy both kinds (#485).
+    #[test]
+    fn title_null_srv_at_slot_zero_stays_an_srv() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        // Format R32_UINT, TEXTURE1D, default component mapping — the shape
+        // reported for the title's null SRV at heap slot 0.
+        let view = View::Shader(
+            0,
+            Some([
+                42,
+                2,
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]),
+        );
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());

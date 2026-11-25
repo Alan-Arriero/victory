@@ -3842,39 +3842,63 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let h = self.handle(site, src, false, (13, 0x1_0000))?;
+        // shortcut: untyped heap-direct scalar CBV loads skip index 0. This
+        // title parks a null *texture* SRV at heap slot 0 that shaders also
+        // sample as an SRV; a single host descriptor cannot be both kinds,
+        // and a raw-buffer handle would still mismatch that texture null
+        // (#485). On the console a CBV read through that null returns zeros.
+        // Listed ResourceHeap CBVs (used-resource metadata) keep a live load
+        // at index 0. Table CBVs and heap slots that vector buffer loads
+        // already classify as SRVs are unchanged (paths above).
+        let live = if kind.is_none() && self.is_heap_direct(src) {
+            let index = self
+                .uniform_heap_index(src, false)
+                .or_else(|_| self.lane_heap_index(src, false))?;
+            let zero = self.s.m.i32(0);
+            Some(self.s.m.cmp(self.cur, pred::NE, index, zero))
+        } else {
+            None
+        };
         let constant = self.s.m.int_value(addr).map(|v| v as u32);
         let mut rows: HashMap<u32, V> = HashMap::new();
+        let zero = self.s.m.i32(0);
         for k in 0..count {
+            let at = self.begin_guarded(live);
             let x = match constant {
                 Some(base) => {
                     // Shader byte arithmetic wraps; debug builds must not
                     // panic when a near-end constant address expands to
                     // dwordxN (e.g. soffset 0xfffffffc, dwordx2).
                     let byte = base.wrapping_add(4 * k);
-                    let row = match rows.get(&(byte >> 4)) {
+                    // Row loads are emitted inside the guard so a null-slot
+                    // index never executes cbufferLoadLegacy.
+                    let ri = self.s.m.i32(byte >> 4);
+                    let r = match rows.get(&(byte >> 4)) {
                         Some(&r) => r,
                         None => {
-                            let ri = self.s.m.i32(byte >> 4);
                             let r = self.s.op(
-                                c,
+                                self.cur,
                                 "cbufferLoadLegacy.i32",
                                 Attr::ReadOnly,
                                 self.s.t.cbuf_ret,
                                 59,
                                 &[h, ri],
                             );
-                            rows.insert(byte >> 4, r);
+                            if live.is_none() {
+                                rows.insert(byte >> 4, r);
+                            }
                             r
                         }
                     };
-                    self.s.m.extract(c, row, (byte >> 2) & 3)
+                    self.s.m.extract(self.cur, r, (byte >> 2) & 3)
                 }
                 None => {
                     let off = self.s.m.i32(4 * k);
-                    let a = self.s.m.bin(c, Bin::Add, addr, off);
+                    let a = self.s.m.bin(self.cur, Bin::Add, addr, off);
                     self.cbuffer_dword(h, a)
                 }
             };
+            let x = self.end_guarded(at, &[(x, zero)])[0];
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
@@ -4898,6 +4922,19 @@ impl<'a> Lower<'a> {
             }
         }
         loads
+    }
+
+    /// Whether a descriptor comes from the resource heap itself (root type
+    /// 5, not a table) on some path.
+    fn is_heap_direct(&self, src: &Source) -> bool {
+        src.leaves().iter().any(|l| match l {
+            Source::Loaded { load, .. } | Source::Fetched { load, .. } => self
+                .scalar
+                .get(load)
+                .and_then(|a| self.x.native.layout.get(a.param))
+                .is_some_and(|p| p.root == RootType::ResourceHeap),
+            _ => false,
+        })
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -10637,6 +10674,8 @@ mod tests {
         // load must not read it through a constant buffer handle (a
         // descriptor of the wrong type). A store makes it a UAV, which a
         // read-only view would not match either: that case is unchanged.
+        // Heap-direct scalar loads alone still use a CBV handle; index 0 is
+        // skipped (shortcut: this title's dual-read null texture SRV; #485).
         #[derive(Clone, Copy)]
         enum Also {
             Nothing,
@@ -10690,6 +10729,29 @@ mod tests {
         assert_eq!(cbuffers(Also::Nothing), 1, "no other use: a CBV");
         assert_eq!(cbuffers(Also::Load), 0, "buffer_load: an SRV");
         assert_eq!(cbuffers(Also::Store), 1, "buffer_store: unchanged");
+        // Untyped heap-direct (#485 null-slot skip) must still lower.
+        assert!(
+            lower_with(&program(Also::Nothing), layout(), vec![]).is_ok(),
+            "heap-direct scalar CBV with null-slot skip"
+        );
+        // A listed ResourceHeap CBV keeps a live load at index 0 (no skip).
+        let listed = vec![UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::ResourceHeap,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 0,
+            user_data: 0,
+            slot: 0,
+        }];
+        assert_eq!(
+            lower_with(&program(Also::Nothing), layout(), listed)
+                .unwrap()
+                .cbuffer_handles,
+            1,
+            "listed ResourceHeap CBV at slot 0 stays a CBV"
+        );
     }
 
     #[test]
