@@ -6794,8 +6794,40 @@ impl<'a> Lower<'a> {
                 let h = 2 * attribute.channel;
                 let c = self.cur;
                 if f16 {
-                    let lo = half(self, h + u8::from(attribute.high))?;
-                    self.low_half(inst, reg, lo)
+                    // VOP3: omod/clamp on the f32 value, then narrow; op_sel[3]
+                    // selects the destination half via write_half (GFX10).
+                    let half_idx = h + u8::from(attribute.high);
+                    let src = if pack2 {
+                        packed_half(&self.s.inputs, attribute.row, b, half_idx)
+                    } else {
+                        half_idx
+                            .is_multiple_of(2)
+                            .then_some((attribute.row, half_idx / 2))
+                    };
+                    let mut f = match src.and_then(|(row, ch)| self.find_input(row, ch)) {
+                        Some((id, col)) => {
+                            let x = channel(self, id, col)?;
+                            self.as_float(x)
+                        }
+                        None => self.s.m.f32(0),
+                    };
+                    let Fields::Valu(v) = &inst.fields else {
+                        unreachable!("v_interp_*_f16 is VOP3")
+                    };
+                    let (omod, clamp) = (v.omod, v.clamp);
+                    match omod {
+                        0 => {}
+                        k => {
+                            let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(k)];
+                            let c = self.s.m.f32(factor.to_bits());
+                            f = self.s.m.bin(self.cur, Bin::Mul, f, c);
+                        }
+                    }
+                    if clamp {
+                        f = self.unary(7, f);
+                    }
+                    let h16 = self.f16_nearest(f);
+                    return self.write_half(inst, h16, None);
                 } else if mode == 1 {
                     // The whole dword of a flat input: both halves.
                     let lo = half(self, h)?;
