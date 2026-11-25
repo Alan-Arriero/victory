@@ -10,10 +10,13 @@
 //! in its copy. Ranges shaders write go back to title memory after the
 //! submission ([`Shadow::gpu_writes`]).
 //!
-//! shortcut: only the ranges draws are known to read are brought up to
-//! date (vertex and index buffer views, constant buffers in tables, root
-//! descriptors, buffer views in tables); buffers read through directly
-//! indexed heaps keep what their first use copied.
+//! Ranges draws are known to read are brought up to date (vertex and index
+//! buffer views, constant buffers in tables, root descriptors, buffer views
+//! in tables, and buffer / constant views reached through
+//! `ResourceDescriptorHeap` via [`crate::descriptor::host::HostHeap::refresh_bindless_buffers`]).
+//! shortcut: unordered buffer ranges reached only through the heap are
+//! refreshed for reading but not copied back after the submission (a
+//! full-heap UAV snapshot is too expensive).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};

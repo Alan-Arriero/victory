@@ -140,7 +140,9 @@ struct FreshTableEntry {
     dead_slots: Vec<u32>,
 }
 
-/// Fast-path and incremental-sync cache for [`State::bindless_textures`].
+/// Fast-path and incremental-sync cache for the texture half of
+/// [`State::bindless_textures`]. Buffer refreshes always run when a stage
+/// indexes `ResourceHeap` and are not gated by this cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BindlessCache {
     heap: usize,
@@ -1077,14 +1079,17 @@ impl State {
         true
     }
 
-    /// Transitions (and uploads title-written) live bindless textures in the
-    /// bound CBV/SRV/UAV heap when any stage indexes `ResourceHeap`.
+    /// Refreshes bindless buffer views and transitions (and uploads
+    /// title-written) live bindless textures in the bound CBV/SRV/UAV heap
+    /// when any stage indexes `ResourceHeap`.
     fn bindless_textures(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+        let mut uses_heap = false;
         let mut uses_heap_srv = false;
         let mut uses_heap_uav = false;
         for stage in &p.stages {
             for u in &stage.translated().used {
                 if u.root == RootType::ResourceHeap {
+                    uses_heap = true;
                     match u.kind {
                         ResourceType::Srv => uses_heap_srv = true,
                         ResourceType::Uav => uses_heap_uav = true,
@@ -1093,16 +1098,21 @@ impl State {
                 }
             }
         }
-        if (!uses_heap_srv && !uses_heap_uav) || self.heaps[0] == 0 {
+        if !uses_heap || self.heaps[0] == 0 {
             return;
         }
         let Some(host) = crate::descriptor::heap(self.heaps[0] as This).host() else {
             return;
         };
-        // Off-element aligned copies and other special buffer views are not
-        // textures; refresh them every ResourceHeap draw/dispatch so heap-
-        // indexed SRVs see title writes (#553).
-        host.refresh_special_buffers(list);
+        // Buffer / constant views through ResourceDescriptorHeap: title CPU
+        // writes do not bump tex_gen or state_gen, so refresh every time a
+        // stage indexes the heap — same cadence as table `readable()`.
+        // Also covers off-element / aliased slots that `refresh_special_buffers`
+        // would have refreshed on main (#553).
+        host.refresh_bindless_buffers(list);
+        if !uses_heap_srv && !uses_heap_uav {
+            return;
+        }
         let targets_hash = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
