@@ -326,6 +326,17 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     (format != own && format != target_format(own)).then_some(own)
 }
 
+/// Dimension, depth-or-array size, and sample count for a NULL-desc RTV/DSV
+/// when the host copy is typeless ([`view_format`] is `Some`).
+#[cfg(windows)]
+pub(crate) fn view_shape(this: This) -> Option<(u32, u16, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let d = &resource(this).desc;
+    Some((d.dimension, d.depth_or_array_size, d.sample_count.max(1)))
+}
+
 /// Depth formats with their typeless family: depth textures that shaders
 /// read are made typeless on the host, which only allows views of
 /// typeless depth resources.
