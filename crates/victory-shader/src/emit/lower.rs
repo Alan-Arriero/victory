@@ -5666,7 +5666,10 @@ impl<'a> Lower<'a> {
 
     /// 16-bit operations, computed in f32 or i32: f16 sums, differences and
     /// products are exact there and round once to f16 (f32 has the 2 x 11 +
-    /// 2 bits that make double rounding harmless); `None` if `name` is none.
+    /// 2 bits that make double rounding harmless). Unfused multiply-adds
+    /// (`v_mad_f16` / `v_mac_f16`) round the product to f16 before the add;
+    /// fused ones (`v_fma_f16` / `v_fmac_f16`) keep a single f32 FMad.
+    /// `None` if `name` is none.
     fn valu16(&mut self, inst: &Inst, name: &str, guard: Option<V>) -> Option<Result<(), Why>> {
         const FLOAT2: &[&str] = &[
             "v_add_f16",
@@ -5795,9 +5798,20 @@ impl<'a> Lower<'a> {
                 self.half_fsrc(inst, 2)?
             };
             let r = match name {
-                // shortcut: fused f16 multiply-adds as FMad in f32 (the
-                // product is exact; the sum rounds twice).
-                "v_fma_f16" | "v_fmac_f16" | "v_mad_f16" | "v_mac_f16" => self.fmad(a, b, acc),
+                // Unfused: round a×b to f16 before adding (overflow of the
+                // product must become ±inf, not feed a fused sum).
+                "v_mad_f16" | "v_mac_f16" => {
+                    let prod = self.s.m.bin(c, Bin::Mul, a, b);
+                    let h = self.f16_nearest(prod);
+                    let prod = self
+                        .s
+                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+                    self.s.m.bin(c, Bin::Add, prod, acc)
+                }
+                // shortcut: fused f16 multiply-add as FMad in f32 (the
+                // product is exact; the sum then rounds to f16, so midpoints
+                // can double-round vs a true binary16 FMA).
+                "v_fma_f16" | "v_fmac_f16" => self.fmad(a, b, acc),
                 "v_max3_f16" => {
                     let t = self.max_min(true, a, b);
                     self.max_min(true, t, acc)
@@ -9167,6 +9181,37 @@ mod tests {
             lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(),
             "buffer_gl1_inv"
         );
+    }
+
+    /// VIC-BT-042: fused `v_fma_f16` keeps `256h×256h + (-65504h) = 32h`;
+    /// unfused mad (mul then add) overflows the product to +inf. Both
+    /// sequences must lower; host execution is in `valu_tests`.
+    #[test]
+    fn f16_fma_and_mul_add_lower() {
+        // Exact fused sum is finite; the product alone exceeds max finite f16.
+        let (a, b, c) = (256.0f64, 256.0f64, -65504.0f64);
+        assert_eq!(a * b + c, 32.0);
+        assert!(a * b > 65504.0);
+
+        let v = |n: u8| 256u32 + u32::from(n);
+        let vop3 = |op: u16, vdst: u8, src0: u32, src1: u32, src2: u32| -> [u32; 2] {
+            [
+                0x35 << 26 | (op as u32 & 0x3FF) << 16 | u32::from(vdst),
+                (src0 & 0x1FF) | (src1 & 0x1FF) << 9 | (src2 & 0x1FF) << 18,
+            ]
+        };
+        // v_fma_f16 v0, v1, v2, v3
+        let mut fma = Vec::new();
+        fma.extend_from_slice(&vop3(0x34b, 0, v(1), v(2), v(3)));
+        fma.push(S_ENDPGM);
+        lowers(&fma, 0).expect("v_fma_f16");
+
+        // v_mul_f16 v5, v1, v2; v_add_f16 v0, v5, v3 (unfused mad)
+        let mut mad = Vec::new();
+        mad.extend_from_slice(&vop3(0x135, 5, v(1), v(2), 0));
+        mad.extend_from_slice(&vop3(0x132, 0, v(5), v(3), 0));
+        mad.push(S_ENDPGM);
+        lowers(&mad, 0).expect("v_mul_f16+v_add_f16");
     }
 
     /// Lowers a pixel program with one target: whether it translates.
