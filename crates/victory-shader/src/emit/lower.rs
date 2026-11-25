@@ -204,11 +204,20 @@ fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
 /// How far a float channel of `width` bits (16, or the unsigned 11- and
 /// 10-bit floats of the packed formats) shifts up to be a half:
 /// the small floats are a half's exponent (5 bits, biased 15) and the top
-/// of its mantissa, without the sign, so `legacyF16ToF32` widens them
-/// exactly, denormals, infinities and NaNs included.
+/// of its mantissa, without the sign. Non-NaN values widen as a half;
+/// NaNs keep their payload (see [`f16_nan_widen_bits`]).
 fn half_shift(width: u32) -> u32 {
     debug_assert!(matches!(width, 10 | 11 | 16), "{width}-bit float");
     if width == 16 { 0 } else { 15 - width }
+}
+
+/// f32 bits for an f16 NaN without quieting: `sign | 0x7F800000 |
+/// (payload << 13)`. RDNA typed-buffer float formats preserve the
+/// signalling bit; `legacyF16ToF32` would set it (VIC-BT-019 / #440).
+fn f16_nan_widen_bits(h: u32) -> u32 {
+    let h = h & 0xFFFF;
+    debug_assert!(h & 0x7FFF > 0x7C00, "{h:#x} is not an f16 NaN");
+    ((h & 0x8000) << 16) | 0x7F80_0000 | ((h & 0x3FF) << 13)
 }
 
 /// A cached descriptor handle: block, the load site, its first dword, whether
@@ -4278,9 +4287,15 @@ impl<'a> Lower<'a> {
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             let low = self.s.m.bin(c, Bin::LShr, w, sh);
             let word = if total == 16 && self.s.m.int_value(off).is_none_or(|v| v % 4 == 3) {
-                // A halfword at byte 3 reads the low byte of the next dword.
-                // Other alignments stay within the first dword, including
-                // when it is the last word exposed by a root buffer.
+                // A halfword at byte 3 reads `(lo >> 24) | (hi << 8)` from
+                // the dword pair around it; shifting only the first dword
+                // would drop the high byte (VIC-BT-019 / #440). Other
+                // alignments stay within the first dword, including when it
+                // is the last word exposed by a root buffer.
+                #[cfg(test)]
+                if self.s.m.int_value(off).is_some_and(|v| v % 4 == 3) {
+                    self.s.unaligned_typed_loads += 1;
+                }
                 let crosses = self.s.m.cmp(c, pred::EQ, byte, three);
                 let four = self.s.m.i32(4);
                 let next = self.s.m.bin(c, Bin::Add, at, four);
@@ -4391,23 +4406,49 @@ impl<'a> Lower<'a> {
                             self.s.m.bin(c, Bin::Shl, field, sh)
                         }
                     };
-                    let f = self
-                        .s
-                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
-                    float(self, f)
+                    float(self, self.f16_widen_keep_snan(h))
                 }
             };
             out.push(x);
         }
-        let one = match numeric {
-            Numeric::Uint | Numeric::Sint => 1,
-            _ => 1.0f32.to_bits(),
-        };
-        for k in out.len() as u32..channels {
-            out.push(self.s.m.i32(if k == 3 { one } else { 0 }));
+        // Absent channels are 0; DST_SEL supplies 1 only when set to SEL_1
+        // (VIC-BT-019 / #440).
+        for _ in out.len() as u32..channels {
+            out.push(self.s.m.i32(0));
         }
         out.truncate(channels as usize);
         Ok(out)
+    }
+
+    /// Widen an f16 (or a 10/11-bit float shifted into half form) to f32
+    /// without quieting sNaNs: NaNs become `sign | 0x7F800000 |
+    /// (payload << 13)`; other values use `legacyF16ToF32`.
+    fn f16_widen_keep_snan(&mut self, h: V) -> V {
+        let c = self.cur;
+        let f32t = self.s.t.f32;
+        let quieted = self
+            .s
+            .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+        let quieted = self.as_int(quieted);
+        let (mask_abs, nan_min, sign_bit, k16, mant, k13, exp_ones) = (
+            self.s.m.i32(0x7FFF),
+            self.s.m.i32(0x7C00),
+            self.s.m.i32(0x8000),
+            self.s.m.i32(16),
+            self.s.m.i32(0x3FF),
+            self.s.m.i32(13),
+            self.s.m.i32(0x7F80_0000),
+        );
+        let abs = self.s.m.bin(c, Bin::And, h, mask_abs);
+        let is_nan = self.s.m.cmp(c, pred::IUGT, abs, nan_min);
+        let sign = self.s.m.bin(c, Bin::And, h, sign_bit);
+        let sign = self.s.m.bin(c, Bin::Shl, sign, k16);
+        let payload = self.s.m.bin(c, Bin::And, h, mant);
+        let payload = self.s.m.bin(c, Bin::Shl, payload, k13);
+        let kept = self.s.m.bin(c, Bin::Or, sign, exp_ones);
+        let kept = self.s.m.bin(c, Bin::Or, kept, payload);
+        let bits = self.s.m.select(c, is_nan, kept, quieted);
+        self.as_float(bits)
     }
 
     /// Channels of buffer format `format`, as [`Self::format_load`] gives
@@ -9341,7 +9382,7 @@ fn wave_lane(m: &mut Module, block: usize, lane: V, wave64: bool) -> V {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, buffer_format, f16_nan_widen_bits, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -10170,6 +10211,49 @@ mod tests {
         let (layout, used) = fetch_tables(0, 4);
         let l = lower_with(&fetch_program(odd, 4), layout, used).unwrap();
         assert_eq!(l.unaligned_typed_loads, 1);
+    }
+
+    #[test]
+    fn a_halfword_typed_fetch_at_byte_3_reads_the_next_dword() {
+        // `tbuffer_load_format_x` of 16_UINT at byte offset 3 straddles
+        // two dwords: `(lo >> 24) | (hi << 8)`. VIC-BT-019 / #440.
+        let odd = buffer(0x000, true, 11, 3, false, false, 0, 3, 8);
+        let (layout, used) = fetch_tables(0, 4);
+        let l = lower_with(&fetch_program(odd, 1), layout, used).unwrap();
+        assert_eq!(l.unaligned_typed_loads, 1);
+        let even = buffer(0x000, true, 11, 0, false, false, 0, 3, 8);
+        let (layout, used) = fetch_tables(0, 4);
+        let l = lower_with(&fetch_program(even, 1), layout, used).unwrap();
+        assert_eq!(l.unaligned_typed_loads, 0);
+    }
+
+    #[test]
+    fn a_typed_fetch_fills_missing_channels_with_zero() {
+        // `tbuffer_load_format_xyzw` of 32_FLOAT has one format channel;
+        // the other three are 0 (not (0,0,0,1)). VIC-BT-019 / #440.
+        let fetch = buffer(0x003, true, 22, 0, false, false, 0, 3, 8);
+        let (layout, used) = fetch_tables(0, 4);
+        let l = lower_with(&fetch_program(fetch, 4), layout, used).unwrap();
+        assert!(!l.dxil.is_empty());
+        // The old path wrote float 1.0 into W; a single-channel 32_FLOAT
+        // fetch has no other reason to emit that constant.
+        assert!(
+            !l.dxil.windows(4).any(|w| w == 1.0f32.to_bits().to_le_bytes()),
+            "missing-channel fill must not be float 1.0"
+        );
+    }
+
+    #[test]
+    fn typed_float_widen_keeps_snan_payload() {
+        // 16_FLOAT sNaN 0x7C01 widens to 0x7F802000, not quieted
+        // 0x7FC02000. VIC-BT-019 / #440.
+        assert_eq!(f16_nan_widen_bits(0x7C01), 0x7F80_2000);
+        assert_eq!(f16_nan_widen_bits(0xFC01), 0xFF80_2000);
+        // A 16_FLOAT typed fetch lowers through the keep-sNaN path.
+        let fetch = buffer(0x000, true, 13, 0, false, false, 0, 3, 8);
+        let (layout, used) = fetch_tables(0, 4);
+        let l = lower_with(&fetch_program(fetch, 1), layout, used).unwrap();
+        assert!(l.widens_f16, "non-NaN values still use legacyF16ToF32");
     }
 
     #[test]
