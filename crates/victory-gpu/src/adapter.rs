@@ -102,22 +102,33 @@ pub(crate) fn choose(candidates: &[Candidate]) -> Option<Choice> {
     })
 }
 
-/// The warning for a choice that cannot run the whole title: every candidate and what it
-/// lacks, so a report names the hardware gap instead of a dark world.
-pub(crate) fn shortfall(candidates: &[Candidate], choice: &Choice) -> Option<String> {
+/// The fields of the warning for a choice that cannot run the whole title.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Shortfall {
+    /// The chosen adapter's name.
+    pub chosen: String,
+    /// What the chosen adapter lacks, comma-separated.
+    pub lacks: String,
+    /// Every candidate and what it lacks, so a report names the hardware gap instead of a
+    /// dark world.
+    pub adapters: String,
+}
+
+/// `None` when the chosen adapter runs the whole title.
+pub(crate) fn shortfall(candidates: &[Candidate], choice: &Choice) -> Option<Shortfall> {
     if choice.lacks.is_empty() {
         return None;
     }
-    let list = candidates
+    let adapters = candidates
         .iter()
         .map(|c| format!("{} (lacks {})", c.name, join(&c.caps.lacks())))
         .collect::<Vec<_>>()
         .join("; ");
-    Some(format!(
-        "no adapter has everything the title needs; using {}, which lacks {}. Adapters: {list}",
-        candidates[choice.index].name,
-        join(&choice.lacks),
-    ))
+    Some(Shortfall {
+        chosen: candidates[choice.index].name.clone(),
+        lacks: join(&choice.lacks),
+        adapters,
+    })
 }
 
 fn join(lacks: &[Lack]) -> String {
@@ -184,14 +195,14 @@ mod tests {
         assert_eq!(choice.index, 1, "earliest of the best-ranked");
         assert_eq!(choice.lacks, vec![Lack::MeshShaders]);
         let warning = shortfall(&c, &choice).unwrap();
+        assert_eq!(warning.chosen, "gpu1");
+        assert_eq!(warning.lacks, "mesh shaders");
         assert!(
-            warning.contains("using gpu1, which lacks mesh shaders"),
-            "{warning}"
-        );
-        assert!(
-            warning
-                .contains("gpu0 (lacks shader model 6.6, resource binding tier 3, mesh shaders)"),
-            "{warning}"
+            warning.adapters.starts_with(
+                "gpu0 (lacks shader model 6.6, resource binding tier 3, mesh shaders); "
+            ),
+            "{}",
+            warning.adapters
         );
     }
 

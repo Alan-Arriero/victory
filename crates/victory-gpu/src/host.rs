@@ -3603,6 +3603,7 @@ fn pick_hardware_adapter(
             }
             let Some(device) = device else { continue };
             let caps = adapter_caps(&device);
+            #[cfg(feature = "diagnostics")]
             tracing::debug!(adapter = %name, ?caps, "adapter candidate");
             candidates.push(crate::adapter::Candidate { name, caps });
             found.push((adapter, desc));
@@ -3610,8 +3611,13 @@ fn pick_hardware_adapter(
         let Some(choice) = crate::adapter::choose(&candidates) else {
             return Err(windows::core::Error::from_hresult(DXGI_ERROR_NOT_FOUND));
         };
-        if let Some(warning) = crate::adapter::shortfall(&candidates, &choice) {
-            tracing::warn!("{warning}");
+        if let Some(s) = crate::adapter::shortfall(&candidates, &choice) {
+            tracing::warn!(
+                adapter = %s.chosen,
+                lacks = %s.lacks,
+                adapters = %s.adapters,
+                "no adapter has everything the title needs; using the one that runs most"
+            );
         }
         Ok(found.swap_remove(choice.index))
     }
