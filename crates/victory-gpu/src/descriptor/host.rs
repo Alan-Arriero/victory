@@ -1546,65 +1546,35 @@ fn supports_typed_uav(format: DXGI_FORMAT) -> bool {
 /// multi-plane, block-compressed, and 96-bit `R32G32B32` formats only allow
 /// shader views (`None` for UAVs); every typed UAV format is gated on the host
 /// device's cached `D3D12_FEATURE_FORMAT_SUPPORT` query.
+///
+/// Production null/UNKNOWN resolution goes through [`concrete_format_for`]
+/// (and `null_view_format`); this helper is the direct typeless-family table
+/// used by the unit tests below.
+#[cfg(test)]
 fn default_concrete_format(typeless: u32, unordered: bool) -> Option<u32> {
-    let concrete = match DXGI_FORMAT(typeless as i32) {
-        // Depth-stencil multi-plane (SRV only, plane 0)
-        DXGI_FORMAT_R24G8_TYPELESS => (!unordered).then_some(DXGI_FORMAT_R24_UNORM_X8_TYPELESS)?,
-        DXGI_FORMAT_R32G8X24_TYPELESS => {
-            (!unordered).then_some(DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS)?
-        }
-        // Block-compressed (SRV only)
-        DXGI_FORMAT_BC1_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC1_UNORM)?,
-        DXGI_FORMAT_BC2_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC2_UNORM)?,
-        DXGI_FORMAT_BC3_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC3_UNORM)?,
-        DXGI_FORMAT_BC4_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC4_UNORM)?,
-        DXGI_FORMAT_BC5_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC5_UNORM)?,
-        DXGI_FORMAT_BC6H_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC6H_UF16)?,
-        DXGI_FORMAT_BC7_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC7_UNORM)?,
-        // 96-bit RGB has no typed UAV in D3D12 (SRV only)
-        DXGI_FORMAT_R32G32B32_TYPELESS => (!unordered).then_some(DXGI_FORMAT_R32G32B32_FLOAT)?,
-        // Color (SRV, and UAV when supported by the host device)
-        DXGI_FORMAT_R32G32B32A32_TYPELESS => DXGI_FORMAT_R32G32B32A32_FLOAT,
-        DXGI_FORMAT_R16G16B16A16_TYPELESS => DXGI_FORMAT_R16G16B16A16_FLOAT,
-        DXGI_FORMAT_R32G32_TYPELESS => DXGI_FORMAT_R32G32_FLOAT,
-        DXGI_FORMAT_R10G10B10A2_TYPELESS => DXGI_FORMAT_R10G10B10A2_UNORM,
-        DXGI_FORMAT_R8G8B8A8_TYPELESS => DXGI_FORMAT_R8G8B8A8_UNORM,
-        DXGI_FORMAT_R16G16_TYPELESS => DXGI_FORMAT_R16G16_FLOAT,
-        DXGI_FORMAT_R32_TYPELESS => DXGI_FORMAT_R32_FLOAT,
-        DXGI_FORMAT_R8G8_TYPELESS => DXGI_FORMAT_R8G8_UNORM,
-        DXGI_FORMAT_R16_TYPELESS => DXGI_FORMAT_R16_FLOAT,
-        DXGI_FORMAT_R8_TYPELESS => DXGI_FORMAT_R8_UNORM,
-        DXGI_FORMAT_B8G8R8A8_TYPELESS => DXGI_FORMAT_B8G8R8A8_UNORM,
-        DXGI_FORMAT_B8G8R8X8_TYPELESS => DXGI_FORMAT_B8G8R8X8_UNORM,
-        _ => return None,
-    };
-    if unordered && !supports_typed_uav(concrete) {
+    let concrete = crate::resource::typeless_default_format(typeless, unordered)?;
+    if unordered && !supports_typed_uav(DXGI_FORMAT(concrete as i32)) {
         return None;
     }
-    Some(concrete.0 as u32)
+    Some(concrete)
 }
 
-/// Resolves the concrete view format for a typeless host texture: preserves the
-/// title's format for sRGB+UAV SRVs (via `view_format`, excluding depth formats
-/// other than mapping `D16_UNORM` to `R16_UNORM`), otherwise uses
-/// [`default_concrete_format`].
+/// Resolves the concrete view format for a typeless host texture when the title
+/// passed a null description or `DXGI_FORMAT_UNKNOWN`: uses [`view_format`] for
+/// textures promoted from a typed console format (sRGB kept on SRVs, mapped to
+/// linear on UAVs; depth mapped to an SRV plane format), else
+/// [`default_concrete_format`]. (#438 VIC-BT-004)
 fn concrete_format_for(
     resource: crate::object::This,
     own: u32,
     unordered: bool,
 ) -> Option<DXGI_FORMAT> {
-    if !unordered && let Some(fmt) = crate::resource::view_format(resource) {
-        if fmt == DXGI_FORMAT_D16_UNORM.0 as u32 {
-            return Some(DXGI_FORMAT_R16_UNORM);
-        }
-        if !crate::resource::DEPTH_FORMATS
-            .iter()
-            .any(|&(d, _)| d == fmt)
-        {
-            return Some(DXGI_FORMAT(fmt as i32));
-        }
+    let title = crate::resource::view_format(resource);
+    let concrete = crate::resource::null_view_format(own, title, unordered)?;
+    if unordered && !supports_typed_uav(DXGI_FORMAT(concrete as i32)) {
+        return None;
     }
-    default_concrete_format(own, unordered).map(|f| DXGI_FORMAT(f as i32))
+    Some(DXGI_FORMAT(concrete as i32))
 }
 
 /// Synthesizes a full SRV description matching `rd` with concrete `format` when
@@ -1765,6 +1735,8 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    // Typeless host copies need an explicit concrete format: `make` fills
+    // null / UNKNOWN via `concrete_format_for` before calling here (VIC-BT-004).
     if view == 0 {
         return !typeless;
     }
