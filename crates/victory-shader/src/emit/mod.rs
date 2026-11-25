@@ -78,6 +78,8 @@
 //!   declares and the rasterizer system values.
 
 mod bitcode;
+#[cfg(test)]
+mod bvh_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
