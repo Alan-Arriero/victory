@@ -1636,10 +1636,10 @@ extern "system" fn execute_indirect(
             ran = s.execute_indirect(list, (kind, stride, max), address, counter, &mut dropped);
         });
     } else {
-        dropped = if address.is_none() {
-            "arguments outside title buffers"
-        } else if !args.is_empty() {
+        dropped = if args.len() != 1 {
             "a signature of more than one argument"
+        } else if address.is_none() {
+            "arguments outside title buffers"
         } else {
             "count outside title buffers"
         };
@@ -1660,16 +1660,21 @@ extern "system" fn execute_indirect(
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&(signature as usize, dropped)) {
         seen.push((signature as usize, dropped));
-        // The records the GPU would have read, from their host copy: title
-        // memory holds whatever the pass that writes them left there.
+        // The records from a host copy that already exists, never one made
+        // here: its bytes are as of that copy's last refresh, before this
+        // submission and any producer earlier in this list. A buffer with no
+        // copy reads as absent rather than as zeroes.
         #[cfg(windows)]
         let records = address.and_then(|at| {
-            let shadow = crate::shadow::find(at, u64::from(stride))?;
+            let shadow = crate::shadow::peek(at, u64::from(stride))?;
             let bytes = shadow.bytes(at, u64::from(stride))?;
+            // A stride that is not a multiple of four leaves a tail out
+            // rather than panicking in this callback.
+            let (words, _tail) = bytes.as_chunks::<4>();
             Some(
-                bytes
-                    .chunks(4)
-                    .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                words
+                    .iter()
+                    .map(|w| u32::from_le_bytes(*w))
                     .collect::<Vec<u32>>(),
             )
         });
