@@ -2606,24 +2606,30 @@ pub fn write_title_memory(destination: usize, bytes: &[u8]) -> bool {
     written
 }
 
-/// `NtWriteVirtualMemory`, looked up once. `WriteProcessMemory` asks the
-/// kernel about the destination's region first (to flush the instruction
-/// cache of executable memory), which in the title's big pools walks page
-/// tables for about 2 ms a call: the copy back after a world submission
-/// spent over a second there. The system call itself writes the same bytes
-/// and reports a page it cannot write the same way.
-fn nt_write_virtual_memory() -> Option<NtWrite> {
+#[derive(Clone, Copy)]
+enum CopyBack {
+    WineRead,
+    NativeWrite(NtWrite),
+}
+
+/// Select the checked same-process copy once. Proton's read path is much
+/// cheaper for the small rows and pages written back after a submission.
+fn copy_back_method() -> Option<CopyBack> {
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-    static CALL: std::sync::OnceLock<Option<NtWrite>> = std::sync::OnceLock::new();
-    *CALL.get_or_init(|| {
-        // SAFETY: ntdll is always loaded; the symbol has this signature.
+    static METHOD: std::sync::OnceLock<Option<CopyBack>> = std::sync::OnceLock::new();
+    *METHOD.get_or_init(|| {
+        // SAFETY: ntdll is always loaded. Wine identifies itself by this export;
+        // on native Windows the write routine has the NtWrite signature.
         unsafe {
             let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            if GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some() {
+                return Some(CopyBack::WineRead);
+            }
             let f = GetProcAddress(ntdll, c"NtWriteVirtualMemory".as_ptr().cast())?;
-            Some(std::mem::transmute::<
+            Some(CopyBack::NativeWrite(std::mem::transmute::<
                 unsafe extern "system" fn() -> isize,
                 NtWrite,
-            >(f))
+            >(f)))
         }
     })
 }
@@ -2639,21 +2645,19 @@ type NtWrite = unsafe extern "system" fn(
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 ///
-/// Through `NtWriteVirtualMemory`: the kernel refuses an unmapped
-/// destination page as it does a source page, without asking first for the
-/// destination's region, which `WriteProcessMemory` does at
-/// `VirtualQuery`'s cost (see [`copy_mapped`]). `WriteProcessMemory` is not
-/// a substitute here: it would make read-only pages writable for the copy,
-/// writing around the watch in [`crate::watch`] without the fault it needs.
-/// ntdll exports the symbol on every Windows, so a missing one leaves the
-/// copy back undone rather than patched up.
+/// Wine uses the checked read into the destination. Native Windows uses
+/// the NT write directly, avoiding the region query and temporary changes
+/// to read-only page protections that WriteProcessMemory can perform.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let Some(call) = nt_write_virtual_memory() else {
+    let Some(method) = copy_back_method() else {
         return;
     };
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
+        let CopyBack::NativeWrite(call) = method else {
+            return read(from, at as *mut u8, n);
+        };
         let mut done = 0;
         // SAFETY: the source is our mapped host copy; the kernel checks the
         // destination.
@@ -2799,6 +2803,33 @@ mod title_copies {
         assert!(to[BLOCK..2 * BLOCK].iter().all(|&b| b == 0));
         assert!(to[2 * BLOCK..].iter().all(|&b| b == 7));
         release(holes);
+    }
+
+    // Run on both revisions with --ignored --nocapture to measure the active path.
+    #[test]
+    #[ignore = "local copy-back timing"]
+    fn time_small_copy_backs() {
+        const ROW: usize = 4096;
+        let source = vec![0xf3; ROW * 1024];
+        let mut dest = vec![0; source.len()];
+        let mut samples = Vec::new();
+        for round in 0..10 {
+            dest.fill(0);
+            let start = std::time::Instant::now();
+            for offset in (0..source.len()).step_by(ROW) {
+                write_mapped(dest[offset..].as_mut_ptr(), source[offset..].as_ptr(), ROW);
+            }
+            let elapsed = start.elapsed();
+            assert_eq!(dest, source);
+            if round >= 2 {
+                samples.push(elapsed);
+            }
+        }
+        samples.sort_unstable();
+        eprintln!(
+            "1024 x 4 KiB copy-backs, median {:?}",
+            (samples[3] + samples[4]) / 2
+        );
     }
 
     #[test]
