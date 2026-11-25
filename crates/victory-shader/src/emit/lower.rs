@@ -4625,18 +4625,29 @@ impl<'a> Lower<'a> {
                     .get(..4)
                     .and_then(|w| w.try_into().ok())
                     .ok_or("a sampler constant")?;
-                let n = match self.samplers.iter().position(|w| *w == words) {
-                    Some(n) => n,
+                // Comparison and non-comparison samples need distinct static
+                // sampler slots (D3D12 SamplerComparisonState vs SamplerState):
+                // annotateHandle props must match dx.resources sampler kind.
+                let cmp = props.0 & 0x8000 != 0;
+                let n = match self
+                    .samplers
+                    .iter()
+                    .enumerate()
+                    .find(|(n, w)| **w == words && (self.s.cmp_samplers >> *n & 1 != 0) == cmp)
+                {
+                    Some((n, _)) => n,
                     None => {
+                        let n = self.samplers.len();
+                        if n >= 64 {
+                            return Err("too many immediate samplers");
+                        }
                         self.samplers.push(words);
-                        self.samplers.len() - 1
+                        if cmp {
+                            self.s.cmp_samplers |= 1 << n;
+                        }
+                        n
                     }
                 };
-                if props.0 & 0x8000 != 0 {
-                    // shortcut: one sampler used with and without comparison
-                    // would need two static samplers; it becomes a comparison one.
-                    self.s.cmp_samplers |= 1 << n;
-                }
                 Ok(self.s.sampler_handle(self.cur, n as u32))
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
@@ -10208,6 +10219,96 @@ mod tests {
             v.validate(&mut l.dxil.clone())
                 .expect("DXIL validation failed");
         }
+    }
+
+    /// VIC-BT-009: the same immediate sampler words used non-comparison first
+    /// then comparison (or the reverse) allocate two static slots so each
+    /// annotateHandle matches `dx.resources` sampler kind.
+    #[test]
+    fn immediate_sampler_comparison_and_plain_get_distinct_slots() {
+        let setup = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0xBE88_03FF,
+            0x0000_0092, // s_mov_b32 s8, 0x92 (an immediate sampler)
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ];
+        // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+        let sample_lz = [0x7E04_02F0, 0x7E06_02F0, 0xF09C_0F08, 0x0043_0C02];
+        // image_sample_c_lz v12, v[2:4], … dmask:0x1 (z-ref then coords)
+        let sample_c_lz = [
+            0x7E04_02F0,
+            0x7E06_02F0,
+            0x7E08_02F0,
+            0xF0BC_0108,
+            0x0043_0C02,
+        ];
+        let store = [
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ];
+        let lower_mix = |plain_first: bool| {
+            let mut words = setup.to_vec();
+            if plain_first {
+                words.extend_from_slice(&sample_lz);
+                words.extend_from_slice(&sample_c_lz);
+            } else {
+                words.extend_from_slice(&sample_c_lz);
+                words.extend_from_slice(&sample_lz);
+            }
+            words.extend_from_slice(&store);
+            let (_, mut used) = texture_and_uav_tables();
+            used.retain(|u| u.user_data == 0);
+            let layout = vec![root(RootType::Table, 0, 0)];
+            lower_with(&words, layout, used).unwrap()
+        };
+        for plain_first in [true, false] {
+            let l = lower_mix(plain_first);
+            assert_eq!(
+                l.samplers.len(),
+                2,
+                "plain_first={plain_first}: need distinct static slots"
+            );
+            assert_eq!(l.samplers[0], l.samplers[1]);
+            assert_eq!(
+                l.cmp_samplers.count_ones(),
+                1,
+                "plain_first={plain_first}: one comparison slot"
+            );
+            let cmp_slot = l.cmp_samplers.trailing_zeros();
+            let plain_slot = if cmp_slot == 0 { 1 } else { 0 };
+            assert_eq!(
+                l.cmp_samplers >> plain_slot & 1,
+                0,
+                "plain_first={plain_first}"
+            );
+            #[cfg(windows)]
+            if let Ok(mut v) = super::super::validator::Validator::load(
+                super::super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut l.dxil.clone())
+                    .unwrap_or_else(|e| panic!("plain_first={plain_first}: {e}"));
+            }
+        }
+        // Same-kind reuse still shares one slot.
+        let mut words = setup.to_vec();
+        words.extend_from_slice(&sample_lz);
+        words.extend_from_slice(&sample_lz);
+        words.extend_from_slice(&store);
+        let (_, mut used) = texture_and_uav_tables();
+        used.retain(|u| u.user_data == 0);
+        let l = lower_with(&words, vec![root(RootType::Table, 0, 0)], used).unwrap();
+        assert_eq!(l.samplers.len(), 1);
+        assert_eq!(l.cmp_samplers, 0);
     }
 
     /// A compute program that sets `defined` VGPRs from v2 on (`offsets` first:
