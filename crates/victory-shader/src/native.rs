@@ -329,7 +329,9 @@ pub struct ComputeIo {
     pub threads: [u32; 3],
 }
 
-/// `SPI_SHADER_PGM_RSRC2_PS` of a pixel program.
+/// `SPI_SHADER_PGM_RSRC2_PS` of a pixel program: after the user SGPRs the
+/// hardware loads the primitive mask, then (with `LOAD_COLLISION_WAVEID`)
+/// the POPS collision wave id, then the scratch wave offset (`SCRATCH_EN`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PsRsrc2(pub u32);
 
@@ -339,8 +341,8 @@ impl PsRsrc2 {
         (self.0 >> 1 & 0x1F) as u8
     }
 
-    /// The SGPR after the user SGPRs: the primitive mask, the LDS offset of
-    /// the primitive's parameters that `v_interp` reads through M0.
+    /// The primitive mask: the LDS offset of the primitive's parameters,
+    /// M0 for `v_interp`.
     pub fn prim_mask_sgpr(self) -> u8 {
         self.user_sgprs()
     }
@@ -354,13 +356,14 @@ impl PsRsrc2 {
         (self.0 >> 25 & 1 != 0).then(|| self.prim_mask_sgpr() + 1)
     }
 
-    /// SGPRs the hardware initializes; the ones above hold whatever the
-    /// previous wave left.
+    /// SGPRs the hardware initializes: the user SGPRs, the system ones,
+    /// then the scratch wave offset when scratch is enabled (bit 0). The
+    /// ones above hold whatever the previous wave left.
     pub fn initialized_sgprs(self) -> u8 {
-        let last = self
+        let system = self
             .collision_wave_id_sgpr()
             .unwrap_or(self.prim_mask_sgpr());
-        last + 1
+        system + 1 + (self.0 & 1) as u8
     }
 }
 
@@ -1194,7 +1197,7 @@ mod tests {
                     io: StageIo::Ps {
                         inputs: vec![],
                         input_addr: 0,
-                        rsrc2: Default::default(),
+                        rsrc2: PsRsrc2::default(),
                         db_shader_control: 0,
                         patches: vec![],
                     },
@@ -1605,6 +1608,9 @@ mod tests {
         assert_eq!(plain.prim_mask_sgpr(), 4);
         assert_eq!(plain.collision_wave_id_sgpr(), None);
         assert_eq!(plain.initialized_sgprs(), 5);
+        // Scratch (bit 0) adds the wave offset after the system SGPRs.
+        assert_eq!(PsRsrc2(4 << 1 | 1).initialized_sgprs(), 6);
+        assert_eq!(PsRsrc2(17 << 1 | 1 << 25 | 1).initialized_sgprs(), 20);
     }
 
     #[test]

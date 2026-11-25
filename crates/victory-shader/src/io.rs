@@ -19,6 +19,10 @@
 //! Attributes and outputs are named by their row: a register of the
 //! container's signature part.
 //!
+//! Pixel shaders also get the primitive mask in the SGPR after the user data
+//! and, with `LOAD_COLLISION_WAVEID` (POPS), the collision wave id after it,
+//! as `SPI_SHADER_PGM_RSRC2_PS` enables them.
+//!
 //! Compute programs get the thread id in the group in v0-v2 and the group
 //! id in the SGPRs after the user data, as `COMPUTE_PGM_RSRC2` enables them.
 //!
@@ -190,7 +194,7 @@ pub struct Io {
     pub inputs: Vec<(Value, Input)>,
     pub interps: Vec<(Site, Interp)>,
     pub exports: Vec<Export>,
-    /// Compute: how many SGPRs the hardware initializes
+    /// Compute and pixel: how many SGPRs the hardware initializes
     /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs),
     /// [`PsRsrc2::initialized_sgprs`](crate::native::PsRsrc2::initialized_sgprs)).
     pub initialized_sgprs: Option<u8>,
