@@ -246,14 +246,12 @@ fn release_epoch_in(retire_state: &Mutex<RetireState>, epoch: u64) {
 }
 
 fn retire_in<T: 'static>(retire_state: &Mutex<RetireState>, object: T, born_seq: u64) {
-    // Pair with `work_seq` updates in `HostList::mark_work` and `RESOURCE_SEQ`
-    // increments in `birth_seq`.
-    std::sync::atomic::fence(Ordering::SeqCst);
     let warn = {
         let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
         let slot = state.free_slots.pop().unwrap_or(state.retired.len());
         let mut blockers = 0usize;
         for entry in state.active_epochs.values_mut() {
+            // Pairs with `AcqRel` `work_seq` updates in `HostList::mark_work`.
             if born_seq == 0 || entry.work_seq.load(Ordering::Acquire) >= born_seq {
                 entry.waiting.push(slot);
                 blockers += 1;

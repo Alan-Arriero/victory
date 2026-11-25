@@ -2906,7 +2906,7 @@ mod tests {
         state::stencil_ref(list, 0);
         set_pipeline(list, null);
         // Empty OMSetRenderTargets (0 targets, null depth) must not pin an epoch.
-        slot::<extern "system" fn(This, u32, *const u64, u32, *const u64)>(list, 0x170)(
+        slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190)(
             list,
             0,
             std::ptr::null(),
