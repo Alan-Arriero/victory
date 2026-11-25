@@ -9609,6 +9609,38 @@ mod tests {
         assert!(refused.to_string().contains("untracked mask"), "{refused}");
     }
 
+    /// A select on a mask the same in every lane picks one source for all of
+    /// them, so it needs neither a lane index nor a wave operation.
+    #[test]
+    fn selects_on_masks_the_same_in_every_lane_need_no_lane_index() {
+        let select = [
+            0xD501_0001,
+            258 | (259 << 9) | (2 << 18), // v_cndmask_b32 v1, v2, v3, s2 (or s[2:3])
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1: the select is needed
+            S_ENDPGM,
+        ];
+        let cases: [(&[u32], bool); 6] = [
+            (&[0xBF06_0100, 0x8502_80C1], false), // s_cmp_eq_u32; s_cselect_b32 s2, -1, 0
+            (&[0xBF06_0100, 0x8582_80C1], true),  // s_cmp_eq_u32; s_cselect_b64 s[2:3], -1, 0
+            (&[0xBE82_03C1], false),              // s_mov_b32 s2, -1
+            (&[0xBE82_0380], false),              // s_mov_b32 s2, 0
+            (&[0xBE82_04C1], true),               // s_mov_b64 s[2:3], -1
+            (&[0xBE82_0480], true),               // s_mov_b64 s[2:3], 0
+        ];
+        for (prefix, wave64) in cases {
+            let words = [prefix, &select].concat();
+            let l = lower_wave(
+                &words,
+                (0..4).map(|i| root(RootType::Constants, i, i)).collect(),
+                vec![],
+                wave64,
+            )
+            .unwrap_or_else(|e| panic!("{words:x?} wave64={wave64}: {e}"));
+            assert!(!l.wave_ops, "{words:x?} wave64={wave64}");
+        }
+    }
+
     /// [`texture_tables`] with a raw buffer UAV at dword 16 of the first.
     pub(crate) fn texture_and_uav_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
         let (layout, mut used) = texture_tables();
