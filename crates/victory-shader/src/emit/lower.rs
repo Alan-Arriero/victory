@@ -54,6 +54,13 @@ pub(crate) struct Lowered {
     /// Test builds: typed loads assembled from a dword-aligned pair.
     #[cfg(test)]
     pub unaligned_typed_loads: u32,
+    /// Test builds: indices into the address list of image instructions that
+    /// were read.
+    #[cfg(test)]
+    pub image_address_reads: Vec<usize>,
+    /// Test builds: whether a 16-bit float is widened (`legacyF16ToF32`).
+    #[cfg(test)]
+    pub widens_f16: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1190,6 +1197,10 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             #[cfg(test)]
             unaligned_typed_loads: self.s.unaligned_typed_loads,
+            #[cfg(test)]
+            image_address_reads: std::mem::take(&mut self.s.image_address_reads),
+            #[cfg(test)]
+            widens_f16: self.s.m.has_dx_op("dx.op.legacyF16ToF32", 131),
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -6783,19 +6794,25 @@ impl<'a> Lower<'a> {
         // Full 32-bit address VGPR at `reg_idx` (offset, bias, z-compare).
         let addr_u32 = |l: &mut Self, reg_idx: usize| -> Result<V, Why> {
             let r = *regs.get(reg_idx).ok_or("an image address")?;
+            #[cfg(test)]
+            l.s.image_address_reads.push(reg_idx);
             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
             l.i32_of(v)
         };
         // With a16, two 16-bit components per VGPR starting at `base_reg`, low half first.
+        let addr_halves =
+            |l: &mut Self, base_reg: usize, k: usize, packed: bool| -> Result<V, Why> {
+                let x = addr_u32(l, base_reg + if packed { k / 2 } else { k })?;
+                if !packed {
+                    return Ok(x);
+                }
+                let c = l.cur;
+                let (sh, mask) = (l.s.m.i32(16 * (k as u32 % 2)), l.s.m.i32(0xFFFF));
+                let x = l.s.m.bin(c, Bin::LShr, x, sh);
+                Ok(l.s.m.bin(c, Bin::And, x, mask))
+            };
         let addr_packed = |l: &mut Self, base_reg: usize, k: usize| -> Result<V, Why> {
-            let x = addr_u32(l, base_reg + if *a16 { k / 2 } else { k })?;
-            if !*a16 {
-                return Ok(x);
-            }
-            let c = l.cur;
-            let (sh, mask) = (l.s.m.i32(16 * (k as u32 % 2)), l.s.m.i32(0xFFFF));
-            let x = l.s.m.bin(c, Bin::LShr, x, sh);
-            Ok(l.s.m.bin(c, Bin::And, x, mask))
+            addr_halves(l, base_reg, k, *a16)
         };
         let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> { addr_packed(l, 0, k) };
         let src = self
@@ -6965,12 +6982,20 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
             return Ok(());
         }
-        let (op, sample) = match name {
+        // GFX10.3 `_g16` opcodes pack gradients into 16-bit pairs; `a16` (coordinates, LOD,
+        // clamp) is independent of it.
+        let (base_name, g16) = match name.strip_suffix("_g16") {
+            Some(base) => (base, true),
+            None => (name, false),
+        };
+        let (op, sample) = match base_name {
             "image_sample" | "image_sample_cl" | "image_sample_o" => (60, true),
             "image_sample_lz" | "image_sample_l" | "image_sample_lz_o" => (62, true),
             "image_sample_b" | "image_sample_b_cl" => (61, true),
             "image_sample_c_lz" => (65, true),
-            "image_sample_d" | "image_sample_d_cl" => (63, true),
+            "image_sample_d" | "image_sample_d_cl" | "image_sample_d_o" | "image_sample_d_cl_o" => {
+                (63, true)
+            }
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" | "image_sample_c_cl" if self.s.pixel => (64, true),
@@ -7036,19 +7061,31 @@ impl<'a> Lower<'a> {
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only). Offset, bias and
             // z-compare are always full 32-bit VGPRs even with a16.
-            let offset_word = name.ends_with("_o");
-            let has_cl = name.ends_with("_cl");
+            let offset_word = base_name.split('_').any(|t| t == "o");
+            let has_cl = base_name.split('_').any(|t| t == "cl");
             let first = usize::from(offset_word) + usize::from(op == 61) + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates and remain
             // 32-bit floats on GFX10.3 unless the opcode is a `_g16` form.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
-            let deriv_regs = if op == 63 { spatial } else { 0 };
-            let coord_base = first + 2 * deriv_regs;
+            let deriv_dwords = match (op == 63, g16) {
+                (false, _) => 0,
+                (true, false) => spatial,
+                (true, true) => spatial.div_ceil(2),
+            };
+            let coord_base = first + 2 * deriv_dwords;
             let mut cs = vec![fu; 4];
             // With a16, sampling coordinates, bias (low half), LOD and clamp are f16.
             let to_float = |l: &mut Self, x: V| {
                 if *a16 {
+                    let f = l.s.t.f32;
+                    l.s.op(l.cur, "legacyF16ToF32", Attr::ReadNone, f, 131, &[x])
+                } else {
+                    l.as_float(x)
+                }
+            };
+            let grad_float = |l: &mut Self, x: V| {
+                if g16 {
                     let f = l.s.t.f32;
                     l.s.op(l.cur, "legacyF16ToF32", Attr::ReadNone, f, 131, &[x])
                 } else {
@@ -7119,7 +7156,7 @@ impl<'a> Lower<'a> {
             } else {
                 fu
             };
-            if op == 60 && offset_word {
+            if matches!(op, 60 | 63) && offset_word {
                 // DXIL takes immediate offsets in -8..=7; the console's are
                 // 6-bit and may be computed.
                 let w = addr_u32(self, 0)?;
@@ -7197,10 +7234,10 @@ impl<'a> Lower<'a> {
                 63 => {
                     let mut g = vec![fu; 6];
                     for k in 0..spatial {
-                        let x = addr_u32(self, first + k)?;
-                        g[k] = self.as_float(x);
-                        let y = addr_u32(self, first + deriv_regs + k)?;
-                        g[3 + k] = self.as_float(y);
+                        let x = addr_halves(self, first, k, g16)?;
+                        g[k] = grad_float(self, x);
+                        let y = addr_halves(self, first + deriv_dwords, k, g16)?;
+                        g[3 + k] = grad_float(self, y);
                     }
                     args.extend(&os);
                     args.extend(g);
@@ -9583,6 +9620,126 @@ mod tests {
         ) {
             v.validate(&mut l.dxil.clone())
                 .expect("DXIL validation failed");
+        }
+    }
+
+    /// A compute program that sets `defined` VGPRs from v2 on (`offsets` first:
+    /// the texel offset word) and samples 2D with the MIMG opcode `op`.
+    fn gradient_sample(op: u32, a16: bool, defined: usize, offsets: bool) -> Vec<u32> {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0xBE88_03FF,
+            0x0000_0092, // s_mov_b32 s8, 0x92 (an immediate sampler)
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+        ];
+        for r in 0..defined as u32 {
+            if r == 0 && offsets {
+                words.extend([0x7E04_02FF, 0x0000_3F01]); // v_mov_b32 v2, 0x3f01: x 1, y -1
+            } else {
+                words.push(0x7E00_02F0 | (2 + r) << 17); // v_mov_b32 v(2+r), 0.5
+            }
+        }
+        words.extend([
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF000_0F08 | (op & 0x7F) << 18 | op >> 7,
+            0x0043_0C02 | u32::from(a16) << 30, // v[12:15], v2.., s[12:19], s[8:11]
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ]);
+        words
+    }
+
+    fn lower_gradient_sample(
+        op: u32,
+        a16: bool,
+        defined: usize,
+        offsets: bool,
+    ) -> Result<Lowered, crate::ShaderError> {
+        let words = gradient_sample(op, a16, defined, offsets);
+        let (_, mut used) = texture_and_uav_tables();
+        used.retain(|u| u.user_data == 0);
+        let layout = vec![root(RootType::Table, 0, 0)];
+        lower_with(&words, layout, used)
+    }
+
+    /// The address-list indices the sample read, each once.
+    fn address_reads(l: &Lowered) -> Vec<usize> {
+        let mut reads = l.image_address_reads.clone();
+        reads.sort_unstable();
+        reads.dedup();
+        reads
+    }
+
+    #[test]
+    fn gradient_sample_reads_exactly_the_packed_address_dwords() {
+        // 2D image_sample_d (0x22) and image_sample_d_g16 (0xa2).
+        for (op, a16, dwords) in [
+            (0x22, false, 6),
+            (0x22, true, 5),
+            (0xA2, false, 4),
+            (0xA2, true, 3),
+        ] {
+            let l = lower_gradient_sample(op, a16, dwords, false)
+                .unwrap_or_else(|e| panic!("op {op:#x} a16 {a16}: {e:?}"));
+            let want: Vec<usize> = (0..dwords).collect();
+            assert_eq!(address_reads(&l), want, "op {op:#x} a16 {a16}");
+        }
+    }
+
+    #[test]
+    fn offset_gradient_samples_shift_every_address_by_the_offset_word() {
+        // image_sample_d_o (0x32), image_sample_d_o_g16 (0xb2),
+        // image_sample_d_cl_o (0x33), image_sample_d_cl_o_g16 (0xb3).
+        for (op, a16, dwords) in [
+            (0x32, false, 7),
+            (0x32, true, 6),
+            (0xB2, false, 5),
+            (0xB2, true, 4),
+            (0x33, false, 8),
+            (0x33, true, 7),
+            (0xB3, false, 6),
+            (0xB3, true, 5),
+        ] {
+            let l = lower_gradient_sample(op, a16, dwords, true)
+                .unwrap_or_else(|e| panic!("op {op:#x} a16 {a16}: {e:?}"));
+            let want: Vec<usize> = (0..dwords).collect();
+            assert_eq!(address_reads(&l), want, "op {op:#x} a16 {a16}");
+        }
+    }
+
+    #[test]
+    fn gradient_halves_widen_only_for_g16_and_coordinate_halves_only_for_a16() {
+        let plain = lower_gradient_sample(0x22, false, 6, false).unwrap();
+        assert!(!plain.widens_f16);
+        let a16 = lower_gradient_sample(0x22, true, 5, false).unwrap();
+        assert!(a16.widens_f16);
+        let g16 = lower_gradient_sample(0xA2, false, 4, false).unwrap();
+        assert!(g16.widens_f16);
+        let both = lower_gradient_sample(0xA2, true, 3, false).unwrap();
+        assert!(both.widens_f16);
+    }
+
+    #[test]
+    fn gradient_sample_offsets_validate_as_dxil() {
+        for (op, a16, dwords) in [(0x32, false, 7), (0xB2, true, 4)] {
+            #[cfg_attr(not(windows), allow(unused_variables))]
+            let l = lower_gradient_sample(op, a16, dwords, true).unwrap();
+            #[cfg(windows)]
+            if let Ok(mut v) = super::super::validator::Validator::load(
+                super::super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut l.dxil.clone())
+                    .expect("DXIL validation failed");
+            }
         }
     }
 
