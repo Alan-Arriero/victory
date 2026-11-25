@@ -397,18 +397,21 @@ fn null_target_words(
     depth: bool,
 ) -> Option<[u32; 6]> {
     let array = u32::from(depth_or_array);
+    // RTV: Format, ViewDimension, then the union (no Flags).
+    // DSV: Format, ViewDimension, Flags, then the union — so array
+    // dimensions shift one word later than the matching RTV layout.
     let (dim, w2, w3, w4, w5) = match (resource_dim, depth) {
         (RES_TEXTURE_1D, false) if array > 1 => (3, 0, 0, array, 0), // RTV 1DARRAY
         (RES_TEXTURE_1D, false) => (2, 0, 0, 0, 0),                  // RTV 1D
-        (RES_TEXTURE_1D, true) if array > 1 => (2, 0, 0, array, 0),  // DSV 1DARRAY
+        (RES_TEXTURE_1D, true) if array > 1 => (2, 0, 0, 0, array),  // DSV 1DARRAY
         (RES_TEXTURE_1D, true) => (1, 0, 0, 0, 0),                   // DSV 1D
         (RES_TEXTURE_2D, false) if samples > 1 && array > 1 => (7, 0, array, 0, 0), // RTV 2DMSARRAY
         (RES_TEXTURE_2D, false) if samples > 1 => (6, 0, 0, 0, 0),   // RTV 2DMS
         (RES_TEXTURE_2D, false) if array > 1 => (5, 0, 0, array, 0), // RTV 2DARRAY
         (RES_TEXTURE_2D, false) => (4, 0, 0, 0, 0),                  // RTV 2D
-        (RES_TEXTURE_2D, true) if samples > 1 && array > 1 => (6, 0, array, 0, 0), // DSV 2DMSARRAY
+        (RES_TEXTURE_2D, true) if samples > 1 && array > 1 => (6, 0, 0, array, 0), // DSV 2DMSARRAY
         (RES_TEXTURE_2D, true) if samples > 1 => (5, 0, 0, 0, 0),    // DSV 2DMS
-        (RES_TEXTURE_2D, true) if array > 1 => (4, 0, 0, array, 0),  // DSV 2DARRAY
+        (RES_TEXTURE_2D, true) if array > 1 => (4, 0, 0, 0, array),  // DSV 2DARRAY
         (RES_TEXTURE_2D, true) => (3, 0, 0, 0, 0),                   // DSV 2D
         (RES_TEXTURE_3D, false) => (8, 0, 0, array, 0),              // RTV 3D
         _ => return None,
@@ -974,14 +977,23 @@ mod tests {
             null_target_words(RGBA8, RES_TEXTURE_3D, 5, 1, false),
             Some([RGBA8, 8, 0, 0, 5, 0])
         );
-        // DSV: 2DMS (the MSAA depth reproducer) and 2DARRAY; 3D is invalid.
+        // DSV: Flags sits between ViewDimension and the union, so array
+        // sizes land one word later than the matching RTV layout.
         assert_eq!(
             null_target_words(D32, RES_TEXTURE_2D, 1, 4, true),
             Some([D32, 5, 0, 0, 0, 0])
         );
         assert_eq!(
             null_target_words(D32, RES_TEXTURE_2D, 6, 1, true),
-            Some([D32, 4, 0, 0, 6, 0])
+            Some([D32, 4, 0, 0, 0, 6])
+        );
+        assert_eq!(
+            null_target_words(D32, RES_TEXTURE_2D, 2, 4, true),
+            Some([D32, 6, 0, 0, 2, 0])
+        );
+        assert_eq!(
+            null_target_words(D32, RES_TEXTURE_1D, 3, 1, true),
+            Some([D32, 2, 0, 0, 0, 3])
         );
         assert_eq!(null_target_words(D32, RES_TEXTURE_3D, 5, 1, true), None);
         assert_eq!(null_target_words(RGBA8, 1, 1, 1, false), None);
