@@ -191,7 +191,7 @@ impl Heap {
         let start = self.start as usize;
         let end = start.saturating_add(mirrored_count as usize * step as usize);
         let mut last_watch = self.sync_watch.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((now, pages)) = crate::watch::writes(start, end, false) {
+        let mirrored = if let Some((now, pages)) = crate::watch::writes(start, end, false) {
             let prev = *last_watch;
             let mut mirrored = 0;
             for (page, written_at) in pages {
@@ -207,10 +207,14 @@ impl Heap {
                 mirrored += host.sync_slots(self.start, step, first_slot, end_slot, for_draw);
             }
             *last_watch = now;
-            return mirrored;
-        }
-        drop(last_watch);
-        host.sync_slots(self.start, step, 0, mirrored_count, for_draw)
+            mirrored
+        } else {
+            drop(last_watch);
+            host.sync_slots(self.start, step, 0, mirrored_count, for_draw)
+        };
+        // Streamed-mip SRVs can widen without a descriptor write; remake them
+        // even when write-watch only touched other pages (or none).
+        mirrored + host.remirror_widened_srvs(self.start, step, for_draw)
     }
 }
 
