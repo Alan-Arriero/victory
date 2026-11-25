@@ -88,17 +88,34 @@ pub struct SpaceInfo {
 }
 
 fn used_bytes(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .map(|e| match e.metadata() {
-            Ok(m) if m.is_dir() => used_bytes(&e.path()),
-            Ok(m) => m.len(),
-            Err(_) => 0,
-        })
-        .sum()
+    // Walk without following symlinks/junctions so a cycle or escape
+    // cannot inflate the PLS quota (VIC-BT-040 / #440).
+    let mut total = 0u64;
+    let mut stack = Vec::new();
+    match std::fs::read_dir(dir) {
+        Ok(entries) => stack.push(entries),
+        Err(_) => return 0,
+    }
+    while let Some(entries) = stack.pop() {
+        for e in entries.flatten() {
+            let Ok(ft) = e.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                if let Ok(sub) = std::fs::read_dir(e.path()) {
+                    stack.push(sub);
+                }
+                continue;
+            }
+            if let Ok(m) = e.metadata() {
+                total = total.saturating_add(m.len());
+            }
+        }
+    }
+    total
 }
 
 /// What the host disk under `dir` has free (unlimited if unknown).
