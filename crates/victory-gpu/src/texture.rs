@@ -433,10 +433,12 @@ impl Staging {
         }
         last.asked = 0;
         let resident = committed_prefix(self.memory, size);
-        if resident < size {
-            // A full-chain copy may follow a placed view with only its tail
-            // resident. Populate the same tail at its full-chain footprints.
-            let end = self.first + self.footprints.len() as u32;
+        // A mip tail can be selected by its resident prefix only when the
+        // smallest mip occupies less than the whole layout. Arrays and 3D
+        // textures can have resident slices after a hole; copy their full
+        // range through the sparse reader below.
+        if resident < size && self.layout.bytes_from(self.mips - 1) < self.layout.size {
+            let end = self.mips;
             let first =
                 (self.first..end).find(|&mip| self.layout.bytes_from(mip) <= resident as u64);
             let bytes = first.map_or(0, |mip| self.layout.bytes_from(mip) as usize);
@@ -700,6 +702,7 @@ mod tests {
     fn test_texture(
         width: u32,
         mips: u16,
+        slices: u16,
         address: Option<u64>,
     ) -> (This, &'static ID3D12Resource) {
         use windows::Win32::Graphics::Dxgi::Common::{
@@ -716,7 +719,7 @@ mod tests {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
             Width: u64::from(width),
             Height: width,
-            DepthOrArraySize: 1,
+            DepthOrArraySize: slices,
             MipLevels: mips,
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             SampleDesc: DXGI_SAMPLE_DESC {
@@ -755,6 +758,73 @@ mod tests {
     }
 
     #[test]
+    fn partially_resident_arrays_keep_slices_on_both_sides_of_a_hole() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+
+        if host().is_none() {
+            eprintln!("skipping texture array staging: no D3D12 device");
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        if crate::copystat::mode() != 0 {
+            return;
+        }
+        const RESERVED: usize = 2 << 20;
+        // SAFETY: create a new writable reservation for all three slices.
+        let memory = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                RESERVED,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!memory.is_null());
+        let (resource, texture) = test_texture(128, 1, 3, Some(memory as u64));
+        let s = staging(resource, texture, 0).unwrap();
+        let stride = s.layout.slice_size as usize;
+        assert_eq!(s.tiled_bytes, 3 * stride);
+        assert!(s.tiled_bytes <= RESERVED && stride.is_multiple_of(4096));
+        let slice = |n: usize| memory.cast::<u8>().wrapping_add(n * stride);
+        for (n, byte) in [0x16, 0x58, 0x9a].into_iter().enumerate() {
+            // SAFETY: each slice fits within the committed reservation.
+            unsafe { slice(n).write_bytes(byte, stride) };
+        }
+        let pixels = || {
+            s.footprints
+                .iter()
+                .map(|fp| {
+                    // SAFETY: each footprint begins within the live mapped staging buffer.
+                    unsafe { s.data.add(fp.Offset as usize).read() }
+                })
+                .collect::<Vec<_>>()
+        };
+        s.refresh_now();
+        assert_eq!(pixels(), [0x16, 0x58, 0x9a]);
+        // SAFETY: slice 1 is page-aligned and occupies only its own pages.
+        let freed = unsafe { VirtualFree(slice(1).cast(), stride, MEM_DECOMMIT) };
+        assert_ne!(freed, 0);
+        s.refresh_now();
+        assert_eq!(pixels(), [0x16, 0, 0x9a]);
+        // SAFETY: the middle slice remains reserved and may be committed again.
+        let mapped = unsafe { VirtualAlloc(slice(1).cast(), stride, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(mapped, slice(1).cast());
+        // SAFETY: the preceding call recommitted this slice.
+        unsafe { slice(1).write_bytes(0xbc, stride) };
+        s.refresh_now();
+        assert_eq!(pixels(), [0x16, 0xbc, 0x9a]);
+
+        drop(s);
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(resource, 0x10);
+        assert_eq!(release(resource), 0);
+        // SAFETY: the resource and staging no longer refer to the reservation.
+        assert_ne!(unsafe { VirtualFree(memory, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
     fn placed_texture_upload_reads_the_resident_span_and_copies_to_the_requested_mip() {
         let Some(host) = host() else {
             eprintln!("skipping texture readback: no D3D12 device");
@@ -767,7 +837,7 @@ mod tests {
         // SAFETY: reserve space for the complete texture without committing its pages.
         let memory = unsafe { VirtualAlloc(std::ptr::null(), 2 << 20, MEM_RESERVE, PAGE_NOACCESS) };
         assert!(!memory.is_null());
-        let (resource, texture) = test_texture(256, 9, Some(memory as u64));
+        let (resource, texture) = test_texture(256, 9, 1, Some(memory as u64));
         let mut words = [0; 16];
         words[1] = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
         words[4] = 8;
@@ -864,7 +934,7 @@ mod tests {
         if host().is_none() {
             return;
         }
-        let (tex, host_tex) = test_texture(4, 1, None);
+        let (tex, host_tex) = test_texture(4, 1, 1, None);
         let weak = {
             let s = staging(tex, host_tex, 0).expect("staging");
             Arc::downgrade(&s)
@@ -882,7 +952,7 @@ mod tests {
         let Some(host) = host() else {
             return;
         };
-        let (tex, host_tex) = test_texture(4, 1, None);
+        let (tex, host_tex) = test_texture(4, 1, 1, None);
         let list = host.new_list().expect("host list");
         list.mark_work();
 
