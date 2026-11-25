@@ -294,7 +294,7 @@ fn a_number_before_a_branch_that_writes_a_mask_is_refused() {
 /// count only its own bit (1). Issue #465.
 #[test]
 fn loop_exit_mask_counted_after_the_loop() {
-    // Exit mask in s20 — not s10, which sits inside the loaded s[8:11] desc.
+    // Exit mask / count in s20 — not s[8:11], which hold the loaded buffer desc.
     let body = [
         0x4A02_0081,                       // v_add_nc_u32 v1, 1, v0  (lane i loops i + 1 times)
         s_mov_b32(20, 0x80),               // s20 = 0
@@ -304,8 +304,8 @@ fn loop_exit_mask_counted_after_the_loop() {
         s_andn2_b32(EXEC_LO, EXEC_LO, 20), // exec &= ~s20
         0xBF89_FFFB,                       // s_cbranch_execnz loop
         s_or_b32(EXEC_LO, EXEC_LO, 20),    // restore exec
-        s_bcnt1_i32_b32(9, 20),            // s9 = popcount(s20)
-        v_mov_b32(1, 9),                   // v1 = s9 (program stores v1)
+        s_bcnt1_i32_b32(20, 20),           // s20 = popcount(s20)
+        v_mov_b32(1, 20),                  // v1 = s20 (program stores v1)
     ];
     let words = program(&body);
     let shader = build(&words);
