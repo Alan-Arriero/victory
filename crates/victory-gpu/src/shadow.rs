@@ -145,6 +145,18 @@ impl Shadow {
         address - self.start
     }
 
+    /// `len` bytes at a title address from the host copy, for the log: what
+    /// a GPU read of that range would have seen (None outside the buffer).
+    pub(crate) fn bytes(&self, address: u64, len: u64) -> Option<&[u8]> {
+        if address < self.start || len == 0 || len > self.left(address) {
+            return None;
+        }
+        let at = usize::try_from(address - self.start).ok()?;
+        let len = usize::try_from(len).ok()?;
+        // SAFETY: inside the mapping, which is as long as the buffer.
+        Some(unsafe { std::slice::from_raw_parts(self.data.add(at), len) })
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
@@ -734,6 +746,35 @@ mod tests {
         assert_eq!(weak.strong_count(), 1);
         unregister(resource, start);
         assert_eq!(weak.strong_count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bytes_reads_the_copy_inside_the_buffer_only() {
+        let _retire = crate::host::isolated_retire_scope();
+        if host().is_none() {
+            return;
+        }
+        let data = vec![0u8; 4096];
+        let start = data.as_ptr() as u64;
+        let resource = 0xdead_beef_0002_usize;
+        register(resource, start, data.len() as u64);
+        let shadow = find(start, 64).expect("shadow");
+        assert_eq!(shadow.bytes(start, 16).map(<[u8]>::len), Some(16));
+        assert_eq!(
+            shadow
+                .bytes(start + data.len() as u64 - 16, 16)
+                .map(<[u8]>::len),
+            Some(16),
+            "a range ending in the buffer's last bytes is inside it"
+        );
+        assert!(shadow.bytes(start - 4, 4).is_none(), "before the buffer");
+        assert!(
+            shadow.bytes(start + data.len() as u64 - 8, 16).is_none(),
+            "past the buffer"
+        );
+        assert!(shadow.bytes(start, 0).is_none(), "nothing to read");
+        unregister(resource, start);
     }
 
     #[cfg(windows)]
