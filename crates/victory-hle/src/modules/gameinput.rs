@@ -144,6 +144,11 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// Virtual keys `VICTORY_KEYS` holds down now (diagnostics builds only);
+    /// `keys` reports them too.
+    fn scripted(&mut self) -> Vec<u8> {
+        Vec::new()
+    }
     /// Motor speeds for the pad in host slot `slot`; a host without
     /// trigger motors drops those two.
     fn rumble(&mut self, slot: usize, motors: Motors);
@@ -168,6 +173,21 @@ fn fallback(keys: &[KeyState]) -> PadState {
         left_y: on(b'W') - on(b'S'),
         right_x: on(b'L') - on(b'J'),
         right_y: on(b'I') - on(b'K'),
+    }
+}
+
+/// `pad` with the stand-in pad's reading of `keys` pressed on top of it.
+fn press(pad: PadState, keys: &[KeyState]) -> PadState {
+    let extra = fallback(keys);
+    let stick = |a: f32, b: f32| (a + b).clamp(-1.0, 1.0);
+    PadState {
+        buttons: pad.buttons | extra.buttons,
+        left_trigger: pad.left_trigger.max(extra.left_trigger),
+        right_trigger: pad.right_trigger.max(extra.right_trigger),
+        left_x: stick(pad.left_x, extra.left_x),
+        left_y: stick(pad.left_y, extra.left_y),
+        right_x: stick(pad.right_x, extra.right_x),
+        right_y: stick(pad.right_y, extra.right_y),
     }
 }
 
@@ -363,6 +383,8 @@ struct State {
     queue: VecDeque<Event>,
     /// The one thread draining `queue`; other producers only append.
     deliverer: Option<ThreadId>,
+    /// The scripted keys of the last poll, to log each new press once.
+    scripted: Vec<u8>,
 }
 
 pub struct Hub {
@@ -409,6 +431,7 @@ impl Hub {
                 running: Vec::new(),
                 queue: VecDeque::new(),
                 deliverer: None,
+                scripted: Vec::new(),
             }),
             returned: Condvar::new(),
         }));
@@ -441,12 +464,12 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, scripted) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.scripted())
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self.state().poll(&self.devices, pads, keys, scripted);
         self.deliver(events);
     }
 
@@ -533,12 +556,38 @@ impl State {
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
-        pads: [Option<PadState>; PADS],
+        mut pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        scripted: Vec<u8>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         let any_pad = pads.iter().any(Option::is_some);
+        // Scripted keys press the pad the title reads. With no host pad that
+        // is the stand-in, which has them from `keys`. A host pad hides the
+        // stand-in (a receiver answers for its switched-off pad too), so
+        // they press the first one.
+        let target = pads.iter().position(Option::is_some).unwrap_or(FALLBACK);
+        if !scripted.is_empty()
+            && let Some(pad) = pads.get_mut(target).and_then(Option::as_mut)
+        {
+            let keys: Vec<KeyState> = scripted
+                .iter()
+                .map(|&virtual_key| KeyState {
+                    virtual_key,
+                    ..Default::default()
+                })
+                .collect();
+            *pad = press(*pad, &keys);
+        }
+        if scripted.iter().any(|vk| !self.scripted.contains(vk)) {
+            tracing::info!(
+                virtual_keys = format_args!("{scripted:02x?}"),
+                device = target,
+                "scripted keys pressed"
+            );
+        }
+        self.scripted = scripted;
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
@@ -1335,6 +1384,11 @@ mod host {
                 .collect()
         }
 
+        #[cfg(feature = "diagnostics")]
+        fn scripted(&mut self) -> Vec<u8> {
+            scripted()
+        }
+
         // shortcut: trigger motors are dropped (XInput has none). The host
         // API that drives them without a redistributable is
         // Windows.Gaming.Input (WinRT `Gamepad.Vibration`), which needs WinRT
@@ -1352,7 +1406,8 @@ mod host {
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
     /// 0.2 s that long after input starts, with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// `Left`, `Right` (the stand-in pad's table maps them to buttons, on the
+    /// stand-in or, while one is connected, on the first host pad).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
@@ -1537,6 +1592,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        scripted: Vec<u8>,
         rumble: Vec<(usize, Motors)>,
     }
 
@@ -1548,6 +1604,9 @@ mod tests {
         }
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
+        }
+        fn scripted(&mut self) -> Vec<u8> {
+            self.0.lock().unwrap().scripted.clone()
         }
         fn rumble(&mut self, slot: usize, motors: Motors) {
             self.0.lock().unwrap().rumble.push((slot, motors));
@@ -1875,6 +1934,53 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    #[test]
+    fn scripted_keys_press_the_first_host_pad_while_it_hides_the_stand_in() {
+        let (hub, host) = fake();
+        // A receiver answering for its switched-off pad: a pad at rest in
+        // slot 1, a pad held left in slot 3.
+        let held = PadState {
+            left_x: -0.5,
+            ..Default::default()
+        };
+        {
+            let mut host = host.lock().unwrap();
+            host.pads[1] = Some(PadState::default());
+            host.pads[3] = Some(held);
+            host.scripted = vec![0x0D, b'D'];
+            host.keys = vec![key(0x0D), key(b'D')];
+        }
+        hub.poll();
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, FALLBACK),
+            Err(DEVICE_DISCONNECTED)
+        );
+        let r = current(hub, GAMEPAD_KIND, 1).unwrap();
+        assert_eq!(
+            pad(r),
+            PadState {
+                buttons: A,
+                left_x: 1.0,
+                ..Default::default()
+            }
+        );
+        release(r);
+        let r = current(hub, GAMEPAD_KIND, 3).unwrap();
+        assert_eq!(pad(r), held);
+        release(r);
+
+        // Released, the pad reads what the host reports again.
+        {
+            let mut host = host.lock().unwrap();
+            host.scripted.clear();
+            host.keys.clear();
+        }
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 1).unwrap();
+        assert_eq!(pad(r), PadState::default());
+        release(r);
     }
 
     #[test]
