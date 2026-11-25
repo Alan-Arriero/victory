@@ -74,6 +74,14 @@ const fn vop2(op: u8, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
     (op as u32 & 0x3F) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
 }
 
+/// VOP3P `op vdst, src0, src1, src2` (no modifiers; all f32 sources).
+const fn vop3p(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    [
+        0x33 << 26 | (op as u32 & 0x3FF) << 16 | vdst as u32,
+        (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9 | (src2 as u32 & 0x1FF) << 18,
+    ]
+}
+
 /// MUBUF `buffer_store_dword vdata, off, s[srsrc:srsrc+3], 0 offset:byte_off`.
 const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
     [
@@ -1644,6 +1652,50 @@ fn cmp16_ignores_op_sel_as_rdna2_does() {
             );
         },
     );
+}
+
+/// `v_fma_mixlo_f16` / `v_fma_mixhi_f16` round the exact `a*b + c` once to
+/// binary16 (VIC-BT-041). An f32 FMA then `legacyF32ToF16` double-rounds the
+/// midpoint-tie class below to the even half.
+#[test]
+fn fma_mix_f16_single_rounds_midpoint_ties() {
+    let f = f32::to_bits;
+    // 1*1 + (2^-11 + 1 ulp): exact sits just above the 1 + 2^-11 midpoint.
+    let c = 0x3A00_0001u32;
+    // 2^-11 - 2^-30: exact sits just below the same midpoint.
+    let c_below = f(2.0f32.powi(-11) - 2.0f32.powi(-30));
+    let cases: &[([u32; 4], u32)] = &[
+        ([f(1.0), f(1.0), c, 0], 0x3C01),
+        ([f(-1.0), f(1.0), c | 0x8000_0000, 0], 0xBC01),
+        ([f(2.0), f(0.5), c, 0], 0x3C01),
+        ([f(1.0), f(1.0), c_below, 0], 0x3C00),
+        ([f(-1.0), f(1.0), c_below | 0x8000_0000, 0], 0xBC00),
+        ([f(2.0), f(0.5), c_below, 0], 0x3C00),
+        // Ordinary fused multiply-add still lands on the exact half.
+        ([f(2.0), f(3.0), f(1.0), 0], 0x4700), // 7.0
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    // v_fma_mixlo_f16 v0, v1, v2, v3
+    let lo = build_valu_cs(&vop3p(0x021, 0, vgpr(1), vgpr(2), vgpr(3)));
+    run_cases(&lo, &inputs, |backend, i, _, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            got as u16, want as u16,
+            "{backend}: v_fma_mixlo_f16 case {i} = {got:#06x}, want {want:#06x}"
+        );
+    });
+    // High half: seed v0's low half and check the result lands in bits 31:16.
+    let mut body = vec![vop1(0x001, 0, 255)]; // v_mov_b32 v0, lit
+    body.push(0x1234_5678);
+    body.extend_from_slice(&vop3p(0x022, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let hi = build_valu_cs(&body);
+    run_cases(&hi, &inputs, |backend, i, _, got| {
+        let want = cases[i].1 << 16 | 0x5678;
+        assert_eq!(
+            got, want,
+            "{backend}: v_fma_mixhi_f16 case {i} = {got:#010x}, want {want:#010x}"
+        );
+    });
 }
 
 #[test]
