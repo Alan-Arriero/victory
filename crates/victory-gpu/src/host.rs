@@ -2545,33 +2545,30 @@ type NtWrite = unsafe extern "system" fn(
 /// Through `NtWriteVirtualMemory`: the kernel refuses an unmapped
 /// destination page as it does a source page, without asking first for the
 /// destination's region, which `WriteProcessMemory` does at
-/// `VirtualQuery`'s cost (see [`copy_mapped`]). `WriteProcessMemory` makes
-/// the same copy when the symbol is missing.
+/// `VirtualQuery`'s cost (see [`copy_mapped`]). `WriteProcessMemory` is not
+/// a substitute here: it would make read-only pages writable for the copy,
+/// writing around the watch in [`crate::watch`] without the fault it needs.
+/// ntdll exports the symbol on every Windows, so a missing one leaves the
+/// copy back undone rather than patched up.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let nt = nt_write_virtual_memory();
+    let Some(call) = nt_write_virtual_memory() else {
+        return;
+    };
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
         // SAFETY: the source is our mapped host copy; the kernel checks the
         // destination.
         unsafe {
-            match nt {
-                // STATUS_SUCCESS only: a partial copy is a failure here too.
-                Some(call) => {
-                    call(
-                        GetCurrentProcess() as isize,
-                        at as _,
-                        from.cast(),
-                        n,
-                        &mut done,
-                    ) == 0
-                }
-                None => {
-                    WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0
-                }
-            }
+            // STATUS_SUCCESS only: a partial copy is a failure here too.
+            call(
+                GetCurrentProcess() as isize,
+                at as _,
+                from.cast(),
+                n,
+                &mut done,
+            ) == 0
         }
     };
     if len == 0 || write(dst as usize, len) {

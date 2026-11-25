@@ -91,9 +91,10 @@ fn thread_ids() -> Vec<u32> {
 }
 
 fn thread_name(handle: HANDLE, tid: u32) -> String {
+    use windows_sys::Win32::Foundation::LocalFree;
     let mut text: *mut u16 = std::ptr::null_mut();
-    // SAFETY: an open thread handle and an out pointer; the text is read
-    // to its NUL (and left allocated: a few bytes per thread).
+    // SAFETY: an open thread handle and an out pointer; the text is
+    // allocated by the call and freed below.
     unsafe {
         if GetThreadDescription(handle, &mut text) >= 0 && !text.is_null() {
             let mut n = 0;
@@ -101,6 +102,7 @@ fn thread_name(handle: HANDLE, tid: u32) -> String {
                 n += 1;
             }
             let name = String::from_utf16_lossy(std::slice::from_raw_parts(text, n));
+            LocalFree(text.cast());
             if !name.is_empty() {
                 return format!("{name}#{tid}");
             }
@@ -121,6 +123,38 @@ fn cpu_100ns(handle: HANDLE) -> u64 {
     filetime(&t[2]) + filetime(&t[3])
 }
 
+/// `CONTEXT` with the 16-byte alignment the x64 entry points write it with
+/// (`GetThreadContext`, `RtlVirtualUnwind`); windows-sys declares `CONTEXT`
+/// 8-aligned, so a plain local can sit 8 bytes off and every capture then
+/// fails silently.
+#[repr(align(16))]
+struct Aligned16(CONTEXT);
+
+/// Whether `[at, at + n)` lies inside one committed page run that is
+/// readable, so a read of it cannot fault.
+fn readable(at: usize, n: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    if at.checked_add(n).is_none() {
+        return false;
+    }
+    // SAFETY: plain queries with our buffers; `zeroed` is all-bits-zero valid
+    // for this structure.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a plain query with our buffer.
+    let got = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    if got == 0 {
+        return false;
+    }
+    let base = info.BaseAddress as usize;
+    let protect = info.Protect as u32;
+    info.State == MEM_COMMIT
+        && protect & (PAGE_GUARD | PAGE_NOACCESS) == 0
+        && at >= base
+        && at + n <= base.saturating_add(info.RegionSize)
+}
+
 /// The call stack of a thread, innermost first, zero-padded. The thread is
 /// suspended meanwhile; nothing here allocates or locks.
 fn capture(handle: HANDLE) -> Option<Stack> {
@@ -131,9 +165,10 @@ fn capture(handle: HANDLE) -> Option<Stack> {
         if SuspendThread(handle) == u32::MAX {
             return None;
         }
-        let mut ctx: CONTEXT = std::mem::zeroed();
+        let mut aligned = Aligned16(std::mem::zeroed());
+        let ctx = &mut aligned.0;
         ctx.ContextFlags = CONTEXT_FULL;
-        if GetThreadContext(handle, &mut ctx) != 0 {
+        if GetThreadContext(handle, ctx) != 0 {
             for slot in &mut stack {
                 if ctx.Rip == 0 {
                     break;
@@ -143,7 +178,13 @@ fn capture(handle: HANDLE) -> Option<Stack> {
                 let entry = RtlLookupFunctionEntry(ctx.Rip, &mut base, std::ptr::null_mut());
                 if entry.is_null() {
                     // A leaf without unwind data: the return address is on top.
-                    ctx.Rip = *(ctx.Rsp as *const u64);
+                    // After a bad unwind `Rsp` can point anywhere, so the read
+                    // only happens inside a committed, guard-free page.
+                    let rsp = ctx.Rsp as usize;
+                    if !readable(rsp, 8) {
+                        break;
+                    }
+                    ctx.Rip = *(rsp as *const u64);
                     ctx.Rsp += 8;
                 } else {
                     let mut data = std::ptr::null_mut();
@@ -153,7 +194,7 @@ fn capture(handle: HANDLE) -> Option<Stack> {
                         base,
                         ctx.Rip,
                         entry,
-                        &mut ctx,
+                        ctx,
                         &mut data,
                         &mut frame,
                         std::ptr::null_mut(),
@@ -218,9 +259,11 @@ fn symbolize(addr: u64) -> String {
 
 fn run(period: Duration) {
     // SAFETY: symbol handling for our own process, used from this thread only.
+    // No invade: loading every module's symbols at startup is what made this
+    // unsafe to run beside anything else using dbghelp.
     unsafe {
         SymSetOptions(0x2 | 0x4); // SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS
-        SymInitialize(GetCurrentProcess(), std::ptr::null(), 1);
+        SymInitialize(GetCurrentProcess(), std::ptr::null(), 0);
     }
     // SAFETY: no arguments and no failure: the calling thread's own id.
     let me = unsafe { GetCurrentThreadId() };
