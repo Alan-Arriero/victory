@@ -6629,6 +6629,63 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.bin(c, Bin::Mul, a, b);
                 self.s.m.bin(c, Bin::Add, m, d)
             }
+            // 16×16→32 multiply-add: op_sel[0]/[1] pick high/low halves of
+            // src0/src1; src2 is a full 32-bit addend. Clamp stays refused.
+            "v_mad_u32_u16" | "v_mad_i32_i16" => {
+                let (mut a, mut b, d) = (
+                    self.half_src_i16(inst, 0)?,
+                    self.half_src_i16(inst, 1)?,
+                    s(self, 2)?,
+                );
+                if name == "v_mad_i32_i16" {
+                    let sh = k(self, 16);
+                    let sext = |l: &mut Self, x: V| {
+                        let t = l.s.m.bin(c, Bin::Shl, x, sh);
+                        l.s.m.bin(c, Bin::AShr, t, sh)
+                    };
+                    a = sext(self, a);
+                    b = sext(self, b);
+                }
+                let m = self.s.m.bin(c, Bin::Mul, a, b);
+                self.s.m.bin(c, Bin::Add, m, d)
+            }
+            // Packed 4×8-bit unsigned average; per-byte rounding bit from src2:
+            // dst.u8[i] = (src0.u8[i] + src1.u8[i] + (src2.u8[i] & 1)) >> 1.
+            "v_lerp_u8" => {
+                let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let (mff, one) = (k(self, 0xFF), k(self, 1));
+                let mut out = k(self, 0);
+                for i in 0..4u32 {
+                    let (ai, bi, di) = if i == 0 {
+                        (a, b, d)
+                    } else {
+                        let sh = k(self, i * 8);
+                        (
+                            self.s.m.bin(c, Bin::LShr, a, sh),
+                            self.s.m.bin(c, Bin::LShr, b, sh),
+                            self.s.m.bin(c, Bin::LShr, d, sh),
+                        )
+                    };
+                    let ai = self.s.m.bin(c, Bin::And, ai, mff);
+                    let bi = self.s.m.bin(c, Bin::And, bi, mff);
+                    let di = self.s.m.bin(c, Bin::And, di, one);
+                    let sum = self.s.m.bin(c, Bin::Add, ai, bi);
+                    let sum = self.s.m.bin(c, Bin::Add, sum, di);
+                    let avg = self.s.m.bin(c, Bin::LShr, sum, one);
+                    let byte = if i == 0 {
+                        avg
+                    } else {
+                        let sh = k(self, i * 8);
+                        self.s.m.bin(c, Bin::Shl, avg, sh)
+                    };
+                    out = if i == 0 {
+                        byte
+                    } else {
+                        self.s.m.bin(c, Bin::Or, out, byte)
+                    };
+                }
+                out
+            }
             "v_min3_i32" | "v_max3_i32" | "v_min3_u32" | "v_max3_u32" | "v_med3_i32"
             | "v_med3_u32" => {
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
@@ -9929,6 +9986,38 @@ mod tests {
         for words in [add, sub] {
             lowers(&words, 0).unwrap();
         }
+    }
+
+    /// `v_mad_u32_u16` / `v_mad_i32_i16` (with op_sel halves) and `v_lerp_u8`
+    /// lower (#405). An LDS store keeps the result live.
+    #[test]
+    fn mad_32_16_and_lerp_u8_lower() {
+        let vop3 = |op: u16, opsel: u8, vdst: u8, s0: u32, s1: u32, s2: u32| -> [u32; 2] {
+            [
+                0x35 << 26 | (op as u32 & 0x3FF) << 16 | (opsel as u32 & 0xF) << 11 | vdst as u32,
+                (s0 & 0x1FF) | (s1 & 0x1FF) << 9 | (s2 & 0x1FF) << 18,
+            ]
+        };
+        let (v0, v1, v2) = (256u32, 257, 258);
+        let store = |op_words: [u32; 2]| {
+            let mut words = vec![
+                0x7E00_0283, // v_mov_b32 v0, 3
+                0x7E02_0285, // v_mov_b32 v1, 5
+                0x7E04_0287, // v_mov_b32 v2, 7
+            ];
+            words.extend_from_slice(&op_words);
+            words.extend_from_slice(&[
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0xD834_0000,
+                0x0000_0003, // ds_write_b32 v3, v0
+                S_ENDPGM,
+            ]);
+            lowers_lds(&words).unwrap();
+        };
+        store(vop3(0x373, 0, 0, v0, v1, v2)); // v_mad_u32_u16
+        store(vop3(0x373, 0b0011, 0, v0, v1, v0)); // opsel hi halves
+        store(vop3(0x375, 0, 0, v0, v1, v2)); // v_mad_i32_i16
+        store(vop3(0x14d, 0, 0, v0, v1, v2)); // v_lerp_u8
     }
 
     /// VOP3 integer `clamp` is unsigned saturation on carry/non-carry add/sub
