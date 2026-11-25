@@ -311,15 +311,28 @@ pub fn translate_with_view_strides(
     translate_program(container, allow_wave32, Some(view_stride))
 }
 
+/// A precompiled compute module (`FSPX`): only GFX10 code, no DXIL to start from.
+const FSPX_UNSUPPORTED: ShaderError = ShaderError::Unsupported {
+    offset: 0,
+    what: "FSPX compute module",
+};
+
 fn translate_program(
     container: &[u8],
     allow_wave32: bool,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<(HostShader, Vec<crate::UsedResource>), ShaderError> {
+    if container.starts_with(crate::dxbc::Fspx::MAGIC) {
+        return Err(FSPX_UNSUPPORTED);
+    }
     let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let Some(dxil) = c.part(FourCC::DXIL) else {
+        return Err(if c.fspx().is_some() {
+            FSPX_UNSUPPORTED
+        } else {
+            ShaderError::Malformed("no DXIL part")
+        });
+    };
     let native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
@@ -747,6 +760,27 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::{parse_loop_limit, parse_shader_opt};
+
+    #[test]
+    fn fspx_modules_are_unsupported_not_missing_dxil() {
+        let fspx = crate::dxbc::Fspx::assemble(&[0; 28], &[], &[0x55; 8], &[]);
+        let wrapped = crate::dxbc::build(&[(crate::FourCC::ACCC, &fspx)]);
+        for bytes in [&fspx, &wrapped] {
+            assert_eq!(
+                super::translate(bytes).unwrap_err(),
+                crate::ShaderError::Unsupported {
+                    offset: 0,
+                    what: "FSPX compute module"
+                }
+            );
+        }
+        // Without an FSPX module it is still the missing DXIL part.
+        let plain = crate::dxbc::build(&[(crate::FourCC::ACCC, b"other")]);
+        assert_eq!(
+            super::translate(&plain).unwrap_err(),
+            crate::ShaderError::Malformed("no DXIL part")
+        );
+    }
 
     #[test]
     fn the_shader_opt_switch_parses_or_falls_back() {
