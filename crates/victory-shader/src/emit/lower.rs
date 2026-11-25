@@ -17,8 +17,17 @@ use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
-use crate::resource::{Address, CODE, Resources, Role, Site, Source};
+use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
+
+/// The ray-tracing node test (`image_bvh_intersect_ray`), a child module so
+/// its arithmetic sits apart from the general emitter.
+#[path = "intersect.rs"]
+pub(super) mod intersect;
+
+/// Title-memory addressing, a child module for the same reason.
+#[path = "lower_memory.rs"]
+mod lower_memory;
 
 type Why = &'static str;
 
@@ -542,6 +551,11 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        // A POPS pixel program waits for the earlier waves that cover its
+        // pixels before its UAV accesses. The host orders a rasterizer-ordered
+        // view's accesses between overlapping pixels itself.
+        s.rov = matches!(&x.native.io, StageIo::Ps { rsrc2, .. }
+            if rsrc2.collision_wave_id_sgpr().is_some());
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -802,6 +816,9 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if self.scalar.get(&(b, i)).is_some_and(|a| a.param == MEMORY) {
+            return self.memory_flat(inst, b, i);
+        }
         let rest = name
             .strip_prefix("global_load_")
             .ok_or("a global memory write")?;
@@ -1368,6 +1385,14 @@ impl<'a> Lower<'a> {
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            // M0 for `v_interp`, which takes the primitive's parameters from
+            // the signature here, so no lowering reads the value. A phi can
+            // still join it with the register's reuse on another path (an
+            // address's high dword set to 0) and needs a value then.
+            Input::PrimMask => return Val::I32(self.s.m.i32(0)),
+            // Bit 31 clear: the wave overlaps no earlier one, so it does not
+            // wait. Its UAV handles are rasterizer ordered instead.
+            Input::CollisionWaveId => return Val::I32(self.s.m.i32(0)),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()
@@ -1397,15 +1422,6 @@ impl<'a> Lower<'a> {
                     &[],
                 ));
             }
-            // M0 for `v_interp`, which takes the primitive's parameters from
-            // the signature here, so no lowering reads the value. A phi can
-            // still join it with the register's reuse on another path and
-            // needs a value then.
-            Input::PrimMask => return Val::I32(self.s.m.i32(0)),
-            // shortcut: bit 31 clear says the wave overlaps no earlier one,
-            // so a POPS program skips its own wait (see `pops`) and its UAV
-            // accesses are not ordered between overlapping pixels.
-            Input::CollisionWaveId => return Val::I32(self.s.m.i32(0)),
             _ => return Val::Missing("a pixel system input"),
         };
         let free = self
@@ -1588,6 +1604,46 @@ impl<'a> Lower<'a> {
         Val::I32(self.user_word(index))
     }
 
+    /// A user-data dword no register of the console's holds: one the host
+    /// computes when it binds (`root` says what, an `Other` code of
+    /// `shader.rs`), placed after the layout's own dwords.
+    fn host_word(&mut self, root: RootType, slot: u8, dword: u32) -> V {
+        let known = self
+            .user_reads
+            .values()
+            .find(|u| u.root == root && u.slot == slot && u.dword == dword)
+            .map(|u| u.index);
+        let index = match known {
+            Some(index) => index,
+            None => {
+                let mut index = self
+                    .x
+                    .native
+                    .layout
+                    .iter()
+                    .map(|e| u32::from(e.user_data) + e.sgprs)
+                    .max()
+                    .unwrap_or(0);
+                while self.user_reads.contains_key(&index) {
+                    index += 1;
+                }
+                self.user_reads.insert(
+                    index,
+                    UserData {
+                        indexed_buffer: false,
+                        index,
+                        slot,
+                        root,
+                        dword,
+                    },
+                );
+                index
+            }
+        };
+        self.user_word(index)
+    }
+
+    /// User-data dword `index`, loaded in the entry block.
     fn user_word(&mut self, index: u32) -> V {
         self.s.user_data = self.s.user_data.max(index + 1);
         let h = match self.user_data {
@@ -1793,21 +1849,15 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
-            // `src_pops_exiting_wave_id`: only compared with the fields of
-            // the collision wave id, which reads as overlapping no wave.
-            Operand::Const(239) if self.pops() => Ok(self.s.m.i32(0)),
+            // `src_pops_exiting_wave_id`: only compared with the collision
+            // wave id's fields, which a wave that overlaps none never reads.
+            Operand::Const(239) if self.s.rov => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
             Operand::Literal(x) => Ok(self.s.m.i32(x)),
             Operand::Attr { .. } => Err("an attribute operand"),
         }
-    }
-
-    /// Whether this is a pixel program that loads the POPS collision wave id.
-    fn pops(&self) -> bool {
-        matches!(&self.x.native.io, StageIo::Ps { rsrc2, .. }
-            if rsrc2.collision_wave_id_sgpr().is_some())
     }
 
     /// GFX10 puts an inline f16 constant in the low half of the operand.
@@ -3269,6 +3319,19 @@ impl<'a> Lower<'a> {
             Fields::Valu(_) if name.starts_with("v_interp_") => self.interp(inst, (b, i)),
             Fields::Valu(_) => self.valu(inst, b, i),
             Fields::Vintrp { .. } => self.interp(inst, (b, i)),
+            // The ray and node test. A failure is a refusal at once: an
+            // instruction without a side effect otherwise only stops the
+            // program where its results are needed.
+            Fields::Image { .. } if name.starts_with("image_bvh") => {
+                // A query whose structure was traced is intersected for
+                // real; one that was not lowers as a miss.
+                if self.x.res.bvh.iter().any(|n| n.0 == (b, i)) {
+                    return self.bvh(inst, b, i).map_err(|why| unsupported(offset, why));
+                }
+                return self
+                    .image(inst, b, i)
+                    .map_err(|why| unsupported(offset, why));
+            }
             Fields::Image { .. } => self.image(inst, b, i),
             Fields::Buffer { .. } => self.buffer(inst, b, i),
             Fields::Exp { .. } => self.export(b, i),
@@ -3877,6 +3940,9 @@ impl<'a> Lower<'a> {
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
+        if self.scalar.get(&site).is_some_and(|a| a.param == MEMORY) {
+            return self.memory_smem(inst);
+        }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
         };
@@ -4203,6 +4269,8 @@ impl<'a> Lower<'a> {
                 || used.is_some_and(|u| u.kind == ResourceType::Uav);
             let u = if uav { 0x1000 } else { 0 };
             let (props, image) = match &ui.fields {
+                // A ray-tracing structure in a buffer of the host: read raw.
+                Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
                 Fields::Image { dim, .. } => {
                     let kind = match dim {
                         0 => 1,
@@ -10505,8 +10573,8 @@ mod tests {
             used: vec![],
             io: StageIo::Ps {
                 inputs: vec![],
-                input_addr: 0,
                 rsrc2: Default::default(),
+                input_addr: 0,
                 db_shader_control: 0,
                 patches: vec![],
             },
@@ -12107,6 +12175,7 @@ mod tests {
                 rsrc2: Default::default(),
                 db_shader_control: 0,
                 patches: vec![],
+                rsrc2: Default::default(),
             },
             code,
         };
