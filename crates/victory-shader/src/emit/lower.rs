@@ -42,6 +42,8 @@ pub(crate) struct Lowered {
     pub has_isnan_op: bool,
     #[cfg(test)]
     pub has_fcmp_uno: bool,
+    #[cfg(test)]
+    pub has_fcmp_oeq: bool,
     /// Whether the program reads the pixel coverage mask.
     #[cfg(test)]
     pub has_coverage_op: bool,
@@ -1227,6 +1229,8 @@ impl<'a> Lower<'a> {
         #[cfg(test)]
         let has_fcmp_uno = self.s.m.has_cmp(pred::UNO);
         #[cfg(test)]
+        let has_fcmp_oeq = self.s.m.has_cmp(pred::OEQ);
+        #[cfg(test)]
         let has_coverage_op = self.s.m.has_dx_op("dx.op.coverage.i32", 91);
         Ok(Lowered {
             #[cfg(test)]
@@ -1260,6 +1264,8 @@ impl<'a> Lower<'a> {
             has_isnan_op,
             #[cfg(test)]
             has_fcmp_uno,
+            #[cfg(test)]
+            has_fcmp_oeq,
             #[cfg(test)]
             has_coverage_op,
         })
@@ -2432,11 +2438,17 @@ impl<'a> Lower<'a> {
             0 => {}
             k => {
                 let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(k)];
-                let c = self.s.m.f32(factor.to_bits());
-                f = self.s.m.bin(self.cur, Bin::Mul, f, c);
+                let c = self.cur;
+                let scale = self.s.m.f32(factor.to_bits());
+                f = self.s.m.bin(c, Bin::Mul, f, scale);
                 if flush_denorms {
                     f = self.flush_f32_subnormal(f);
                 }
+                // RDNA2 omod (mul:2/mul:4/div:2) flushes -0.0 to +0.0;
+                // IEEE FMul keeps the sign of zero.
+                let zero = self.s.m.f32(0);
+                let is_zero = self.s.m.cmp(c, pred::OEQ, f, zero);
+                f = self.s.m.select(c, is_zero, zero, f);
             }
         }
         if v.clamp {
@@ -9593,6 +9605,35 @@ mod tests {
             !lowered.has_fcmp_uno,
             "v_med3_f32 must not emit fcmp uno (folded away by some drivers)"
         );
+    }
+
+    /// VOP3 `v_add_f32` with output modifier `omod` in bits 28:27 of word 1.
+    fn v_add_f32_omod(omod: u8) -> [u32; 3] {
+        let src0 = 256 + 1u32;
+        let src1 = 256 + 2u32;
+        [
+            // VOP3 opcode 0x103 = VOP2 v_add_f32 (0x003) at the VOP2 base.
+            0x35 << 26 | (0x103u32 << 16),
+            src0 | (src1 << 9) | (u32::from(omod) & 3) << 27,
+            S_ENDPGM,
+        ]
+    }
+
+    #[test]
+    fn write_f_omod_flushes_neg_zero_with_fcmp_oeq() {
+        // Plain add has no signed-zero flush; omod must compare against +0.
+        let plain = lower_words(&v_add_f32_omod(0), 0).unwrap();
+        assert!(
+            !plain.has_fcmp_oeq,
+            "v_add_f32 without omod must not emit fcmp oeq"
+        );
+        for omod in 1..=3 {
+            let lowered = lower_words(&v_add_f32_omod(omod), 0).unwrap();
+            assert!(
+                lowered.has_fcmp_oeq,
+                "v_add_f32 omod={omod} must emit fcmp oeq to flush -0.0"
+            );
+        }
     }
 
     /// A pixel shader that exports `v0` as a render-target colour, with
