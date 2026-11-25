@@ -331,8 +331,15 @@ const LANE_MASK: Why = "a lane mask read as data";
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 /// Samples whose level comes from derivatives across each quad of lanes.
+/// Clamp and offset tokens (`_cl`, `_o`) keep that; explicit LOD, gradients,
+/// and comparison forms do not.
 fn implicit_derivatives(name: &str) -> bool {
-    matches!(name, "image_sample" | "image_sample_b")
+    let Some(rest) = name.strip_prefix("image_sample") else {
+        return false;
+    };
+    !rest
+        .split('_')
+        .any(|t| matches!(t, "l" | "lz" | "d" | "cd" | "c" | "g16"))
 }
 
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -7072,7 +7079,9 @@ impl<'a> Lower<'a> {
         let (op, sample) = match base_name {
             "image_sample" | "image_sample_cl" | "image_sample_o" => (60, true),
             "image_sample_lz" | "image_sample_l" | "image_sample_lz_o" => (62, true),
-            "image_sample_b" | "image_sample_b_cl" => (61, true),
+            "image_sample_b" | "image_sample_b_cl" | "image_sample_b_o" | "image_sample_b_cl_o" => {
+                (61, true)
+            }
             "image_sample_c_lz" => (65, true),
             "image_sample_d" | "image_sample_d_cl" | "image_sample_d_o" | "image_sample_d_cl_o" => {
                 (63, true)
@@ -7168,6 +7177,17 @@ impl<'a> Lower<'a> {
                     l.as_float(x)
                 }
             };
+            // Bias is a whole VGPR even with a16; only its low half is the f16.
+            let bias_float = |l: &mut Self| -> Result<V, Why> {
+                let bias = addr_u32(l, usize::from(offset_word))?;
+                if *a16 {
+                    let mask = l.s.m.i32(0xFFFF);
+                    let lo = l.s.m.bin(l.cur, Bin::And, bias, mask);
+                    Ok(to_float(l, lo))
+                } else {
+                    Ok(l.as_float(bias))
+                }
+            };
             let grad_float = |l: &mut Self, x: V| {
                 if g16 {
                     let f = l.s.t.f32;
@@ -7240,7 +7260,7 @@ impl<'a> Lower<'a> {
             } else {
                 fu
             };
-            if matches!(op, 60 | 63) && offset_word {
+            if matches!(op, 60 | 61 | 63) && offset_word {
                 // DXIL takes immediate offsets in -8..=7; the console's are
                 // 6-bit and may be computed.
                 let w = addr_u32(self, 0)?;
@@ -7268,8 +7288,7 @@ impl<'a> Lower<'a> {
                     // them by 2^bias, the same level for isotropic filtering.
                     self.cross_lane(true)?;
                     let scale = if op == 61 {
-                        let bias = addr_val(self, 0)?;
-                        let bias = self.as_float(bias);
+                        let bias = bias_float(self)?;
                         Some(self.unary(21, bias))
                     } else {
                         None
@@ -7277,7 +7296,7 @@ impl<'a> Lower<'a> {
                     let g = self.quad_gradients(&cs[..spatial], scale);
                     args.extend(&os);
                     args.extend(g);
-                    args.push(fu);
+                    args.push(clamp);
                     self.s.op(
                         c,
                         "sampleGrad.f32",
@@ -7294,16 +7313,7 @@ impl<'a> Lower<'a> {
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
-                    // With a16, bias occupies a full VGPR but holds an f16 in
-                    // its low 16 bits (upper half undefined).
-                    let bias = addr_u32(self, usize::from(offset_word))?;
-                    let bias = if *a16 {
-                        let mask = self.s.m.i32(0xFFFF);
-                        let lo = self.s.m.bin(c, Bin::And, bias, mask);
-                        to_float(self, lo)
-                    } else {
-                        self.as_float(bias)
-                    };
+                    let bias = bias_float(self)?;
                     args.extend(&os);
                     args.extend([bias, clamp]);
                     self.s.op(
@@ -9941,6 +9951,43 @@ mod tests {
         for (op, a16, dwords) in [(0x32, false, 7), (0xB2, true, 4)] {
             #[cfg_attr(not(windows), allow(unused_variables))]
             let l = lower_gradient_sample(op, a16, dwords, true).unwrap();
+            #[cfg(windows)]
+            if let Ok(mut v) = super::super::validator::Validator::load(
+                super::super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut l.dxil.clone())
+                    .expect("DXIL validation failed");
+            }
+        }
+    }
+
+    #[test]
+    fn biased_sample_reads_whole_bias_vgpr_and_packed_a16_coords() {
+        // 2D image_sample_b (0x25) and image_sample_b_o (0x35): bias (and
+        // the offset word) stay whole VGPRs; a16 only packs the coordinates.
+        for (op, a16, dwords, offsets) in [
+            (0x25, false, 3, false),
+            (0x25, true, 2, false),
+            (0x35, false, 4, true),
+            (0x35, true, 3, true),
+            (0x26, false, 4, false),
+            (0x26, true, 3, false),
+            (0x36, false, 5, true),
+            (0x36, true, 4, true),
+        ] {
+            let l = lower_gradient_sample(op, a16, dwords, offsets)
+                .unwrap_or_else(|e| panic!("op {op:#x} a16 {a16}: {e:?}"));
+            let want: Vec<usize> = (0..dwords).collect();
+            assert_eq!(address_reads(&l), want, "op {op:#x} a16 {a16}");
+            assert_eq!(l.widens_f16, a16, "op {op:#x} a16 {a16} f16 widen");
+        }
+    }
+
+    #[test]
+    fn biased_a16_sample_validates_as_dxil() {
+        for (op, dwords, offsets) in [(0x25, 2, false), (0x35, 3, true)] {
+            #[cfg_attr(not(windows), allow(unused_variables))]
+            let l = lower_gradient_sample(op, true, dwords, offsets).unwrap();
             #[cfg(windows)]
             if let Ok(mut v) = super::super::validator::Validator::load(
                 super::super::validator::Validator::default_path().as_deref(),
