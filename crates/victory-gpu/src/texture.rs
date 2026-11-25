@@ -195,7 +195,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 let dropped = from_mips - to_mips;
                 if dropped > 0
                     && (of_to.Width != (of_from.Width >> dropped).max(1)
-                        || u32::from(of_to.Height) != (u32::from(of_from.Height) >> dropped).max(1))
+                        || of_to.Height != (of_from.Height >> dropped).max(1))
                 {
                     return false;
                 }

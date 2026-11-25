@@ -1327,9 +1327,9 @@ fn host_texture(
     Some((texture, initial, dropped))
 }
 
-/// Tests: host textures wider than this fail with `E_OUTOFMEMORY` before
-/// reaching the host, as an exhausted adapter would refuse them. Thread-local
-/// so parallel GPU tests are not refused by another test's threshold.
+// Tests: host textures wider than this fail with `E_OUTOFMEMORY` before
+// reaching the host, as an exhausted adapter would refuse them. Thread-local
+// so parallel GPU tests are not refused by another test's threshold.
 #[cfg(all(test, windows))]
 std::thread_local! {
     static SYNTHETIC_OOM_ABOVE: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
