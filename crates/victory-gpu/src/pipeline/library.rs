@@ -77,33 +77,96 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            device
+                .CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?
+                .cast()
         }
     };
     if !blob.is_empty() {
         match make(&blob) {
             Ok(library) => {
                 tracing::info!(bytes = blob.len(), "host pipeline library loaded");
-                return Some(Library { library, _blob: blob, added: 0 });
+                return Some(Library {
+                    library,
+                    _blob: blob,
+                    added: 0,
+                });
             }
-            Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
+            Err(e) => {
+                tracing::info!(error = %e, "host pipeline library rejected; starting an empty one")
+            }
         }
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
     }
-    let library = make(&[]).ok()?;
-    Some(Library { library, _blob: Vec::new(), added: 0 })
+    // An empty library is asked for with no blob at all, which `make` cannot
+    // say: an empty slice still has an address, and vkd3d-proton refuses an
+    // address with no bytes behind it. That left it with no library at all.
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: no blob is read; a success that wrote a pointer wrote an owned
+    // ID3D12PipelineLibrary.
+    let made = unsafe {
+        (Interface::vtable(device).CreatePipelineLibrary)(
+            Interface::as_raw(device),
+            std::ptr::null(),
+            0,
+            &ID3D12PipelineLibrary::IID,
+            &mut raw,
+        )
+        .ok()
+        .and_then(|()| {
+            if raw.is_null() {
+                return Err(windows::Win32::Foundation::E_POINTER.into());
+            }
+            ID3D12PipelineLibrary::from_raw(raw).cast::<ID3D12PipelineLibrary1>()
+        })
+    };
+    match made {
+        Ok(library) => Some(Library {
+            library,
+            _blob: Vec::new(),
+            added: 0,
+        }),
+        Err(e) => {
+            tracing::info!(error = %e, "the host refused an empty pipeline library");
+            None
+        }
+    }
 }
 
 /// A pipeline's name in the library: the hash of what its host
 /// description holds.
 pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> String {
     let mut h = blake3::Hasher::new();
-    for part in [kind.as_bytes(), root].into_iter().chain(code.iter().copied()).chain([state.as_bytes()]) {
+    for part in [kind.as_bytes(), root]
+        .into_iter()
+        .chain(code.iter().copied())
+        .chain([state.as_bytes()])
+    {
         h.update(&(part.len() as u64).to_le_bytes());
         h.update(part);
     }
     h.finalize().to_hex()[..32].to_owned()
+}
+
+/// Exact library names from the host pipeline trace. Names describe both
+/// translated stages and fixed-function state, so a shader shared with a
+/// different pipeline can still be used there.
+#[cfg(feature = "diagnostics")]
+fn excluded_names(value: &str) -> HashSet<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .filter_map(|id| {
+            if id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                Some(id.to_ascii_lowercase())
+            } else {
+                tracing::warn!(id, "VICTORY_SKIP_HOST_PSOS expects 32-digit pipeline names");
+                None
+            }
+        })
+        .collect()
 }
 
 /// The pipeline named `name`: loaded from the library by `load` if it is
@@ -113,12 +176,36 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    #[cfg(feature = "diagnostics")]
+    {
+        static EXCLUDED: OnceLock<HashSet<String>> = OnceLock::new();
+        let excluded = EXCLUDED.get_or_init(|| {
+            excluded_names(&std::env::var("VICTORY_SKIP_HOST_PSOS").unwrap_or_default())
+        });
+        if excluded.contains(name) {
+            tracing::warn!(name, "skipping configured host pipeline");
+            return Err(windows::Win32::Foundation::E_ABORT.into());
+        }
+        static TRACE: OnceLock<bool> = OnceLock::new();
+        if *TRACE.get_or_init(|| crate::switch::on("VICTORY_TRACE_PIPELINES")) {
+            // SAFETY: queries the calling thread without accessing caller memory.
+            let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+            tracing::info!(
+                tid = format_args!("{tid:04x}"),
+                name,
+                "loading or compiling host pipeline"
+            );
+        }
+    }
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
-    if let Ok(pso) = load(&library.lock().unwrap_or_else(|e| e.into_inner()).library, PCWSTR(wide.as_ptr())) {
+    if let Ok(pso) = load(
+        &library.lock().unwrap_or_else(|e| e.into_inner()).library,
+        PCWSTR(wide.as_ptr()),
+    ) {
         LOADED.fetch_add(1, Ordering::Relaxed);
         return Ok(pso);
     }
@@ -137,19 +224,21 @@ pub(crate) fn pipeline(
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
+    // Held over serialisation and both writes, so overlapping saves cannot
+    // replace files under each other.
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
-    {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-            return;
-        }
-        *last = Some(std::time::Instant::now());
+    let (Some(dir), Some(library)) = (DIR.get(), library()) else {
+        return;
+    };
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        return;
     }
-    let blob = {
-        let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !USED_CHANGED.swap(false, Ordering::Relaxed) {
+    *last = Some(std::time::Instant::now());
+    let (blob, saved_additions) = {
+        let l = library.lock().unwrap_or_else(|e| e.into_inner());
+        if l.added == 0 && !USED_CHANGED.load(Ordering::Relaxed) {
             return;
         }
         // SAFETY: a buffer of the size the library asks for.
@@ -158,39 +247,65 @@ pub(crate) fn save(now: bool) {
             l.library.Serialize(&mut bytes).map(|()| bytes)
         };
         match bytes {
-            Ok(bytes) => {
-                l.added = 0;
-                bytes
-            }
+            Ok(bytes) => (bytes, l.added),
             Err(e) => {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
                 return;
             }
         }
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+    let used: Vec<String> = USED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
     let written = std::fs::create_dir_all(dir)
         .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
-        Ok(()) => tracing::info!(
-            bytes = blob.len(),
-            early = used.len(),
-            made = MADE.load(Ordering::Relaxed),
-            loaded = LOADED.load(Ordering::Relaxed),
-            started_early = EARLY.load(Ordering::Relaxed),
-            "host pipeline library saved"
-        ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Ok(()) => {
+            let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+            // Keep pipelines stored while the files were being written.
+            l.added = l.added.saturating_sub(saved_additions);
+            tracing::info!(
+                bytes = blob.len(),
+                early = used.len(),
+                made = MADE.load(Ordering::Relaxed),
+                loaded = LOADED.load(Ordering::Relaxed),
+                started_early = EARLY.load(Ordering::Relaxed),
+                "host pipeline library saved"
+            );
+        }
+        Err(e) => {
+            // At least one cache file was not published. Keep the counters
+            // dirty for the next save.
+            if used_changed {
+                USED_CHANGED.store(true, Ordering::Relaxed);
+            }
+            tracing::warn!(error = %e, "host pipeline library not saved");
+        }
     }
 }
 
-/// Writes `bytes` to a temporary file beside `path`, then renames it over
-/// `path`: a reader never sees a part.
+/// Writes `bytes` to a unique temporary file beside `path`, then renames it
+/// over `path`: a reader never sees a part, and overlapping saves do not
+/// share a temporary file.
 fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let extension = format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    let tmp = path.with_extension(extension);
+    let written = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Title pipeline keys drawn or dispatched with (this run and the last).
@@ -204,7 +319,11 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
             .get()
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
-        let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
+        let set: HashSet<String> = listed
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect();
         tracing::info!(pipelines = set.len(), "title pipelines to start early");
         *used = Some(set);
     }
@@ -241,14 +360,108 @@ mod tests {
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
     }
 
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn excluded_names_match_whole_host_descriptions() {
+        let a = name("mesh", b"root", &[b"ms", b"ps"], "one");
+        let b = name("mesh", b"root", &[b"ms", b"ps"], "two");
+        let value = format!(" , {},{}, {}, x", a.to_uppercase(), &b[..16], a);
+        assert_eq!(excluded_names(&value), HashSet::from([a]));
+        assert!(excluded_names("").is_empty());
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn an_excluded_pipeline_skips_both_driver_calls() {
+        // The process reads the setting once. Use a child so other tests can
+        // exercise the normal path in the same suite.
+        let key = name("mesh", b"root", &[b"ms", b"ps"], "test");
+        if std::env::var("VICTORY_SKIP_HOST_PSOS").as_deref() != Ok(&key) {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pipeline::library::tests::an_excluded_pipeline_skips_both_driver_calls",
+                ])
+                .env("VICTORY_SKIP_HOST_PSOS", &key)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+            return;
+        }
+        let result = pipeline(
+            &key,
+            |_, _| panic!("library touched"),
+            || panic!("driver called"),
+        );
+        assert_eq!(
+            result.unwrap_err().code(),
+            windows::Win32::Foundation::E_ABORT
+        );
+    }
+
     #[test]
     fn a_rejected_blob_gives_an_empty_library() {
-        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
+        else {
             return; // no host GPU here
         };
-        let library = open(&device, b"not a pipeline library".repeat(16)).expect("an empty library");
+        let library =
+            open(&device, b"not a pipeline library".repeat(16)).expect("an empty library");
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(library._blob.is_empty());
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_publish_one_complete_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut threads = Vec::new();
+        for thread in 0..8 {
+            let path = path.clone();
+            let start = start.clone();
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                let byte = thread as u8 + 1;
+                for _ in 0..32 {
+                    write_atomically(&path, &[byte; 64 * 1024]).unwrap();
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let published = std::fs::read(&path).unwrap();
+        assert_eq!(published.len(), 64 * 1024);
+        assert!(published.iter().all(|&byte| byte == published[0]));
+        assert!((1..=8).contains(&published[0]));
+        assert!(
+            !std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+        );
+    }
+
+    #[test]
+    fn failed_atomic_writes_remove_their_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(write_atomically(&path, b"not published").is_err());
+        assert!(
+            !std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+        );
     }
 }

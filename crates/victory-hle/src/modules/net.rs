@@ -11,8 +11,9 @@
 //!   numeric, or fail if a name is required, as with no network.
 //! * `WinHttpConnect` to a host that is not loopback fails with
 //!   `ERROR_WINHTTP_CANNOT_CONNECT`, so no request (or WebSocket) handle can
-//!   exist for one. Proxies are off and proxy auto-detection (WPAD, PAC
-//!   downloads) fails with `ERROR_WINHTTP_AUTODETECTION_FAILED`.
+//!   exist for one. Automatic redirects are disabled, including redirects
+//!   returned by a loopback server. Proxies are off and proxy auto-detection
+//!   (WPAD, PAC downloads) fails with `ERROR_WINHTTP_AUTODETECTION_FAILED`.
 //! * A bind to all interfaces is narrowed to loopback, so nothing on the
 //!   network can connect in.
 #![allow(non_snake_case)]
@@ -23,7 +24,7 @@ use std::ffi::{CStr, c_char, c_void};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 
-use windows_sys::Win32::Foundation::SetLastError;
+use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
 
 use crate::modules::files::host;
 use crate::{HleExport, HleModule, hle_export};
@@ -45,6 +46,8 @@ const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0006;
 const SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0024;
 const WINHTTP_ACCESS_TYPE_NO_PROXY: u32 = 1;
 const WINHTTP_OPTION_PROXY: u32 = 38;
+const WINHTTP_OPTION_REDIRECT_POLICY: u32 = 88;
+const WINHTTP_OPTION_REDIRECT_POLICY_NEVER: u32 = 0;
 
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -132,10 +135,40 @@ fn loopback(ip: IpAddr) -> bool {
     ip.to_canonical().is_loopback()
 }
 
-/// `localhost` or a loopback literal (bracketed IPv6 too).
+/// The local host name query via `gethostname` from host `ws2_32.dll`.
+fn local_hostname() -> Option<String> {
+    static HOSTNAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HOSTNAME
+        .get_or_init(|| {
+            let mut buf = [0 as c_char; 256];
+            let rc = host!("ws2_32.dll", "gethostname": extern "system" fn(*mut c_char, i32) -> i32)(
+                buf.as_mut_ptr(),
+                buf.len() as i32,
+            );
+            if rc == 0 {
+                // SAFETY: NUL-terminated by successful gethostname.
+                let s = unsafe { CStr::from_ptr(buf.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned();
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+            None
+        })
+        .clone()
+}
+
+fn is_local_hostname(name: &str) -> bool {
+    local_hostname().is_some_and(|host| host.eq_ignore_ascii_case(name))
+}
+
+/// `localhost`, the local hostname, or a loopback literal (bracketed IPv6 too).
 fn loopback_name(name: &str) -> bool {
     let bare = name.trim_start_matches('[').trim_end_matches(']');
-    bare.eq_ignore_ascii_case("localhost") || bare.parse().is_ok_and(loopback)
+    bare.eq_ignore_ascii_case("localhost")
+        || is_local_hostname(bare)
+        || bare.parse().is_ok_and(loopback)
 }
 
 fn shown(addr: Option<impl ToString>) -> String {
@@ -153,6 +186,19 @@ fn reachable(what: &'static str, addr: *const u8, len: i32) -> bool {
             false
         }
     }
+}
+
+/// A `connect` target that reaches no one: an address of zeros (or of no
+/// family), which disconnects a datagram socket from its peer, and which a
+/// stream socket cannot connect to. Passed to the host; it never leaves
+/// the machine.
+fn no_peer(addr: *const u8, len: i32) -> bool {
+    if addr.is_null() || len < 2 {
+        return false;
+    }
+    // SAFETY: the title passes `len` (at least 2) readable bytes.
+    let family = unsafe { std::slice::from_raw_parts(addr, 2) };
+    family == [0, 0] || socket_addr(addr, len).is_some_and(|a| a.ip().is_unspecified())
 }
 
 /// Connecting by name: only to loopback. A name would need a lookup
@@ -174,13 +220,14 @@ fn reachable_name(name: Option<String>) -> bool {
     }
 }
 
-/// Names answered without asking the network: none, `localhost`, IP
-/// literals (connecting to one is vetted separately).
+/// Names answered without asking the network: none, `localhost`, local hostname,
+/// IP literals (connecting to one is vetted separately).
 fn resolvable(name: Option<String>) -> bool {
     match name {
         Some(name)
             if !(name.is_empty()
                 || name.eq_ignore_ascii_case("localhost")
+                || is_local_hostname(&name)
                 || name.parse::<IpAddr>().is_ok()) =>
         {
             once("network name lookup blocked", name);
@@ -221,7 +268,7 @@ fn name_info_flags(sa: *const u8, len: i32, host_wanted: bool, flags: i32) -> Op
 // Connects.
 
 pub extern "system" fn connect(s: Socket, name: *const u8, len: i32) -> i32 {
-    if !reachable("network connect blocked", name, len) {
+    if !no_peer(name, len) && !reachable("network connect blocked", name, len) {
         return SOCKET_ERROR;
     }
     host!("ws2_32.dll", "connect": extern "system" fn(Socket, *const u8, i32) -> i32)(s, name, len)
@@ -236,7 +283,7 @@ pub extern "system" fn WSAConnect(
     sqos: *const c_void,
     gqos: *const c_void,
 ) -> i32 {
-    if !reachable("network connect blocked", name, len) {
+    if !no_peer(name, len) && !reachable("network connect blocked", name, len) {
         return SOCKET_ERROR;
     }
     host!("ws2_32.dll", "WSAConnect": extern "system" fn(Socket, *const u8, i32, *const c_void, *mut c_void, *const c_void, *const c_void) -> i32)(
@@ -537,6 +584,14 @@ pub extern "system" fn bind(s: Socket, name: *const u8, len: i32) -> i32 {
 
 // Forward lookups.
 
+fn blocked_lookup(result: *mut *mut c_void) -> i32 {
+    if !result.is_null() {
+        // SAFETY: a non-null result points to the caller's output slot.
+        unsafe { result.write(std::ptr::null_mut()) };
+    }
+    WSAHOST_NOT_FOUND
+}
+
 pub extern "system" fn getaddrinfo(
     node: *const c_char,
     service: *const c_char,
@@ -544,7 +599,7 @@ pub extern "system" fn getaddrinfo(
     result: *mut *mut c_void,
 ) -> i32 {
     if !resolvable(narrow(node)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_lookup(result);
     }
     host!("ws2_32.dll", "getaddrinfo": extern "system" fn(*const c_char, *const c_char, *const c_void, *mut *mut c_void) -> i32)(
         node, service, hints, result,
@@ -558,7 +613,7 @@ pub extern "system" fn GetAddrInfoW(
     result: *mut *mut c_void,
 ) -> i32 {
     if !resolvable(wide(node)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_lookup(result);
     }
     host!("ws2_32.dll", "GetAddrInfoW": extern "system" fn(*const u16, *const u16, *const c_void, *mut *mut c_void) -> i32)(
         node, service, hints, result,
@@ -578,7 +633,7 @@ pub extern "system" fn GetAddrInfoExA(
     handle: *mut Handle,
 ) -> i32 {
     if !resolvable(narrow(name)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_lookup(result);
     }
     host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
@@ -598,7 +653,7 @@ pub extern "system" fn GetAddrInfoExW(
     handle: *mut Handle,
 ) -> i32 {
     if !resolvable(wide(name)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_lookup(result);
     }
     host!("ws2_32.dll", "GetAddrInfoExW": extern "system" fn(*const u16, *const u16, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
@@ -737,8 +792,8 @@ pub extern "system" fn WinHttpConnect(
     )
 }
 
-/// Sessions never use a proxy: only loopback is reachable, and a proxy
-/// (named, or found by auto-detection) would carry it off the machine.
+/// Sessions never use a proxy or follow redirects: either could carry a
+/// loopback request off the machine inside the host's own WinHTTP calls.
 pub extern "system" fn WinHttpOpen(
     agent: *const u16,
     access: u32,
@@ -749,16 +804,44 @@ pub extern "system" fn WinHttpOpen(
     if access != WINHTTP_ACCESS_TYPE_NO_PROXY {
         once("HTTP proxy ignored", format!("access type {access}"));
     }
-    host!("winhttp.dll", "WinHttpOpen": extern "system" fn(*const u16, u32, *const u16, *const u16, u32) -> Handle)(
+    let session = host!("winhttp.dll", "WinHttpOpen": extern "system" fn(*const u16, u32, *const u16, *const u16, u32) -> Handle)(
         agent,
         WINHTTP_ACCESS_TYPE_NO_PROXY,
         std::ptr::null(),
         std::ptr::null(),
         flags,
-    )
+    );
+    if session.is_null() || no_http_redirects(session) == 0 {
+        return std::ptr::null_mut();
+    }
+    session
 }
 
-/// See [`WinHttpOpen`]: a proxy set later is accepted and not used.
+/// Applies the documented DWORD policy to a session or request. If the
+/// host cannot enforce it, the handle is closed and the original error
+/// is preserved; an unguarded handle must not remain usable.
+fn no_http_redirects(handle: Handle) -> i32 {
+    let policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+    let result = host!("winhttp.dll", "WinHttpSetOption": extern "system" fn(Handle, u32, *const c_void, u32) -> i32)(
+        handle,
+        WINHTTP_OPTION_REDIRECT_POLICY,
+        (&raw const policy).cast(),
+        std::mem::size_of_val(&policy) as u32,
+    );
+    if result == 0 {
+        // SAFETY: reads only the calling thread's last error.
+        let error = unsafe { GetLastError() };
+        if !handle.is_null() {
+            host!("winhttp.dll", "WinHttpCloseHandle": extern "system" fn(Handle) -> i32)(handle);
+        }
+        // SAFETY: restore the option failure after closing the unsafe handle.
+        unsafe { SetLastError(error) };
+    }
+    result
+}
+
+/// See [`WinHttpOpen`]: later proxy settings are ignored and every redirect
+/// policy change still enforces NEVER, on both sessions and requests.
 pub extern "system" fn WinHttpSetOption(
     handle: Handle,
     option: u32,
@@ -768,6 +851,13 @@ pub extern "system" fn WinHttpSetOption(
     if option == WINHTTP_OPTION_PROXY {
         once("HTTP proxy ignored", "WINHTTP_OPTION_PROXY".into());
         return 1;
+    }
+    if option == WINHTTP_OPTION_REDIRECT_POLICY {
+        once(
+            "HTTP redirects disabled",
+            "WINHTTP_OPTION_REDIRECT_POLICY".into(),
+        );
+        return no_http_redirects(handle);
     }
     host!("winhttp.dll", "WinHttpSetOption": extern "system" fn(Handle, u32, *const c_void, u32) -> i32)(
         handle, option, buffer, len,
@@ -879,6 +969,10 @@ pub(crate) fn module() -> HleModule {
 }
 
 #[cfg(test)]
+#[path = "net_redirect_tests.rs"]
+mod redirect_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use victory_pe::ImportSymbol;
@@ -894,6 +988,92 @@ mod tests {
     // TEST-NET-1 (192.0.2.0/24): never routed, and never tried here.
     const AWAY: [u8; 4] = [192, 0, 2, 1];
     const HOME: [u8; 4] = [127, 0, 0, 1];
+
+    /// A datagram socket connected to a peer is disconnected by connecting
+    /// it to an address of zeros, as Winsock documents; that address reaches
+    /// no one, so it is not refused as off the machine (#891).
+    #[test]
+    fn a_zero_address_disconnects_a_datagram_socket() {
+        // Also starts Winsock for the raw calls below.
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = peer.local_addr().unwrap().port();
+        let socket = host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket);
+        let close = host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32);
+        let last_error = host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32);
+        type GetPeerName = extern "system" fn(Socket, *mut u8, *mut i32) -> i32;
+        let getpeername = host!("ws2_32.dll", "getpeername": GetPeerName);
+        let connected = |s: Socket| {
+            let mut addr = [0u8; 16];
+            let mut len = 16;
+            getpeername(s, addr.as_mut_ptr(), &mut len) == 0
+        };
+        const WSAENOTCONN: i32 = 10057;
+        let null = std::ptr::null_mut::<c_void>();
+
+        let u = socket(2, 2, 17);
+        assert_ne!(u, INVALID_SOCKET);
+        for zero in [v4([0; 4], 0), [0u8; 16]] {
+            assert_eq!(connect(u, v4(HOME, port).as_ptr(), 16), 0);
+            assert!(connected(u));
+            // An IPv4 address of zeros, and a sockaddr of no family.
+            assert_eq!(connect(u, zero.as_ptr(), 16), 0, "{zero:?}");
+            assert!(!connected(u));
+            assert_eq!(last_error(), WSAENOTCONN);
+        }
+        assert_eq!(connect(u, v4(HOME, port).as_ptr(), 16), 0);
+        let n = null.cast_const();
+        assert_eq!(WSAConnect(u, v4([0; 4], 0).as_ptr(), 16, n, null, n, n), 0);
+        assert!(!connected(u));
+        // A real address off the machine is still refused.
+        assert_eq!(connect(u, v4(AWAY, 80).as_ptr(), 16), SOCKET_ERROR);
+        assert_eq!(last_error(), WSAENETUNREACH);
+        close(u);
+    }
+
+    #[test]
+    fn blocked_name_lookups_clear_the_result() {
+        let ansi = c"blocked.invalid".as_ptr();
+        let wide: Vec<u16> = "blocked.invalid\0".encode_utf16().collect();
+        let wide = wide.as_ptr();
+        let null = std::ptr::null();
+        let null_mut = std::ptr::null_mut();
+        let check = |lookup: &dyn Fn(*mut *mut c_void) -> i32| {
+            let mut result = std::ptr::dangling_mut::<c_void>();
+            assert_eq!(lookup(&mut result), WSAHOST_NOT_FOUND);
+            assert!(result.is_null());
+            assert_eq!(lookup(std::ptr::null_mut()), WSAHOST_NOT_FOUND);
+        };
+        check(&|result| getaddrinfo(ansi, std::ptr::null(), null, result));
+        check(&|result| GetAddrInfoW(wide, std::ptr::null(), null, result));
+        check(&|result| {
+            GetAddrInfoExA(
+                ansi,
+                std::ptr::null(),
+                0,
+                null,
+                null,
+                result,
+                null,
+                null_mut,
+                null,
+                std::ptr::null_mut(),
+            )
+        });
+        check(&|result| {
+            GetAddrInfoExW(
+                wide,
+                std::ptr::null(),
+                0,
+                null,
+                null,
+                result,
+                null,
+                null_mut,
+                null,
+                std::ptr::null_mut(),
+            )
+        });
+    }
 
     #[test]
     fn only_loopback_is_reachable() {
@@ -990,6 +1170,22 @@ mod tests {
             ),
             WSAHOST_NOT_FOUND
         );
+
+        // Local machine hostname is resolvable.
+        if let Some(host) = local_hostname() {
+            let mut host_result = null;
+            let host_c = std::ffi::CString::new(host.clone()).unwrap();
+            let rc = getaddrinfo(
+                host_c.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut host_result,
+            );
+            assert_eq!(rc, 0, "local hostname {host} must be resolvable");
+            if !host_result.is_null() {
+                host!("ws2_32.dll", "freeaddrinfo": extern "system" fn(*mut c_void))(host_result);
+            }
+        }
         let mut text = [0 as c_char; 64];
         let away = v4(AWAY, 80);
         assert_eq!(

@@ -1,6 +1,7 @@
 //! A DXIL vertex, pixel, compute or mesh shader under construction: the module,
 //! the `dx.op` declarations it calls, its signatures and bound resources,
-//! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
+//! and the metadata and container that wrap it up (SM 6.6; validator 1.6,
+//! or 1.8 for compute derivatives).
 
 use super::bitcode::{Attr, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
@@ -16,10 +17,13 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    pub const VIEWPORT_RT_INDEX: u64 = 1 << 9;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
+    pub const ATOMIC_TYPED64: u64 = 1 << 27;
+    pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
 }
@@ -45,8 +49,32 @@ pub(crate) struct Mesh {
     pub topology: u8,
 }
 
+impl Mesh {
+    pub(super) const MAX_OUTPUT_BYTES: u64 = 32_768;
+
+    /// DXIL charges for declared components and rounds each output count
+    /// up to a multiple of 32 independently of the signature packing.
+    pub(super) fn output_bytes(self, vertices: &[SigElement], primitives: &[SigElement]) -> u64 {
+        let bytes = |count: u32, elements: &[SigElement]| {
+            let components: u64 = elements.iter().map(|e| u64::from(e.cols)).sum();
+            u64::from(count).next_multiple_of(32) * 4 * components
+        };
+        bytes(self.max_vertices, vertices) + bytes(self.max_primitives, primitives)
+    }
+}
+
+/// What a geometry shader declares: triangles in, triangle strips out on
+/// stream 0, one instance.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Geometry {
+    pub max_vertices: u32,
+}
+
 pub(crate) struct Shader {
     pub m: Module,
+    /// Test builds: typed loads assembled from a dword-aligned pair.
+    #[cfg(test)]
+    pub unaligned_typed_loads: u32,
     pub t: Types,
     pub pixel: bool,
     pub inputs: Vec<SigElement>,
@@ -55,6 +83,7 @@ pub(crate) struct Shader {
     pub prims: Vec<SigElement>,
     /// A mesh shader (`threads` is its thread-group size).
     pub mesh: Option<Mesh>,
+    pub geometry: Option<Geometry>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
@@ -65,13 +94,19 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
+    /// Root UAVs (raw buffers) read and written, likewise.
+    pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Heap handles annotated as constant buffers.
+    pub cbuffer_handles: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
     pub wave_size: Option<u32>,
+    /// Compute derivatives require validator 1.8 rather than 1.6 or 1.7.
+    compute_derivatives: bool,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
@@ -99,6 +134,9 @@ impl Shader {
         let entry = m.new_block();
         Shader {
             m,
+            #[cfg(test)]
+            #[cfg(test)]
+            unaligned_typed_loads: 0,
             t: Types {
                 void,
                 i1,
@@ -115,15 +153,19 @@ impl Shader {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh: None,
+            geometry: None,
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            cbuffer_handles: 0,
             threads: None,
             wave_size: None,
+            compute_derivatives: false,
             lds_dwords: 0,
             lds: None,
             main,
@@ -153,6 +195,12 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        if self.threads.is_some()
+            && self.mesh.is_none()
+            && matches!(opcode, 53..=56 | 60 | 61 | 64 | 81)
+        {
+            self.compute_derivatives = true;
+        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
@@ -236,6 +284,32 @@ impl Shader {
         h
     }
 
+    /// The handle of the root UAV (a raw buffer the shader may write) of
+    /// root parameter `slot`: `u<slot>` in [`ROOT_CBV_SPACE`].
+    pub fn root_uav_handle(&mut self, slot: u8) -> V {
+        if let Some(&(_, h)) = self.root_uavs.iter().find(|r| r.0 == slot) {
+            return h;
+        }
+        let r = self.m.i32(u32::from(slot));
+        let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(1)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        // A raw buffer with unordered access.
+        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.root_uavs.push((slot, h));
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -278,6 +352,12 @@ impl Shader {
 
     /// A descriptor heap handle, annotated with `props`; `nonuniform` when
     /// the index may differ between lanes (`NonUniformResourceIndex`).
+    /// Indices at or past [`super::VIEW_HEAP_LIMIT`] /
+    /// [`super::SAMPLER_HEAP_LIMIT`] (garbage or negative values from
+    /// dropped passes) are clamped to slot 0, so `ResourceDescriptorHeap` /
+    /// `SamplerDescriptorHeap` reads never go far past any heap. The bound
+    /// is the largest heap, not the one bound: an index just past a smaller
+    /// heap's end still reads past it.
     pub fn heap_handle(
         &mut self,
         block: usize,
@@ -291,7 +371,16 @@ impl Shader {
         } else {
             flags::RESOURCE_HEAP
         };
+        let limit = self.m.i32(if sampler {
+            super::SAMPLER_HEAP_LIMIT
+        } else {
+            super::VIEW_HEAP_LIMIT
+        });
+        let zero = self.m.i32(0);
+        let in_bounds = self.m.cmp(block, super::bitcode::pred::IULT, index, limit);
+        let index = self.m.select(block, in_bounds, index, zero);
         self.nonuniform_handles += u32::from(nonuniform);
+        self.cbuffer_handles += u32::from(props.0 == 13);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -308,6 +397,28 @@ impl Shader {
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        // The clean-up, before anything is declared about the code: a
+        // feature whose last use it removed must not be declared (the
+        // validator compares the flags with what the code uses).
+        let passes = super::shader_opt() & super::bitcode::opt::MODULE;
+        if passes != 0 {
+            self.m.optimise(passes);
+            let used = self.m.usage();
+            for (flag, used) in [
+                (flags::WAVE_OPS, used.wave_ops),
+                (flags::INT64, used.int64),
+                (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
+                (flags::RESOURCE_HEAP, used.heap_views),
+                (flags::SAMPLER_HEAP, used.heap_samplers),
+                (flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64, used.atomic64),
+            ] {
+                if !used {
+                    self.flags &= !flag;
+                }
+            }
+        }
+        container::separate_interpolation(&mut self.inputs);
+        container::separate_interpolation(&mut self.outputs);
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -318,6 +429,7 @@ impl Shader {
             || self.samplers > 0
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
+            || !self.root_uavs.is_empty()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -401,6 +513,44 @@ impl Shader {
                 }
                 srvs = Some(self.m.md_node(list));
             }
+            let mut uavs = None;
+            if !self.root_uavs.is_empty() {
+                let ty = self
+                    .m
+                    .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
+                let p = self.m.ptr(ty);
+                let u = self.m.undef(p);
+                let no = self.m.bool(false);
+                let no = self.m.md_value(no);
+                let mut list = Vec::new();
+                for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
+                    // Id, variable, name, space, lower bound, range size,
+                    // shape (11: a raw buffer), globally coherent, counter,
+                    // rasterizer ordered, extra.
+                    let ops = vec![
+                        Some(i32c(&mut self, n as u32)),
+                        Some(self.m.md_value(u)),
+                        Some(empty),
+                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
+                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, 1)),
+                        Some(i32c(&mut self, 11)),
+                        Some(no),
+                        Some(no),
+                        Some(no),
+                        None,
+                    ];
+                    list.push(Some(self.m.md_node(ops)));
+                    // PSV0 kind 7: a raw buffer with unordered access.
+                    bindings.push(Binding {
+                        kind: 7,
+                        space: ROOT_CBV_SPACE,
+                        register: u32::from(slot),
+                        dxil_kind: 11,
+                    });
+                }
+                uavs = Some(self.m.md_node(list));
+            }
             let mut samplers = None;
             if self.samplers > 0 {
                 let ty = self.m.named_struct("struct.SamplerState", vec![self.t.i32]);
@@ -430,11 +580,12 @@ impl Shader {
                 }
                 samplers = Some(self.m.md_node(list));
             }
-            resources = Some(self.m.md_node(vec![srvs, None, cbvs, samplers]));
-            // PSV0 lists them as the module does: CBVs, samplers, SRVs.
+            resources = Some(self.m.md_node(vec![srvs, uavs, cbvs, samplers]));
+            // PSV0 lists them as the module does: CBVs, samplers, SRVs, UAVs.
             bindings.sort_by_key(|b| match b.kind {
                 2 => 0,
                 1 => 1,
+                7 => 3,
                 _ => 2,
             });
         }
@@ -468,6 +619,11 @@ impl Shader {
                     });
                 }
             }
+            // A geometry shader lists four streams: the other three have
+            // no outputs.
+            if self.geometry.is_some() {
+                view.extend([0, 0, 0]);
+            }
             let arr = self.m.array(view.len() as u32, self.t.i32);
             let elems: Vec<V> = view.iter().map(|&v| self.m.i32(v)).collect();
             let arr = self.m.aggregate(arr, &elems);
@@ -488,6 +644,13 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
+        if self.threads.is_none()
+            && !self.pixel
+            && self.geometry.is_none()
+            && self.outputs.iter().any(|o| matches!(o.kind, 4 | 5))
+        {
+            self.flags |= flags::VIEWPORT_RT_INDEX;
+        }
         // Entry properties: shader flags (tag 0), thread-group size (4),
         // wave size (11).
         let mut props = Vec::new();
@@ -496,6 +659,13 @@ impl Shader {
             let i64t = self.m.int(64);
             let f = self.m.int_const(i64t, self.flags as i64);
             props.push(self.m.md_value(f));
+        }
+        if let Some(g) = self.geometry {
+            // Input primitive (3: triangles), maximum vertices, stream
+            // mask, output topology (5: triangle strips), instances.
+            props.push(i32c(&mut self, 1));
+            let state = [3, g.max_vertices, 1, 5, 1].map(|n| Some(i32c(&mut self, n)));
+            props.push(self.m.md_node(state.to_vec()));
         }
         if let Some(threads) = self.threads {
             let t = threads.map(|n| Some(i32c(&mut self, n)));
@@ -542,10 +712,14 @@ impl Shader {
         let six = i32c(&mut self, 6);
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
-        self.m.named_md("dx.valver", vec![version]);
+        let val_minor = if self.compute_derivatives { 8 } else { 6 };
+        let val_minor = i32c(&mut self, val_minor);
+        let val_version = self.m.md_node(vec![Some(one), Some(val_minor)]);
+        self.m.named_md("dx.valver", vec![val_version]);
         // Program kinds: 0 pixel, 1 vertex, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
+            _ if self.geometry.is_some() => ("gs", 2),
             (Some(_), _) => ("cs", 5u32),
             (None, true) => ("ps", 0),
             (None, false) => ("vs", 1),
@@ -555,7 +729,9 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
-        let bitcode = self.m.write();
+        // Compute lowering can generate unused register results that otherwise
+        // keep arithmetic and entire chains of merge values in the host module.
+        let bitcode = self.m.write(!graphics);
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
         dxil.extend((kind << 16 | 0x66).to_le_bytes());
         dxil.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());
@@ -572,6 +748,9 @@ impl Shader {
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
         }
+        if self.flags & flags::VIEWPORT_RT_INDEX != 0 {
+            features |= 0x2000;
+        }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
         }
@@ -579,10 +758,16 @@ impl Shader {
             features |= 0x8000;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
-            features |= 0x200_0000;
+            features |= super::SFI0_RESOURCE_HEAP;
         }
         if self.flags & flags::SAMPLER_HEAP != 0 {
-            features |= 0x400_0000;
+            features |= super::SFI0_SAMPLER_HEAP;
+        }
+        if self.flags & flags::ATOMIC_TYPED64 != 0 {
+            features |= 0x40_0000;
+        }
+        if self.flags & flags::ATOMIC_HEAP64 != 0 {
+            features |= 0x1000_0000;
         }
         let sfi0 = features.to_le_bytes();
         let isg1 = container::signature(&self.inputs, true);
@@ -599,9 +784,11 @@ impl Shader {
             outputs: &self.outputs,
             prims: &self.prims,
             mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
+            geometry: self.geometry.map(|g| g.max_vertices),
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
+            validator18: self.compute_derivatives,
         });
         let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);
@@ -647,7 +834,7 @@ impl Shader {
             };
             let ops = vec![
                 c32(self, id as u32),
-                Some(self.m.md_str(&e.name)),
+                Some(self.m.md_str(e.semantic_name())),
                 c8(self, e.comp),
                 c8(self, e.kind),
                 indices,
@@ -661,5 +848,213 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::super::bitcode::Term;
+    use super::super::validator;
+    use super::*;
+
+    use crate::dxbc::{Container, FourCC};
+
+    fn element(name: &str, row: u32, col: u8, cols: u8) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        }
+    }
+
+    fn change_part(dxil: &[u8], part: FourCC, edit: impl FnOnce(&mut [u8])) -> Vec<u8> {
+        let c = Container::parse(dxil).unwrap();
+        let part = c.part(part).unwrap();
+        let start = part.offset + 8;
+        let mut changed = dxil.to_vec();
+        edit(&mut changed[start..start + part.data.len()]);
+        let digest = container::hash(&changed[20..]);
+        changed[4..20].copy_from_slice(&digest);
+        changed
+    }
+
+    #[test]
+    fn packed_signature_records_keep_metadata_order_even_for_unused_elements() {
+        let Some(mut validator) = validator::Validator::for_test() else {
+            return;
+        };
+        let mut shader = Shader::new(false);
+        // A packed element at w precedes an unread element at x, as it does
+        // in module metadata. The signature part must preserve that order.
+        let mut high = element("HIGH", 0, 3, 1);
+        high.usage = 1;
+        shader.outputs = vec![high, element("LOW", 0, 0, 1)];
+        shader.inputs = shader.outputs.clone();
+        for e in &mut shader.inputs {
+            e.interp = 0;
+        }
+        shader.m.terminate(shader.entry, Term::Ret);
+        let mut dxil = shader.finish();
+        for (part, label, unused) in [
+            (FourCC::ISG1, "Program Input Signature", 0),
+            (FourCC::OSG1, "Program Output Signature", 15),
+        ] {
+            let mut swapped = change_part(&dxil, part, |data| {
+                assert_eq!(data[8 + 24], 8);
+                assert_eq!(data[40 + 24], 1);
+                assert_eq!(data[40 + 25], unused);
+                data[8..72].rotate_left(32);
+            });
+            let error = validator.validate(&mut swapped).unwrap_err();
+            assert!(
+                error.contains(&format!("'{label}' does not match expected for module")),
+                "{error}"
+            );
+        }
+        validator.validate(&mut dxil).unwrap();
+    }
+
+    #[test]
+    fn system_value_names_match_in_vertex_and_primitive_signatures() {
+        let Some(mut validator) = validator::Validator::for_test() else {
+            return;
+        };
+        let mut vertex = Shader::new(false);
+        let mut viewport = element("sV_vIeWpOrTaRrAyInDeX", 0, 0, 1);
+        viewport.kind = 5;
+        viewport.comp = 5;
+        viewport.interp = 1;
+        viewport.usage = 1;
+        vertex.outputs.push(viewport.clone());
+        let zero = vertex.m.i32(0);
+        let col = vertex.m.i8(0);
+        vertex.op(
+            vertex.entry,
+            "storeOutput.i32",
+            Attr::NoUnwind,
+            vertex.t.void,
+            5,
+            &[zero, zero, col, zero],
+        );
+        vertex.m.terminate(vertex.entry, Term::Ret);
+        let mut dxil = vertex.finish();
+        let mut misnamed = change_part(&dxil, FourCC::OSG1, |data| {
+            let name = crate::dxbc::u32_at(data, 12).unwrap() as usize;
+            assert_eq!(&data[name..name + 22], b"SV_ViewportArrayIndex\0");
+            data[name] = b's';
+        });
+        let error = validator.validate(&mut misnamed).unwrap_err();
+        assert!(
+            error.contains("'Program Output Signature' does not match expected for module"),
+            "{error}"
+        );
+        validator.validate(&mut dxil).unwrap();
+
+        let mut mesh = empty_mesh(1, 1);
+        viewport.usage = 0;
+        mesh.prims.push(viewport);
+        let mut dxil = mesh.finish();
+        let c = Container::parse(&dxil).unwrap();
+        let psg = c.part(FourCC::PSG1).unwrap().data;
+        let name = crate::dxbc::u32_at(psg, 12).unwrap() as usize;
+        assert_eq!(&psg[name..], b"SV_ViewportArrayIndex\0");
+        validator.validate(&mut dxil).unwrap();
+    }
+
+    fn empty_mesh(max_vertices: u32, max_primitives: u32) -> Shader {
+        let mut s = Shader::new(false);
+        s.threads = Some([32, 1, 1]);
+        s.mesh = Some(Mesh {
+            max_vertices,
+            max_primitives,
+            topology: 2,
+        });
+        let zero = s.m.i32(0);
+        s.op(
+            s.entry,
+            "setMeshOutputCounts",
+            Attr::NoUnwind,
+            s.t.void,
+            168,
+            &[zero, zero],
+        );
+        s.m.terminate(s.entry, Term::Ret);
+        s
+    }
+
+    #[test]
+    fn mesh_output_price_counts_declared_components_and_rounds_each_count() {
+        let Some(mut validator) = validator::Validator::for_test() else {
+            return;
+        };
+        for (vertices, primitives, rows, cols, prim_rows, stride, expected_bytes) in [
+            (256, 0, 8, 4, 0, 2, 32_768),
+            (256, 0, 32, 1, 0, 1, 32_768),
+            (224, 1, 9, 4, 1, 1, 32_768),
+            (224, 33, 9, 4, 1, 1, 33_280),
+            (225, 0, 9, 4, 0, 1, 36_864),
+        ] {
+            let mut s = empty_mesh(vertices, primitives);
+            for row in 0..rows {
+                s.outputs.push(SigElement {
+                    index: row,
+                    ..element("VALUE", row * stride, 0, cols)
+                });
+            }
+            for row in 0..prim_rows {
+                s.prims.push(SigElement {
+                    index: row,
+                    interp: 1,
+                    ..element("PRIM", row, 0, 4)
+                });
+            }
+            assert_eq!(
+                s.mesh.unwrap().output_bytes(&s.outputs, &s.prims),
+                expected_bytes
+            );
+            let result = validator.validate(&mut s.finish());
+            if expected_bytes <= Mesh::MAX_OUTPUT_BYTES {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error.contains("vertex plus primitive output size is greater than 32768"),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compute_implicit_sample_validates() {
+        let mut s = Shader::new(false);
+        s.threads = Some([32, 1, 1]);
+        s.wave_size = Some(32);
+        s.samplers = 1;
+        let block = s.entry;
+        let index = s.m.i32(0);
+        let texture = s.heap_handle(block, index, false, false, (2, 1033));
+        let sampler = s.sampler_handle(block, 0);
+        let zero = s.m.f32(0);
+        let fu = s.m.undef(s.t.f32);
+        let iu = s.m.undef(s.t.i32);
+        let args = [texture, sampler, zero, zero, fu, fu, iu, iu, iu, fu];
+        let ret = s.t.res_ret;
+        s.op(block, "sample.f32", Attr::ReadOnly, ret, 60, &args);
+        s.m.terminate(block, Term::Ret);
+        let mut dxil = s.finish();
+        let path = validator::Validator::default_path();
+        let Ok(mut validator) = validator::Validator::load(path.as_deref()) else {
+            eprintln!("no dxil.dll; skipped");
+            return;
+        };
+        validator.validate(&mut dxil).unwrap();
     }
 }

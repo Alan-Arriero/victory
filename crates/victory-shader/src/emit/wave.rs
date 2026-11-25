@@ -2,7 +2,7 @@
 //! (or `s_nand_saveexec 0`) and the restore of the saved mask runs in every lane of the console's
 //! wave, the inactive ones included, which is how the compiler expands
 //! HLSL wave reductions and prefix sums (an identity put into the inactive
-//! lanes with `v_cndmask`, then DPP, `v_permlanex16` and `v_readlane`
+//! lanes with `v_cndmask`, then DPP, `v_permlane16`, `v_permlanex16` and `v_readlane`
 //! steps). A host lane that is elsewhere cannot run that code, so each
 //! section is simulated on the console's lanes with symbolic values, and a
 //! value it leaves is lowered by what it turned out to be: the reduction or
@@ -325,8 +325,9 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             };
             let x = lanes(src, &vec, &uni);
             if let Some(w) = inst.write(Reg::S(code)) {
+                let mask = wave - 1;
                 let s = l
-                    .and_then(|l| x.get(l as usize).copied())
+                    .and_then(|l| x.get((l & mask) as usize).copied())
                     .unwrap_or(Sym::Unknown);
                 uni.insert(w, s);
             }
@@ -408,22 +409,29 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     })
                     .collect()
             }
-            ("v_permlanex16_b32", Some(a)) => {
-                // Lanes of each row read the other row of their half; lane
-                // i's pick is nibble i of {src2, src1}.
+            (n @ ("v_permlane16_b32" | "v_permlanex16_b32"), Some(a)) => {
+                // Lane i of a row picks nibble i of {src2, src1}: from its
+                // own row (permlane16) or from the other row of its half of
+                // 32 lanes (permlanex16). Only with every lane active: the
+                // opsel bits (fi, bound_ctrl) decide what an inactive lane
+                // reads.
                 let sel = |k: usize| match v.src.get(k) {
                     Some(&Operand::Const(c)) => crate::resource::inline(c),
                     Some(&Operand::Literal(x)) => Some(x),
                     _ => None,
                 };
                 match (sel(1), sel(2)) {
-                    (Some(s1), Some(s2)) => {
+                    (Some(s1), Some(s2)) if exec == all => {
                         let s = u64::from(s1) | u64::from(s2) << 32;
                         (0..wave)
                             .map(|l| {
-                                let other = (l & !31) | ((l & 16) ^ 16);
+                                let row = if n == "v_permlane16_b32" {
+                                    l & !15
+                                } else {
+                                    (l & !31) | ((l & 16) ^ 16)
+                                };
                                 let pick = (s >> (4 * (l & 15)) & 15) as u32;
-                                a[(other | pick) as usize]
+                                a[(row | pick) as usize]
                             })
                             .collect()
                     }
@@ -617,6 +625,78 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     Some(Shape::Prefix(op, src, mask, ident, inclusive))
 }
 
+/// No upper-half threads exist. Admit only recognized, side-effect-free
+/// whole-wave `Active` reductions, with no independent lane exchange or
+/// full-wave/WQM `EXEC` manipulation outside those sections.
+pub(crate) fn single_wave32_reductions(p: &Program) -> bool {
+    let full_wave_exec = |inst: &Inst| {
+        let name = inst.name();
+        if matches!(name, "s_wqm_b64" | "s_wqm_b32") {
+            return true;
+        }
+        let full_const = match name {
+            "s_or_saveexec_b64" | "s_or_saveexec_b32" => Some(193),
+            "s_nand_saveexec_b64" | "s_nand_saveexec_b32" => Some(128),
+            _ => None,
+        };
+        full_const.is_some_and(|c| {
+            matches!(
+                &inst.fields,
+                Fields::Sop { src, .. } if src.first() == Some(&Operand::Const(c))
+            )
+        })
+    };
+    let mut reduces = false;
+    for (b, block) in p.blocks.iter().enumerate() {
+        let found = sections(p, b);
+        let mut in_section = vec![false; block.insts.len()];
+        for (&start, sec) in &found {
+            if !sec.shapes.values().any(|s| matches!(s, Shape::Active(..)))
+                || sec.shapes.values().any(|s| matches!(s, Shape::Prefix(..)))
+            {
+                return false;
+            }
+            if full_wave_exec(&block.insts[sec.end]) {
+                return false;
+            }
+            for inst in &block.insts[start + 1..sec.end] {
+                // An EXEC write inside a section makes `simulate()` return
+                // early while leaving earlier `Shape::Active` results in
+                // `sec.shapes`; the whitelist also keeps memory/sync ops out.
+                if inst.write(Reg::S(EXEC)).is_some() || inst.write(Reg::S(EXEC + 1)).is_some() {
+                    return false;
+                }
+                let ok = matches!(inst.fields, Fields::Valu(_))
+                    || matches!(
+                        inst.name(),
+                        "s_and_b32" | "s_and_b64" | "s_mov_b32" | "s_mov_b64" | "s_nop"
+                    );
+                if !ok {
+                    return false;
+                }
+            }
+            reduces = true;
+            in_section[start..=sec.end].fill(true);
+        }
+        for (inst, in_sec) in block.insts.iter().zip(in_section) {
+            if in_sec {
+                continue;
+            }
+            let name = inst.name();
+            if full_wave_exec(inst)
+                || name.contains("permute")
+                || name.starts_with("v_permlane")
+                || name.starts_with("ds_swizzle")
+                || matches!(name, "v_readlane_b32" | "v_writelane_b32")
+                || matches!(&inst.fields, Fields::Valu(v) if v.dpp.is_some())
+            {
+                return false;
+            }
+        }
+    }
+    reduces
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,5 +755,240 @@ mod tests {
             per_lane(&vec![red(u64::MAX); 64], u64::MAX),
             Some(Shape::Active(Op::AddU, x, m, 0))
         );
+    }
+
+    /// Assembled with llvm-mc (gfx1030, wave32): a sum over all 32 lanes as
+    /// the console expands it, a DPP reduction of each row of 16, then each
+    /// row total read from lane 15 of its own row and of the other row.
+    const ROW_SUM_WORDS: [u32; 15] = [
+        0xBE80_3DC1, // s_or_saveexec_b32 s0, -1
+        0xD501_0001,
+        0x0002_0080, // v_cndmask_b32_e64 v1, 0, v0, s0
+        0x4A02_02FA,
+        0xFF01_6101, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:1
+        0x4A02_02FA,
+        0xFF01_6201, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:2
+        0x4A02_02FA,
+        0xFF01_6401, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:4
+        0x4A02_02FA,
+        0xFF01_6801, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:8
+        0xD777_0002,
+        0x0305_8301, // v_permlane16_b32 v2, v1, -1, -1
+        0xD778_0003,
+        0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1
+    ];
+
+    #[test]
+    fn permlane16_reads_the_lanes_own_row() {
+        let mut words = ROW_SUM_WORDS.to_vec();
+        words.extend([
+            0x4A08_0702, // v_add_nc_u32_e32 v4, v2, v3
+            0xBEFE_0300, // s_mov_b32 exec_lo, s0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 8).unwrap();
+        let insts = &p.blocks[0].insts;
+        let (saved, x) = (
+            insts[0].write(Reg::S(0)).unwrap(),
+            insts[1].read(Reg::V(0)).unwrap(),
+        );
+        let total = insts[8].write(Reg::V(4)).unwrap();
+        let found = sections(&p, 0);
+        assert_eq!(
+            found[&0].shapes.get(&total),
+            Some(&Shape::Active(Op::AddU, x, saved, 0))
+        );
+    }
+
+    fn build_wave64(words: &[u32]) -> Program {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        crate::ir::build(&code, true, 16).unwrap()
+    }
+
+    /// Wave64 whole-wave sum reduction over all 64 lanes: section opener,
+    /// body reducing into `v4`, and closing `EXEC` restore.
+    fn wave64_sum_section() -> Vec<u32> {
+        let mut words = vec![0xBE80_25C1]; // s_or_saveexec_b64 s[0:1], -1
+        words.extend_from_slice(&ROW_SUM_WORDS[1..]);
+        words.extend([
+            0x4A08_0702, // v_add_nc_u32_e32 v4, v2, v3
+            0xD760_0002,
+            0x0001_3F04, // v_readlane_b32 s2, v4, 31
+            0xD760_0003,
+            0x0001_7F04, // v_readlane_b32 s3, v4, 63
+            0x7E0A_0203, // v_mov_b32_e32 v5, s3
+            0x4A08_0A02, // v_add_nc_u32_e32 v4, s2, v5
+            0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+        ]);
+        words
+    }
+
+    fn wave64_sum_program(extra_inside: &[u32], before: &[u32], after: &[u32]) -> Program {
+        let mut words = before.to_vec();
+        let sec = wave64_sum_section();
+        let end = sec.len() - 1;
+        words.extend_from_slice(&sec[..end]);
+        words.extend_from_slice(extra_inside);
+        words.push(sec[end]);
+        words.extend_from_slice(after);
+        words.push(0xBF81_0000); // s_endpgm
+        build_wave64(&words)
+    }
+
+    #[test]
+    fn single_wave32_reductions_accepts_wave64_active_reduction() {
+        let p = wave64_sum_program(&[], &[], &[]);
+        let insts = &p.blocks[0].insts;
+        let saved = insts[0].write(Reg::S(0)).unwrap();
+        let x = insts[1].read(Reg::V(0)).unwrap();
+        let total = insts[12].write(Reg::V(4)).unwrap();
+        let found = sections(&p, 0);
+        assert_eq!(
+            found[&0].shapes.get(&total),
+            Some(&Shape::Active(Op::AddU, x, saved, 0))
+        );
+        assert!(single_wave32_reductions(&p));
+
+        // `s_nand_saveexec_b64 s[0:1], 0` is the other full-wave opener.
+        let mut nand = wave64_sum_section();
+        nand[0] = 0xBE80_2980;
+        nand.push(0xBF81_0000);
+        let p_nand = build_wave64(&nand);
+        assert!(single_wave32_reductions(&p_nand));
+    }
+
+    #[test]
+    fn single_wave32_reductions_allows_divergent_flow_and_whitelisted_scalar_ops() {
+        let sec = wave64_sum_section();
+        let end = sec.len() - 1;
+        let mut words = vec![
+            0x7D88_0300,                          // v_cmp_gt_u32_e32 vcc, v0, v1
+            0xBE84_246A,                          // s_and_saveexec_b64 s[4:5], vcc
+            0xBF88_0000 | (sec.len() as u32 + 2), // s_cbranch_execz -> after section
+        ];
+        words.extend_from_slice(&sec[..end]);
+        words.extend([
+            0x8786_C100, // s_and_b64 s[6:7], s[0:1], -1
+            0xBF80_0000, // s_nop 0
+            sec[end],
+            0xBE84_2704, // s_andn2_saveexec_b64 s[4:5], s[4:5]
+            0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+            0xBF81_0000, // s_endpgm
+        ]);
+        let p = build_wave64(&words);
+        assert!(single_wave32_reductions(&p));
+
+        // `s_nand_saveexec_b64 s[0:1], 0` is the other full-wave opener.
+        let mut nand = wave64_sum_section();
+        nand[0] = 0xBE80_2980;
+        nand.push(0xBF81_0000);
+        let p_nand = build_wave64(&nand);
+        assert!(single_wave32_reductions(&p_nand));
+    }
+
+    #[test]
+    fn single_wave32_reductions_rejects_without_sections() {
+        let p = build_wave64(&[
+            0x4A02_0100, // v_add_nc_u32_e32 v1, v0, v0
+            0xBF81_0000, // s_endpgm
+        ]);
+        assert!(!single_wave32_reductions(&p));
+    }
+
+    #[test]
+    fn single_wave32_reductions_rejects_prefix_sections() {
+        // Wave64 inclusive prefix sum using row_shr with bound_ctrl and
+        // row_mask-guarded DPP merges (no EXEC writes inside the section).
+        let words = [
+            0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+            0xD501_0001,
+            0x0002_0080, // v_cndmask_b32_e64 v1, 0, v0, s[0:1]
+            0x4A02_02FA,
+            0xFF09_1101, // v_add_nc_u32_dpp v1, v1, v1 row_shr:1 bound_ctrl:1
+            0x4A02_02FA,
+            0xFF09_1201, // v_add_nc_u32_dpp v1, v1, v1 row_shr:2 bound_ctrl:1
+            0x4A02_02FA,
+            0xFF09_1401, // v_add_nc_u32_dpp v1, v1, v1 row_shr:4 bound_ctrl:1
+            0x4A02_02FA,
+            0xFF09_1801, // v_add_nc_u32_dpp v1, v1, v1 row_shr:8 bound_ctrl:1
+            0xD778_0002,
+            0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+            0x4A02_02FA,
+            0xAF00_E402, // v_add_nc_u32_dpp v1, v2, v1 quad_perm:[0,1,2,3] row_mask:0xa
+            0xD760_0002,
+            0x0001_3F01, // v_readlane_b32 s2, v1, 31
+            0x7E06_0202, // v_mov_b32_e32 v3, s2
+            0x4A02_02FA,
+            0xCF00_E403, // v_add_nc_u32_dpp v1, v3, v1 quad_perm:[0,1,2,3] row_mask:0xc
+            0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+            0xBF81_0000, // s_endpgm
+        ];
+        let p = build_wave64(&words);
+        let insts = &p.blocks[0].insts;
+        let saved = insts[0].write(Reg::S(0)).unwrap();
+        let x = insts[1].read(Reg::V(0)).unwrap();
+        let prefix = insts[10].write(Reg::V(1)).unwrap();
+        assert_eq!(
+            sections(&p, 0)[&0].shapes.get(&prefix),
+            Some(&Shape::Prefix(Op::AddU, x, saved, 0, true))
+        );
+        assert!(!single_wave32_reductions(&p));
+    }
+
+    #[test]
+    fn single_wave32_reductions_rejects_exec_write_inside_section() {
+        for exec_write in [
+            0xBEFE_0480u32, // s_mov_b64 exec, 0
+            0xBEFF_0380,    // s_mov_b32 exec_hi, 0
+        ] {
+            let p = wave64_sum_program(&[exec_write], &[], &[]);
+            assert!(
+                sections(&p, 0)[&0]
+                    .shapes
+                    .values()
+                    .any(|s| matches!(s, Shape::Active(..))),
+                "early EXEC write still leaves earlier Shape::Active"
+            );
+            assert!(!single_wave32_reductions(&p));
+        }
+    }
+
+    #[test]
+    fn single_wave32_reductions_rejects_non_whitelisted_op_inside_section() {
+        for bad in [
+            &[0xBF8A_0000u32][..],           // s_barrier
+            &[0x8004_0302][..],              // s_add_u32 s4, s2, s3
+            &[0xF400_0100, 0xFA00_0000][..], // s_load_dword s4, s[0:1], null
+        ] {
+            let p = wave64_sum_program(bad, &[], &[]);
+            assert!(!single_wave32_reductions(&p));
+        }
+    }
+
+    #[test]
+    fn single_wave32_reductions_rejects_full_wave_exec_and_disallowed_ops_outside_section() {
+        // Normal divergent control-flow `s_or_saveexec_b64` with a register mask is allowed.
+        let p_branch = wave64_sum_program(&[], &[0xBE82_2504u32], &[]);
+        assert!(single_wave32_reductions(&p_branch));
+
+        for bad in [
+            0xBE82_25C1u32, // s_or_saveexec_b64 s[2:3], -1
+            0xBE82_2980,    // s_nand_saveexec_b64 s[2:3], 0
+            0xBE82_0A7E,    // s_wqm_b64 s[2:3], exec
+        ] {
+            let p = wave64_sum_program(&[], &[bad], &[]);
+            assert!(!single_wave32_reductions(&p));
+        }
+
+        // Outside-section DPP / v_permlanex16 / v_readlane lane exchanges are rejected.
+        for bad in [
+            &[0x4A0E_0EFA, 0xFF01_6107][..], // v_add_nc_u32_dpp v7, v7, v7 row_xmask:1
+            &[0xD778_0002, 0x0305_8301][..], // v_permlanex16_b32 v2, v1, -1, -1
+            &[0xD760_0004, 0x0001_0104][..], // v_readlane_b32 s4, v4, 0
+        ] {
+            let p = wave64_sum_program(&[], &[], bad);
+            assert!(!single_wave32_reductions(&p));
+        }
     }
 }

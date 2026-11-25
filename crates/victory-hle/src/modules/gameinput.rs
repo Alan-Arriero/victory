@@ -17,6 +17,7 @@ use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
+use super::release_ref;
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
@@ -27,6 +28,8 @@ pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
 pub const READING_NOT_FOUND: HRESULT = 0x838A_0003_u32 as i32;
 pub const REFERENCE_TOO_OLD: HRESULT = 0x838A_0004_u32 as i32;
 const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
+const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
+const IID_IUNKNOWN: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46];
 
 /// Input kinds (bits) our devices have.
 const KEYBOARD_KIND: u32 = 0x10;
@@ -63,11 +66,12 @@ const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
+const FALLBACK_BUTTONS: [(u8, u32); 15] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
     (0x0D, A),    // Enter
     (0x08, B),    // Backspace
+    (b'O', B),    // Circle, for PlayStation players
     (b'X', X),
     (b'Y', Y),
     (0x26, UP), // arrows
@@ -93,6 +97,18 @@ struct PadState {
     right_y: f32,
 }
 
+/// Motor speeds for one pad, each 0 (off) to `u16::MAX` (full), in the
+/// order of the title's four rumble levels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Motors {
+    /// Low frequency, in the left grip.
+    low: u16,
+    /// High frequency, in the right grip.
+    high: u16,
+    left_trigger: u16,
+    right_trigger: u16,
+}
+
 /// One key held down: scan code (0xE0xx when extended), character, key.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -111,8 +127,9 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
-    /// Motor speeds: low frequency (left), high frequency (right).
-    fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Motor speeds for the pad in host slot `slot`; a host without
+    /// trigger motors drops those two.
+    fn rumble(&mut self, slot: usize, motors: Motors);
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -325,6 +342,10 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// Events waiting for the single delivery loop.
+    queue: VecDeque<Event>,
+    /// The one thread draining `queue`; other producers only append.
+    deliverer: Option<ThreadId>,
 }
 
 pub struct Hub {
@@ -369,6 +390,8 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                queue: VecDeque::new(),
+                deliverer: None,
             }),
             returned: Condvar::new(),
         }));
@@ -410,34 +433,78 @@ impl Hub {
         self.deliver(events);
     }
 
-    /// Runs callbacks, never under our lock: they call back into us. One
-    /// unregistered since the event was taken does not run, and
-    /// `UnregisterCallback` waits for one that runs.
+    /// Runs callbacks one at a time, in the order they were queued, never
+    /// under our lock: they call back into us. A callback delivered from a
+    /// callback joins the same queue instead of nesting. One unregistered
+    /// since the event was queued does not run, and `UnregisterCallback`
+    /// waits for one that runs.
     fn deliver(&self, events: Vec<Event>) {
         let me = std::thread::current().id();
-        for e in events {
-            let r = e.registration;
-            {
-                let mut state = self.state();
-                if !state.callbacks.iter().any(|c| c.token == r.token) {
-                    continue;
-                }
-                state.running.push((r.token, me));
-            }
-            (r.callback)(
-                r.token,
-                r.context as *mut c_void,
-                &self.devices[e.device],
-                e.timestamp,
-                e.current,
-                e.previous,
-            );
+        {
             let mut state = self.state();
-            if let Some(i) = state.running.iter().position(|&x| x == (r.token, me)) {
-                state.running.swap_remove(i);
+            state.queue.extend(events);
+            if state.deliverer.is_some() {
+                return;
             }
-            self.returned.notify_all();
+            state.deliverer = Some(me);
         }
+        loop {
+            let e = {
+                let mut state = self.state();
+                match state.queue.pop_front() {
+                    Some(e) => e,
+                    None => {
+                        state.deliverer = None;
+                        return;
+                    }
+                }
+            };
+            self.run(e, me);
+        }
+    }
+
+    /// A blocking enumeration: its callbacks have all run on the calling
+    /// thread before this returns. The title registers holding a lock its
+    /// callback takes again, so they must not be handed to (and waited for
+    /// on) another thread that is delivering: that thread would block on the
+    /// lock this one holds. They run here, alongside that thread's current
+    /// callback. Called from a callback on the delivering thread, they queue
+    /// behind it as `deliver` does.
+    fn deliver_blocking(&self, events: Vec<Event>) {
+        let me = std::thread::current().id();
+        let elsewhere = self.state().deliverer.is_some_and(|t| t != me);
+        if !elsewhere {
+            return self.deliver(events);
+        }
+        for e in events {
+            self.run(e, me);
+        }
+    }
+
+    /// Runs one event's callback on this thread, never under our lock,
+    /// unless its registration was dropped since the event was made.
+    fn run(&self, e: Event, me: ThreadId) {
+        let r = e.registration;
+        {
+            let mut state = self.state();
+            if !state.callbacks.iter().any(|c| c.token == r.token) {
+                return;
+            }
+            state.running.push((r.token, me));
+        }
+        (r.callback)(
+            r.token,
+            r.context as *mut c_void,
+            &self.devices[e.device],
+            e.timestamp,
+            e.current,
+            e.previous,
+        );
+        let mut state = self.state();
+        if let Some(i) = state.running.iter().position(|&x| x == (r.token, me)) {
+            state.running.swap_remove(i);
+        }
+        self.returned.notify_all();
     }
 
     fn index(&self, device: *const Device) -> Option<usize> {
@@ -525,7 +592,7 @@ fn host() -> Box<dyn Source> {
         fn keys(&mut self) -> Vec<KeyState> {
             Vec::new()
         }
-        fn rumble(&mut self, _: usize, _: u16, _: u16) {}
+        fn rumble(&mut self, _: usize, _: Motors) {}
     }
     Box::new(Nothing)
 }
@@ -573,9 +640,27 @@ fn hand(out: Out, reading: Option<&Ref>) -> HRESULT {
     }
 }
 
-extern "system" fn no_interface(_: *const c_void, _iid: *const c_void, out: Out) -> HRESULT {
-    tracing::warn!("input QueryInterface not implemented");
-    fail(out, E_NOINTERFACE)
+fn query_iunknown<T>(
+    this: *const T,
+    iid: *const [u8; 16],
+    out: Out,
+    retain: extern "system" fn(*const T) -> u32,
+) -> HRESULT {
+    if iid.is_null() || out.is_null() {
+        return fail(out, E_POINTER);
+    }
+    // SAFETY: the caller passes a readable IID, checked non-null above.
+    if unsafe { *iid } != IID_IUNKNOWN {
+        return fail(out, E_NOINTERFACE);
+    }
+    retain(this);
+    // SAFETY: checked non-null; the caller passes room for a pointer.
+    unsafe { out.write(this.cast()) };
+    S_OK
+}
+
+extern "system" fn query_interface(this: *const c_void, iid: *const [u8; 16], out: Out) -> HRESULT {
+    query_iunknown(this, iid, out, add_ref)
 }
 /// The input object and devices live as long as the process.
 extern "system" fn add_ref(_: *const c_void) -> u32 {
@@ -621,7 +706,8 @@ extern "system" fn current_reading(
     hand(out, found)
 }
 
-/// The reading after (`forward`) or before `reference` on its device.
+/// The reading after (`forward`) or before `reference`: on `device`, or with
+/// none given on any device, in time order (ties by device, then sequence).
 fn relative(
     this: This,
     reference: *const Reading,
@@ -636,9 +722,6 @@ fn relative(
     let hub = hub(this);
     // SAFETY: a reading we handed out and the title still holds.
     let reference = unsafe { &*reference };
-    // shortcut: with no device given only the reference's device is walked,
-    // not every device's readings in time order; Grand Theft Auto VI walks
-    // only keyboard readings (one device) and the current pad's previous one.
     let Some(index) = hub.index(reference.device) else {
         return fail(out, E_INVALIDARG);
     };
@@ -646,27 +729,38 @@ fn relative(
         return fail(out, E_INVALIDARG);
     }
     let state = hub.state();
-    let history = &state.slots[index].history;
-    if history
+    if state.slots[index]
+        .history
         .front()
         .is_none_or(|oldest| reference.sequence < oldest.sequence)
     {
         return fail(out, REFERENCE_TOO_OLD);
     }
-    let wanted = |r: &&Ref| r.kind() & kind != 0;
-    let found = if forward {
-        history
-            .iter()
-            .filter(|r| r.sequence > reference.sequence)
-            .find(wanted)
+    // On one device this order is its sequence order.
+    let at = (reference.timestamp, index, reference.sequence);
+    let devices = if device.is_null() {
+        0..DEVICES
     } else {
-        history
-            .iter()
-            .rev()
-            .filter(|r| r.sequence < reference.sequence)
-            .find(wanted)
+        index..index + 1
     };
-    hand(out, found)
+    let candidates = devices
+        .flat_map(|i| {
+            let history = &state.slots[i].history;
+            history
+                .iter()
+                .map(move |r| ((r.timestamp, i, r.sequence), r))
+        })
+        .filter(|(_, r)| r.kind() & kind != 0);
+    let found = if forward {
+        candidates
+            .filter(|(key, _)| *key > at)
+            .min_by_key(|(key, _)| *key)
+    } else {
+        candidates
+            .filter(|(key, _)| *key < at)
+            .max_by_key(|(key, _)| *key)
+    };
+    hand(out, found.map(|(_, r)| r))
 }
 extern "system" fn next_reading(
     this: This,
@@ -712,7 +806,7 @@ fn token(out: *mut u64) -> HRESULT {
     S_OK
 }
 
-// shortcut: reading callbacks never run; Grand Theft Auto VI registers none
+// shortcut: reading callbacks never run; the title registers none
 // (it polls).
 extern "system" fn register_reading(
     _: This,
@@ -778,7 +872,13 @@ extern "system" fn register_device(
         // SAFETY: checked non-null.
         unsafe { out.write(registration.token) };
     }
-    hub.deliver(found);
+    // A blocking enumeration's callbacks have all run, on this thread,
+    // before registration returns, even while another thread is delivering.
+    if enumeration != 0 && enumeration != ASYNC_ENUMERATION {
+        hub.deliver_blocking(found);
+    } else {
+        hub.deliver(found);
+    }
     S_OK
 }
 /// Guide button and keyboard layout callbacks: neither ever changes here.
@@ -818,7 +918,10 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
             return true;
         }
         state = match deadline {
-            None => hub.returned.wait(state).unwrap_or_else(PoisonError::into_inner),
+            None => hub
+                .returned
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner),
             Some(deadline) => {
                 let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                     return false;
@@ -871,7 +974,7 @@ extern "system" fn enable_oem_device(
 extern "system" fn set_focus_policy(_: This, _policy: u32) {}
 
 static INPUT: Table<22> = Table([
-    no_interface as *const (),        // 0x00
+    query_interface as *const (),     // 0x00
     add_ref as *const (),             // 0x08 AddRef
     add_ref as *const (),             // 0x10 Release
     timestamp as *const (),           // 0x18
@@ -908,24 +1011,28 @@ extern "system" fn device_status(this: *const Device) -> u32 {
         0
     }
 }
-// shortcut: trigger motors are dropped (XInput has none). The host API that
-// drives them without a redistributable is Windows.Gaming.Input (WinRT
-// `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
+// The title sends trigger levels in slot 0x50; all four reach the
+// host, which drops the trigger motors (see `host::Host::rumble`).
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.index >= PADS {
         return;
     }
-    let [low, high, ..] = if params.is_null() {
+    let [low, high, left_trigger, right_trigger] = if params.is_null() {
         [0.0; 4]
     } else {
         // SAFETY: checked non-null; four motor levels.
         unsafe { *params }
     };
     let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
-    lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
+    let motors = Motors {
+        low: speed(low),
+        high: speed(high),
+        left_trigger: speed(left_trigger),
+        right_trigger: speed(right_trigger),
+    };
+    lock(&device.hub().source).rumble(device.index, motors);
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
@@ -936,7 +1043,7 @@ extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
 }
 
 static DEVICE: Table<21> = Table([
-    no_interface as *const (),        // 0x00
+    query_interface as *const (),     // 0x00
     add_ref as *const (),             // 0x08 AddRef
     add_ref as *const (),             // 0x10 Release
     device_info as *const (),         // 0x18
@@ -963,16 +1070,19 @@ fn reading<'a>(this: *const Reading) -> &'a Reading {
     // SAFETY: a reading we handed out and the title still holds.
     unsafe { &*this }
 }
+extern "system" fn reading_query(this: *const c_void, iid: *const [u8; 16], out: Out) -> HRESULT {
+    query_iunknown(this.cast(), iid, out, reading_add_ref)
+}
 extern "system" fn reading_add_ref(this: *const Reading) -> u32 {
     reading(this).refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 extern "system" fn reading_release(this: *const Reading) -> u32 {
-    let left = reading(this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
-    if left == 0 {
+    let left = release_ref(&reading(this).refs, "input reading");
+    if left == Some(0) {
         // SAFETY: the last reference is gone; `Ref::new` boxed it.
         drop(unsafe { Box::from_raw(this.cast_mut()) });
     }
-    left
+    left.unwrap_or(0)
 }
 extern "system" fn input_kind(this: *const Reading) -> u32 {
     reading(this).kind()
@@ -1028,7 +1138,7 @@ extern "system" fn nothing(_: *const c_void) -> usize {
 }
 
 static READING: Table<25> = Table([
-    no_interface as *const (),      // 0x00
+    reading_query as *const (),     // 0x00
     reading_add_ref as *const (),   // 0x08
     reading_release as *const (),   // 0x10
     input_kind as *const (),        // 0x18
@@ -1074,7 +1184,8 @@ mod host {
 
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
+        GetAsyncKeyState, GetKeyState, GetKeyboardLayout, HKL, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
+        ToUnicodeEx,
     };
     use windows_sys::Win32::UI::Input::XboxController::{
         XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
@@ -1134,17 +1245,32 @@ mod host {
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
-            if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
-                return None;
-            }
-            let mut state = XINPUT_STATE::default();
-            // SAFETY: room for the state.
-            if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
+            let empty = self.empty_until[slot].is_some_and(|until| Instant::now() < until);
+            if !empty {
+                let mut state = XINPUT_STATE::default();
+                // SAFETY: room for the state.
+                if unsafe { XInputGetState(slot as u32, &mut state) } == 0 {
+                    self.empty_until[slot] = None;
+                    return Some(convert(&state.Gamepad));
+                }
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
-                return None;
             }
-            self.empty_until[slot] = None;
-            Some(convert(&state.Gamepad))
+            // A DualSense is a HID device, not an XInput one; it plays slot 0
+            // when no XInput pad answers there.
+            if slot == 0
+                && let Some(pad) = super::super::dualsense::latest()
+            {
+                return Some(PadState {
+                    buttons: pad.buttons,
+                    left_trigger: pad.left_trigger,
+                    right_trigger: pad.right_trigger,
+                    left_x: pad.left_x,
+                    left_y: pad.left_y,
+                    right_x: pad.right_x,
+                    right_y: pad.right_y,
+                });
+            }
+            None
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
@@ -1162,22 +1288,31 @@ mod host {
                     .collect();
                 down.extend(held);
             }
-            down.into_iter()
-                .map(|vk| KeyState {
+            let state = keyboard_state(&down, caps_lock());
+            let layout = layout();
+            down.iter()
+                .map(|&vk| {
                     // SAFETY: plain query.
-                    scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
-                    virtual_key: vk,
-                    // shortcut: no characters (code point 0); Grand Theft
-                    // Auto VI reads scan codes and virtual keys only.
-                    ..Default::default()
+                    let scan_code = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) };
+                    let (code_point, dead_key) = character(vk, scan_code, &state, layout);
+                    KeyState {
+                        scan_code,
+                        code_point,
+                        virtual_key: vk,
+                        dead_key,
+                    }
                 })
                 .collect()
         }
 
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+        // shortcut: trigger motors are dropped (XInput has none). The host
+        // API that drives them without a redistributable is
+        // Windows.Gaming.Input (WinRT `Gamepad.Vibration`), which needs WinRT
+        // bindings this crate lacks outside diagnostics builds.
+        fn rumble(&mut self, slot: usize, motors: Motors) {
             let speeds = XINPUT_VIBRATION {
-                wLeftMotorSpeed: low,
-                wRightMotorSpeed: high,
+                wLeftMotorSpeed: motors.low,
+                wRightMotorSpeed: motors.high,
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
@@ -1223,6 +1358,82 @@ mod host {
             .collect()
     }
 
+    /// The keyboard state `ToUnicodeEx` reads with the keys `held` down:
+    /// each held key, the generic Shift, Ctrl and Alt from either side's key
+    /// (devices report sides only), and Caps Lock's toggle.
+    fn keyboard_state(held: &[u8], caps_lock: bool) -> [u8; 256] {
+        const DOWN: u8 = 0x80;
+        const TOGGLED: u8 = 1;
+        let mut state = [0u8; 256];
+        for &vk in held {
+            state[usize::from(vk)] = DOWN;
+            let generic = match vk {
+                0xA0 | 0xA1 => Some(0x10), // shift
+                0xA2 | 0xA3 => Some(0x11), // control
+                0xA4 | 0xA5 => Some(0x12), // alt
+                _ => None,
+            };
+            if let Some(g) = generic {
+                state[g] = DOWN;
+            }
+        }
+        if caps_lock {
+            state[0x14] |= TOGGLED;
+        }
+        state
+    }
+
+    fn caps_lock() -> bool {
+        // SAFETY: plain query.
+        let state = unsafe { GetKeyState(0x14) };
+        state & 1 != 0
+    }
+
+    /// The foreground window's keyboard layout (the title's while it has
+    /// focus; this thread's when there is no foreground window).
+    fn layout() -> HKL {
+        // SAFETY: plain queries; a null window gives thread 0, this thread.
+        unsafe {
+            GetKeyboardLayout(GetWindowThreadProcessId(
+                GetForegroundWindow(),
+                std::ptr::null_mut(),
+            ))
+        }
+    }
+
+    /// The character key `vk` types in `layout` with `state`: its code point
+    /// (0 when it types none, or several at once), and whether it is a dead
+    /// key, whose code point is then the accent's spacing form. Pending dead
+    /// keys are not combined: the thread's keyboard state is left alone.
+    fn character(vk: u8, scan_code: u32, state: &[u8; 256], layout: HKL) -> (u32, bool) {
+        /// `ToUnicodeEx` flag: keep the keyboard state (Windows 10 1607 on).
+        const KEEP_STATE: u32 = 4;
+        let mut text = [0u16; 8];
+        // SAFETY: the state is the 256 bytes the call reads; the buffer's
+        // length is passed with it.
+        let n = unsafe {
+            ToUnicodeEx(
+                u32::from(vk),
+                scan_code & 0xFF,
+                state.as_ptr(),
+                text.as_mut_ptr(),
+                text.len() as i32,
+                KEEP_STATE,
+                layout,
+            )
+        };
+        let units = match n {
+            0 => return (0, false),
+            ..0 => &text[..1],
+            n => &text[..(n as usize).min(text.len())],
+        };
+        let mut chars = char::decode_utf16(units.iter().copied());
+        match (chars.next(), chars.next()) {
+            (Some(Ok(c)), None) => (u32::from(c), n < 0),
+            _ => (0, false),
+        }
+    }
+
     /// The foreground window is one of ours (the title's or our fallback).
     fn focused() -> bool {
         let mut process = 0;
@@ -1254,6 +1465,32 @@ mod host {
             (1.0, -1.0, 1.0, 0.0)
         );
     }
+
+    #[test]
+    fn either_sides_modifier_holds_the_generic_one() {
+        let state = keyboard_state(&[0xA1, 0xA2, 0x41], false);
+        for vk in [0xA1, 0x10, 0xA2, 0x11, 0x41] {
+            assert_eq!(state[vk], 0x80, "{vk:#x}");
+        }
+        for vk in [0xA0, 0xA3, 0x12, 0x14] {
+            assert_eq!(state[vk], 0, "{vk:#x}");
+        }
+        assert_eq!(keyboard_state(&[], true)[0x14], 1);
+    }
+
+    #[test]
+    fn keys_type_their_characters() {
+        // Space and Enter type the same in every layout; F1 types nothing.
+        let layout = layout();
+        let typed = |vk: u8, held: &[u8]| {
+            // SAFETY: plain query.
+            let scan = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) };
+            character(vk, scan, &keyboard_state(held, false), layout)
+        };
+        assert_eq!(typed(0x20, &[0x20]), (0x20, false));
+        assert_eq!(typed(0x0D, &[0x0D]), (0x0D, false));
+        assert_eq!(typed(0x70, &[0x70]), (0, false));
+    }
 }
 
 #[cfg(test)]
@@ -1270,7 +1507,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
-        rumble: Vec<(usize, u16, u16)>,
+        rumble: Vec<(usize, Motors)>,
     }
 
     struct Fake(Arc<Mutex<FakeHost>>);
@@ -1282,8 +1519,8 @@ mod tests {
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
         }
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            self.0.lock().unwrap().rumble.push((slot, low, high));
+        fn rumble(&mut self, slot: usize, motors: Motors) {
+            self.0.lock().unwrap().rumble.push((slot, motors));
         }
     }
 
@@ -1413,6 +1650,44 @@ mod tests {
     }
 
     #[test]
+    fn query_interface_returns_iunknown_and_retains_the_reading() {
+        type Query = extern "system" fn(*const c_void, *const [u8; 16], Out) -> HRESULT;
+        let (hub, _) = fake();
+        let reading = Ref::new(Reading {
+            vtable: &READING,
+            refs: AtomicU32::new(1),
+            device: &hub.devices[FALLBACK],
+            sequence: 1,
+            timestamp: 0,
+            value: Value::Pad(PadState::default()),
+        });
+        let reading_ptr = reading.0.as_ptr().cast_const();
+        for object in [
+            std::ptr::from_ref(&hub.object).cast(),
+            std::ptr::from_ref(&hub.devices[FALLBACK]).cast(),
+            reading_ptr.cast(),
+        ] {
+            let query = slot::<Query, _>(object, 0);
+            let mut out = std::ptr::null();
+            assert_eq!(query(object, &IID_IUNKNOWN, &mut out), S_OK);
+            assert_eq!(out, object);
+            assert_eq!(query(object, &[0; 16], &mut out), E_NOINTERFACE);
+            assert!(out.is_null());
+            out = object;
+            assert_eq!(query(object, std::ptr::null(), &mut out), E_POINTER);
+            assert!(out.is_null());
+            assert_eq!(
+                query(object, &IID_IUNKNOWN, std::ptr::null_mut()),
+                E_POINTER
+            );
+        }
+        assert_eq!(reading.refs.load(Ordering::Relaxed), 2);
+        drop(reading);
+        let release = slot::<extern "system" fn(*const Reading) -> u32, _>(reading_ptr, 0x10);
+        assert_eq!(release(reading_ptr), 0);
+    }
+
+    #[test]
     fn pads_connect_report_and_disconnect() {
         let (hub, host) = fake();
         let log = Log::default();
@@ -1471,6 +1746,54 @@ mod tests {
         let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(rest), PadState::default());
         release(rest);
+    }
+
+    #[test]
+    fn with_no_device_readings_are_walked_across_devices_in_time_order() {
+        type Walk = extern "system" fn(This, *const Reading, u32, *const Device, Out) -> HRESULT;
+        let any = |hub: &Hub, offset, from, kind| {
+            let mut out = std::ptr::null();
+            let walk = slot::<Walk, _>(&hub.object, offset);
+            result(
+                walk(&hub.object, from, kind, std::ptr::null(), &mut out),
+                out,
+            )
+        };
+        let both = GAMEPAD_KIND | KEYBOARD_KIND;
+        let tick = || std::thread::sleep(Duration::from_millis(2));
+        let (hub, host) = fake();
+        // The first poll: the stand-in pad and the keyboard, at one time.
+        let stand_in = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        let no_keys = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        tick();
+        host.lock().unwrap().pads[1] = Some(PadState::default());
+        hub.poll();
+        let pad_a = current(hub, GAMEPAD_KIND, 1).unwrap();
+        tick();
+        host.lock().unwrap().keys = vec![key(b'W')];
+        hub.poll();
+        let w = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        tick();
+        host.lock().unwrap().pads[1].as_mut().unwrap().buttons = B;
+        hub.poll();
+        let pad_b = current(hub, GAMEPAD_KIND, 1).unwrap();
+
+        let order = [stand_in, no_keys, pad_a, w, pad_b];
+        for pair in order.windows(2) {
+            assert_eq!(any(hub, 0x28, pair[0], both), Ok(pair[1]));
+            assert_eq!(any(hub, 0x30, pair[1], both), Ok(pair[0]));
+        }
+        assert_eq!(any(hub, 0x30, stand_in, both), Err(READING_NOT_FOUND));
+        assert_eq!(any(hub, 0x28, pad_b, both), Err(READING_NOT_FOUND));
+        // Only gamepads: the keyboard's readings are skipped.
+        assert_eq!(any(hub, 0x28, stand_in, GAMEPAD_KIND), Ok(pad_a));
+        assert_eq!(any(hub, 0x28, pad_a, GAMEPAD_KIND), Ok(pad_b));
+        assert_eq!(any(hub, 0x30, pad_a, GAMEPAD_KIND), Ok(stand_in));
+        // Naming the device keeps the walk on it.
+        assert_eq!(walk(hub, 0x30, pad_a), Err(READING_NOT_FOUND));
+        for r in order {
+            release(r);
+        }
     }
 
     #[test]
@@ -1564,7 +1887,16 @@ mod tests {
         let mut token = 0;
         let context = (&raw const hub.object).cast_mut().cast();
         assert_eq!(
-            register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
+            register(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                1,
+                0,
+                context,
+                Some(slow),
+                &mut token
+            ),
             S_OK
         );
         host.lock().unwrap().pads[1] = Some(PadState::default());
@@ -1573,7 +1905,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
-        assert!(!unregister(&hub.object, token, 5000), "times out while it runs");
+        assert!(
+            !unregister(&hub.object, token, 5000),
+            "times out while it runs"
+        );
         let leave = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(50));
             LEAVE.store(true, Ordering::SeqCst);
@@ -1584,6 +1919,188 @@ mod tests {
         assert_eq!(FROM_INSIDE.load(Ordering::SeqCst), 1);
         poller.join().unwrap();
         leave.join().unwrap();
+    }
+
+    #[test]
+    fn callbacks_from_registration_and_poll_are_serialized() {
+        use std::sync::atomic::AtomicBool;
+        static ACTIVE: AtomicU32 = AtomicU32::new(0);
+        static PEAK: AtomicU32 = AtomicU32::new(0);
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        extern "system" fn tracked(
+            _: u64,
+            _: *mut c_void,
+            _: *const Device,
+            _: u64,
+            _: u32,
+            _: u32,
+        ) {
+            let active = ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+            PEAK.fetch_max(active, Ordering::SeqCst);
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            while !RELEASE.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+        let (hub, host) = fake();
+        type Register = extern "system" fn(
+            This,
+            *const Device,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            Option<DeviceCallback>,
+            *mut u64,
+        ) -> HRESULT;
+        let register = slot::<Register, _>(&hub.object, 0x48);
+        ACTIVE.store(0, Ordering::SeqCst);
+        PEAK.store(0, Ordering::SeqCst);
+        CALLS.store(0, Ordering::SeqCst);
+        RELEASE.store(false, Ordering::SeqCst);
+        // Blocking enumeration delivers its first callback on the registering
+        // thread, which stays inside it while the poll thread runs.
+        let registrar = std::thread::spawn(move || {
+            let mut token = 0;
+            register(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                1,
+                2,
+                std::ptr::null_mut(),
+                Some(tracked),
+                &mut token,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while ACTIVE.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_ne!(
+            ACTIVE.load(Ordering::SeqCst),
+            0,
+            "registration delivered a callback"
+        );
+        let poller = std::thread::spawn(move || {
+            host.lock().unwrap().pads[1] = Some(PadState::default());
+            hub.poll();
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(ACTIVE.load(Ordering::SeqCst), 1, "only one callback runs");
+        RELEASE.store(true, Ordering::SeqCst);
+        assert_eq!(registrar.join().unwrap(), S_OK);
+        poller.join().unwrap();
+        assert_eq!(PEAK.load(Ordering::SeqCst), 1);
+        assert!(
+            CALLS.load(Ordering::SeqCst) >= 2,
+            "initial and hotplug both ran"
+        );
+    }
+
+    /// A blocking enumeration registered while the poll thread is inside a
+    /// callback runs its callbacks on the registering thread before it
+    /// returns. The title registers holding a lock its callback takes: here
+    /// the poll thread's callback is waiting for that lock, so handing the
+    /// enumeration to the poll thread and waiting for it would never return.
+    #[test]
+    fn blocking_enumeration_runs_on_the_registering_thread_while_another_delivers() {
+        use std::sync::atomic::AtomicBool;
+        static HELD: AtomicU32 = AtomicU32::new(0);
+        static SEEN: AtomicU32 = AtomicU32::new(0);
+        static LOCKED: AtomicBool = AtomicBool::new(false);
+        /// The title's lock, held by the registering thread.
+        static TITLE: Mutex<()> = Mutex::new(());
+        static SEEN_ON: Mutex<Option<ThreadId>> = Mutex::new(None);
+        extern "system" fn hold(_: u64, _: *mut c_void, _: *const Device, _: u64, _: u32, _: u32) {
+            HELD.fetch_add(1, Ordering::SeqCst);
+            drop(TITLE.lock().unwrap_or_else(PoisonError::into_inner));
+        }
+        extern "system" fn seen(_: u64, _: *mut c_void, _: *const Device, _: u64, _: u32, _: u32) {
+            *SEEN_ON.lock().unwrap() = Some(std::thread::current().id());
+            SEEN.fetch_add(1, Ordering::SeqCst);
+        }
+        type Register = extern "system" fn(
+            This,
+            *const Device,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            Option<DeviceCallback>,
+            *mut u64,
+        ) -> HRESULT;
+        let (hub, host) = fake();
+        let register = slot::<Register, _>(&hub.object, 0x48);
+        HELD.store(0, Ordering::SeqCst);
+        SEEN.store(0, Ordering::SeqCst);
+        LOCKED.store(false, Ordering::SeqCst);
+        let mut token = 0;
+        let no_context = std::ptr::null_mut();
+        let any_device = std::ptr::null();
+        assert_eq!(
+            register(
+                &hub.object,
+                any_device,
+                GAMEPAD_KIND,
+                1,
+                0,
+                no_context,
+                Some(hold),
+                &mut token
+            ),
+            S_OK
+        );
+        // The title takes its lock, then registers once the poll thread is
+        // inside `hold`, waiting for that lock.
+        let registrar = std::thread::spawn(move || {
+            let title = TITLE.lock().unwrap();
+            LOCKED.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while HELD.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let mut token = 0;
+            let any_device = std::ptr::null();
+            let r = register(
+                &hub.object,
+                any_device,
+                GAMEPAD_KIND,
+                1,
+                2,
+                std::ptr::null_mut(),
+                Some(seen),
+                &mut token,
+            );
+            let seen_at_return = SEEN.load(Ordering::SeqCst);
+            drop(title);
+            (r, seen_at_return, std::thread::current().id())
+        });
+        while !LOCKED.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        // Plugging a pad in runs `hold` on the poll thread.
+        let poller = std::thread::spawn(move || {
+            host.lock().unwrap().pads[1] = Some(PadState::default());
+            hub.poll();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !registrar.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(registrar.is_finished(), "registration returned");
+        let (r, seen_at_return, registering) = registrar.join().unwrap();
+        assert_eq!(r, S_OK);
+        assert_ne!(
+            HELD.load(Ordering::SeqCst),
+            0,
+            "the poll thread was delivering"
+        );
+        assert_ne!(seen_at_return, 0, "its callbacks ran before it returned");
+        assert_eq!(*SEEN_ON.lock().unwrap(), Some(registering));
+        poller.join().unwrap();
     }
 
     #[test]
@@ -1610,6 +2127,59 @@ mod tests {
         rumble(device, &[0.5, 1.0, 1.0, 1.0]);
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
-        assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+        let full = Motors {
+            low: 32767,
+            high: 65535,
+            left_trigger: 65535,
+            right_trigger: 65535,
+        };
+        assert_eq!(
+            host.lock().unwrap().rumble,
+            [(2, full), (2, Motors::default())]
+        );
+    }
+
+    #[test]
+    fn trigger_rumble_reaches_the_host() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[1] = Some(PadState::default());
+        hub.poll();
+        let device = &hub.devices[1] as *const Device;
+        type Rumble = extern "system" fn(*const Device, *const [f32; 4]);
+        let rumble = slot::<Rumble, _>(device, 0x50);
+        // Out-of-range and NaN levels clamp or fall to off, like the grips.
+        rumble(device, &[0.0, 0.0, 0.25, 2.0]);
+        rumble(device, &[0.0, 0.0, -1.0, f32::NAN]);
+        let expected = [
+            (
+                1,
+                Motors {
+                    left_trigger: 16383,
+                    right_trigger: 65535,
+                    ..Motors::default()
+                },
+            ),
+            (1, Motors::default()),
+        ];
+        assert_eq!(host.lock().unwrap().rumble, expected);
+    }
+
+    /// A title releasing a reading once too often: the count stays 0 and
+    /// nothing is freed again (the old `fetch_sub(1) - 1` overflowed).
+    #[test]
+    fn reading_release_past_zero_leaves_the_count_at_zero() {
+        let reading = Box::into_raw(Box::new(Reading {
+            vtable: &READING,
+            refs: AtomicU32::new(0),
+            device: std::ptr::null(),
+            sequence: 0,
+            timestamp: 0,
+            value: Value::Keys(Vec::new()),
+        }));
+        assert_eq!(reading_release(reading), 0);
+        // SAFETY: still allocated: `reading_release` freed nothing.
+        assert_eq!(unsafe { &*reading }.refs.load(Ordering::Relaxed), 0);
+        // SAFETY: boxed above and not freed.
+        drop(unsafe { Box::from_raw(reading) });
     }
 }

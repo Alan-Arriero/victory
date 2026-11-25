@@ -15,6 +15,7 @@ const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    "nix",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -50,8 +51,12 @@ const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
 
 pub fn run(root: &Path, staged: bool) -> Result<()> {
     let files = list_files(root, staged)?;
+    check_files(root, staged, &files)
+}
+
+fn check_files(root: &Path, staged: bool, files: &[String]) -> Result<()> {
     let mut violations = Vec::new();
-    for path in &files {
+    for path in files {
         if EXCEPTIONS.iter().any(|(p, _)| p == path) {
             continue;
         }
@@ -61,7 +66,7 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
                 .current_dir(root)
                 .output()?;
             if !out.status.success() {
-                continue; // deleted in the index
+                bail!("cannot read staged file {path} ({})", out.status);
             }
             out.stdout
         } else {
@@ -147,7 +152,12 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    let allowed = ALLOWED_NAMES.contains(&name)
+    // Only these synthetic Metal test sources may use Python or Swift.
+    // All size, magic, NUL and encoded-data checks still apply.
+    let allowed = matches!(
+        path,
+        "tests/metal/generate.py" | "tests/metal/run.py" | "tests/metal/probe.swift"
+    ) || ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
             .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));
@@ -171,6 +181,13 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
         && run > MAX_ENCODED_RUN
     {
         problems.push(format!("{run}-character hex/base64 run (embedded data?)"));
+    } else {
+        let digits = longest_hex_literal_run(content);
+        if digits > MAX_ENCODED_RUN {
+            problems.push(format!(
+                "{digits} hex digits in one run of \\x/0x literals (embedded data?)"
+            ));
+        }
     }
     problems
 }
@@ -179,6 +196,38 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
 fn longest_encoded_run(content: &[u8]) -> Option<usize> {
     let is_payload = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=');
     content.split(|b| !is_payload(b)).map(<[u8]>::len).max()
+}
+
+/// Most hex digits in `\xNN` escapes or `0x` literals with only commas,
+/// whitespace or backslashes between them: a byte string or `xxd -i` array,
+/// which `longest_encoded_run` sees as many 3- or 4-character runs.
+/// shortcut: decimal arrays (`[77, 90, ...]`) still pass, add a literal count if one shows up.
+fn longest_hex_literal_run(content: &[u8]) -> usize {
+    let (mut i, mut run, mut longest) = (0, 0, 0);
+    while i < content.len() {
+        match &content[i..] {
+            [b'\\' | b'0', b'x' | b'X', rest @ ..] => {
+                let len = rest
+                    .iter()
+                    .take_while(|b| b.is_ascii_hexdigit() || **b == b'_')
+                    .count();
+                run += rest[..len].iter().filter(|b| b.is_ascii_hexdigit()).count();
+                longest = longest.max(run);
+                // Skip a type suffix such as `u8` or `u32`.
+                let suffix = rest[len..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_alphanumeric())
+                    .count();
+                i += 2 + len + suffix;
+            }
+            [b, ..] if matches!(b, b',' | b'\\') || b.is_ascii_whitespace() => i += 1,
+            _ => {
+                run = 0;
+                i += 1;
+            }
+        }
+    }
+    longest
 }
 
 #[cfg(test)]
@@ -192,10 +241,30 @@ mod tests {
     }
 
     #[test]
+    fn staged_file_read_failure_is_reported() {
+        let path = "missing-from-index.txt".to_string();
+        let result = super::check_files(&crate::workspace_root(), true, &[path]);
+        let err = result.expect_err("a staged file that cannot be read must fail the check");
+        assert!(err.to_string().contains("missing-from-index.txt"));
+    }
+
+    #[test]
     fn accepts_source() {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
+    }
+
+    #[test]
+    fn metal_test_sources_are_still_checked() {
+        assert!(check("tests/metal/generate.py", b"import struct").is_empty());
+        assert!(check("tests/metal/run.py", b"import subprocess").is_empty());
+        assert!(check("tests/metal/probe.swift", b"import Metal").is_empty());
+
+        assert!(!check("other.py", b"pass").is_empty());
+        assert!(!check("other.swift", b"import Metal").is_empty());
+        assert!(!check("tests/metal/probe.swift", b"MZ\x00").is_empty());
+        assert!(!check("tests/metal/run.py", &vec![b'a'; 800]).is_empty());
     }
 
     #[test]
@@ -219,5 +288,42 @@ mod tests {
     fn rejects_data_smuggled_into_text() {
         let blob = format!("const DATA: &str = \"{}\";", "A1".repeat(400));
         assert!(!check("src/blob.rs", blob.as_bytes()).is_empty());
+    }
+
+    /// Synthetic bytes, never game data.
+    fn synthetic(n: u32) -> impl Iterator<Item = u32> {
+        (0..n).map(|i| (i * 37 + 11) % 256)
+    }
+
+    #[test]
+    fn rejects_data_smuggled_as_an_escaped_byte_string() {
+        // 4096 bytes as one unbroken `\xNN` hex run, the shape a byte-string
+        // literal of copied data takes.
+        let esc: String = synthetic(4096).map(|b| format!("\\x{b:02x}")).collect();
+        let src = format!("pub const DATA: &[u8] = b\"{esc}\";\n");
+        assert!(
+            !check("src/data.rs", src.as_bytes()).is_empty(),
+            "{} bytes of \\x-escaped hex passed",
+            src.len()
+        );
+    }
+
+    #[test]
+    fn rejects_data_smuggled_as_a_hex_byte_array() {
+        // `xxd -i` style: 4096 bytes as hex literals.
+        let lits: Vec<String> = synthetic(4096).map(|b| format!("0x{b:02x}")).collect();
+        let src = format!("pub const DATA: [u8; 4096] = [{}];\n", lits.join(", "));
+        assert!(
+            !check("src/data.rs", src.as_bytes()).is_empty(),
+            "{} bytes of hex array passed",
+            src.len()
+        );
+        // A short constant table, like the 16-entry ones in the tree, stays legal.
+        let table: Vec<String> = synthetic(16).map(|w| format!("0x{w:08x}_u32")).collect();
+        let src = format!(
+            "const T: [u32; 16] = [\n    {},\n];\n",
+            table.join(",\n    ")
+        );
+        assert!(check("src/table.rs", src.as_bytes()).is_empty());
     }
 }

@@ -7,6 +7,8 @@
 
 use std::collections::HashMap;
 
+pub mod opt;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
 
@@ -486,12 +488,30 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
-    /// The module as bitcode.
-    /// Which instructions are written: every body instruction, the branch
-    /// conditions, and whatever they read, transitively (a phi nothing reads
-    /// is dropped). A worklist visits each instruction once, so a long chain
-    /// of merges costs one pass, not one pass per merge.
-    fn live(&self) -> Vec<bool> {
+    #[cfg(test)]
+    pub(crate) fn has_dx_op(&self, name: &str, opcode: i64) -> bool {
+        self.insts.iter().any(|inst| match &inst.op {
+            Op::Call(fid, args) => {
+                self.funcs[*fid as usize].name == name
+                    && matches!(
+                        args.first(),
+                        Some(V::Const(cid)) if matches!(self.consts[*cid as usize].1, Const::Int(n) if n == opcode)
+                    )
+            }
+            _ => false,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_cmp(&self, predicate: u8) -> bool {
+        self.insts
+            .iter()
+            .any(|inst| matches!(inst.op, Op::Cmp(p, _, _) if p == predicate))
+    }
+
+    /// Start from instructions that must execute and from externally used
+    /// values. The worklist keeps their operands, including loop-carried phis.
+    fn live(&self, omit_unused_math: bool) -> Vec<bool> {
         let mut live = vec![false; self.insts.len()];
         let mut work: Vec<u32> = Vec::new();
         let mark = |live: &mut [bool], work: &mut Vec<u32>, v: V| {
@@ -502,8 +522,27 @@ impl Module {
                 work.push(i);
             }
         };
+        for md in &self.mds {
+            if let MdDef::Value(_, v) = md {
+                mark(&mut live, &mut work, *v);
+            }
+        }
         for b in &self.blocks {
             for &i in &b.body {
+                let op = &self.insts[i as usize].op;
+                if omit_unused_math
+                    && matches!(
+                        op,
+                        Op::Bin(..)
+                            | Op::Cast(..)
+                            | Op::Cmp(..)
+                            | Op::Select(..)
+                            | Op::Extract(..)
+                            | Op::Gep(..)
+                    )
+                {
+                    continue;
+                }
                 mark(&mut live, &mut work, V::Inst(i));
             }
             if let Some(Term::CondBr(c, ..)) = b.term {
@@ -518,7 +557,7 @@ impl Module {
         live
     }
 
-    pub fn write(&self) -> Vec<u8> {
+    pub fn write(&self, omit_unused_math: bool) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
         w.enter(MODULE_BLOCK, 3);
@@ -650,8 +689,8 @@ impl Module {
         }
         w.exit();
 
-        // Phis nothing reads are left out (one register per phi makes many).
-        let live = self.live();
+        let live = self.live(omit_unused_math);
+        let is_live = |i: &&u32| live[**i as usize];
 
         // Blocks are laid out in reverse postorder, so every block follows
         // its forward predecessors (drivers take a branch to an earlier
@@ -717,7 +756,7 @@ impl Module {
         let mut ids = vec![u32::MAX; self.insts.len()];
         let mut next = base;
         for b in layout.iter().map(|&b| &self.blocks[b]) {
-            for &i in b.phis.iter().filter(|&&i| live[i as usize]).chain(&b.body) {
+            for &i in b.phis.iter().chain(&b.body).filter(is_live) {
                 if !self.is_void(self.insts[i as usize].ty) {
                     ids[i as usize] = next;
                     next += 1;
@@ -799,7 +838,7 @@ impl Module {
         // The operands of variable-length records, reused across them.
         let mut r: Vec<u64> = Vec::new();
         for b in layout.iter().map(|&b| &self.blocks[b]) {
-            for &i in b.phis.iter().filter(|&&i| live[i as usize]).chain(&b.body) {
+            for &i in b.phis.iter().chain(&b.body).filter(is_live) {
                 let inst = &self.insts[i as usize];
                 let rel = |v: V| {
                     let a = abs(v);
@@ -1131,7 +1170,7 @@ mod tests {
     fn worklist_liveness_matches_passes() {
         for (regs, stages, read) in [(1, 0, 1), (1, 1, 1), (4, 3, 1), (8, 17, 3), (16, 40, 16)] {
             let m = synthetic(regs, stages, read);
-            let live = m.live();
+            let live = m.live(false);
             assert_eq!(live, live_by_passes(&m), "{regs} regs x {stages} stages");
         }
     }
@@ -1158,10 +1197,51 @@ mod tests {
             V::Inst(i) => i as usize,
             _ => unreachable!(),
         };
-        let live = m.live();
+        let live = m.live(false);
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
+    }
+
+    #[test]
+    fn compute_keeps_calls_and_memory_effects_with_their_operands() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let shared = m.global("shared", i32t, 3);
+        let fty = m.func_ty(i32t, vec![i32t]);
+        let f = m.function("test_call", fty, None, false);
+        let entry = m.new_block();
+        let x = m.load(entry, shared);
+        let two = m.i32(2);
+        let arg = m.bin(entry, Bin::Add, x, two);
+        let call = m.call(entry, f, vec![arg]);
+        let old = m.atomic(entry, Rmw::Add, shared, arg);
+        m.store(entry, shared, old);
+        let store = *m.blocks[entry].body.last().unwrap();
+        let unused = m.bin(entry, Bin::Mul, call, two);
+        let live = m.live(true);
+        let retained = |v| match v {
+            V::Inst(i) => live[i as usize],
+            _ => unreachable!(),
+        };
+        assert!([x, arg, call, old].into_iter().all(retained));
+        assert!(live[store as usize]);
+        assert!(!retained(unused));
+    }
+
+    #[test]
+    fn unused_arithmetic_can_release_a_loop_carried_phi() {
+        let m = synthetic(64, 64, 8);
+        let all = m.live(false);
+        let needed = m.live(true);
+        let removed_phis = m
+            .insts
+            .iter()
+            .enumerate()
+            .filter(|(i, inst)| all[*i] && !needed[*i] && matches!(inst.op, Op::Phi(_)))
+            .count();
+        assert!(removed_phis >= 56);
+        assert!(m.write(true).len() < m.write(false).len());
     }
 
     #[test]
@@ -1180,7 +1260,7 @@ mod tests {
             ((64, 64, 64), 38_916, 0x9586_730c_f953_4a45),
             ((128, 256, 32), 295_952, 0x89e5_de2d_64f0_8785),
         ] {
-            let bytes = synthetic(regs, stages, read).write();
+            let bytes = synthetic(regs, stages, read).write(false);
             assert_eq!((bytes.len(), fnv(&bytes)), (len, hash), "{regs}x{stages}");
         }
     }
@@ -1190,11 +1270,11 @@ mod tests {
     fn bench_write() {
         for (regs, stages, read) in [(64, 64, 64), (128, 256, 32), (256, 512, 256)] {
             let m = synthetic(regs, stages, read);
-            let bytes = m.write();
+            let bytes = m.write(false);
             let runs = 5;
             let t = std::time::Instant::now();
             for _ in 0..runs {
-                std::hint::black_box(m.write());
+                std::hint::black_box(m.write(false));
             }
             let per = t.elapsed() / runs;
             println!(

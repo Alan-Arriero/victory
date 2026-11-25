@@ -29,7 +29,7 @@ pub static IID: Iid = guid(
 );
 
 /// The levels the device answers to, as on PC: `ID3D12Device1` to
-/// `ID3D12Device8`, and `ID3D12Device11`, which Grand Theft Auto VI creates
+/// `ID3D12Device8`, and `ID3D12Device11`, which the title creates
 /// its device as. Each level's table is the one before plus its methods.
 const LEVEL_IIDS: [Iid; 9] = [
     guid(
@@ -94,7 +94,7 @@ pub(crate) fn is_device(iid: *const Iid) -> bool {
 }
 
 /// The interface version these layouts were checked against (2.4). Both
-/// Minecraft (March 2022) and Grand Theft Auto VI (April 2026) pass it.
+/// Minecraft (March 2022) and the title (April 2026) pass it.
 pub const CHECKED_VERSION: u32 = 0x0002_0004;
 
 /// Feature level 12_2, what the console hardware supports.
@@ -160,7 +160,7 @@ pub extern "system" fn create(
 /// queues then have the newer layouts (two more methods each; see
 /// `list` and `queue`), although the interface version stays 2.4.
 /// shortcut: the creation interface is the only sign of the newer layouts
-/// we have (Grand Theft Auto VI, April 2026, versus Minecraft, March 2022);
+/// we have (the title, April 2026, versus Minecraft, March 2022);
 /// look for a better one if a title breaks the rule.
 static NEWER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -273,12 +273,16 @@ extern "system" fn check_feature_support(
     const FEATURE_LEVELS: u32 = 2;
     const FORMAT_SUPPORT: u32 = 3;
     const MULTISAMPLE: u32 = 4;
+    const FORMAT_INFO: u32 = 5;
+    const VIRTUAL_ADDRESS: u32 = 6;
     let expected = match feature {
         OPTIONS_QUERY => size_of_val(&OPTIONS),
         ARCHITECTURE => 16,
         FEATURE_LEVELS => size_of::<FeatureLevels>(),
         FORMAT_SUPPORT => 12,
         MULTISAMPLE => 16,
+        FORMAT_INFO => 8,
+        VIRTUAL_ADDRESS => 8,
         _ => {
             tracing::warn!(feature, size, "device feature query not implemented");
             return E_NOTIMPL;
@@ -320,8 +324,31 @@ extern "system" fn check_feature_support(
             q[3] = u32::from(matches!(q[1], 1 | 2 | 4 | 8));
             S_OK
         }
+        FORMAT_INFO => {
+            // SAFETY: checked size and non-null.
+            let q = unsafe { &mut *data.cast::<[u32; 2]>() };
+            // DXGI_FORMAT in, plane count out (the byte is padded to 8).
+            q[1] = plane_count(q[0]);
+            S_OK
+        }
+        VIRTUAL_ADDRESS => {
+            // SAFETY: checked size and non-null.
+            let q = unsafe { &mut *data.cast::<[u32; 2]>() };
+            // The bits OPTIONS reports for a resource, and user space's
+            // 48 bits for the process (addresses are CPU addresses here).
+            q[0] = OPTIONS[9];
+            q[1] = 48;
+            S_OK
+        }
         _ => feature_levels(data),
     }
+}
+
+/// The planes of the depth/stencil format families; everything else has
+/// one. These are the DXGI format numbers, including the typeless and
+/// read-only views of the same two planes.
+fn plane_count(format: u32) -> u32 {
+    1 + u32::from(matches!(format, 19..=22 | 44..=47))
 }
 
 fn feature_levels(data: *mut c_void) -> HRESULT {
@@ -431,11 +458,17 @@ mod tests {
         );
         let missing = slot::<extern "system" fn() -> HRESULT>(device, 0xf0);
         assert_eq!(missing(), E_NOTIMPL);
+        // Not written yet, so they fail: the title takes S_OK from them as success, goes on
+        // to use what they should have produced and faults in its own code.
+        let s1c8 = slot::<extern "system" fn() -> HRESULT>(device, 0x1c8);
+        assert_eq!(s1c8(), E_NOTIMPL);
+        let s218 = slot::<extern "system" fn() -> HRESULT>(device, 0x218);
+        assert_eq!(s218(), E_NOTIMPL);
     }
 
     #[test]
     fn newer_device_levels_are_the_same_device() {
-        // ID3D12Device11, as Grand Theft Auto VI asks for it.
+        // ID3D12Device11, as the title asks for it.
         let (hr, device) = create_as(&LEVEL_IIDS[8]);
         assert_eq!((hr, device), (S_OK, super::device()));
         let mut same = std::ptr::null();
@@ -528,5 +561,33 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    #[test]
+    fn format_info_reports_the_planes_of_depth_formats() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let check = slot::<Check>(device(), 0x68);
+        let query = |format: u32, size| {
+            let mut info = [format, u32::MAX];
+            let hr = check(device(), 5, (&raw mut info).cast(), size);
+            (hr, info[1])
+        };
+        assert_eq!(query(28, 8), (S_OK, 1), "R8G8B8A8_UNORM");
+        assert_eq!(query(45, 8), (S_OK, 2), "D24_UNORM_S8_UINT");
+        assert_eq!(query(20, 8), (S_OK, 2), "D32_FLOAT_S8X24_UINT");
+        assert_eq!(query(19, 8), (S_OK, 2), "R32G8X24_TYPELESS");
+        assert_eq!(query(47, 8), (S_OK, 2), "X24_TYPELESS_G8_UINT");
+        assert_eq!(query(28, 4).0, E_INVALIDARG, "wrong size");
+    }
+
+    #[test]
+    fn virtual_address_support_matches_the_reported_address_space() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let check = slot::<Check>(device(), 0x68);
+        let mut info = [0u32; 2];
+        assert_eq!(check(device(), 6, (&raw mut info).cast(), 8), S_OK);
+        assert_eq!(info[0], OPTIONS[9], "resource bits agree with OPTIONS");
+        assert_eq!(info[1], 48);
+        assert_eq!(check(device(), 6, (&raw mut info).cast(), 4), E_INVALIDARG);
     }
 }

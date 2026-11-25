@@ -178,8 +178,8 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
         && let Some(t) = texture_layout(desc)
     {
         // As the console: the layout's own alignment unless more is asked
-        // (4 KiB for 4 KiB modes, where PC says 64 KiB). Grand Theft Auto
-        // VI keeps these sizes in its texture tables, and its streaming
+        // (4 KiB for 4 KiB modes, where PC says 64 KiB). The
+        // title keeps these sizes in its texture tables, and its streaming
         // asserts when they disagree with the streamed layout.
         let alignment = desc.alignment.max(t.alignment);
         if !alignment.is_power_of_two() {
@@ -237,6 +237,22 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// The format a render target or unordered-access texture of `format` is
+/// made in on the host, and that render target views and pipelines name:
+/// `R16G16B16A16_FLOAT` (10) for `R9G9B9E5_SHAREDEXP` (67), which PC D3D12
+/// forbids as a render target or unordered-access resource; else
+/// [`pc_format`]. Textures only sampled keep `R9G9B9E5_SHAREDEXP`.
+pub(crate) fn target_format(format: u32) -> u32 {
+    const R9G9B9E5_SHAREDEXP: u32 = 67;
+    const RGBA16_FLOAT: u32 = 10;
+    let format = pc_format(format);
+    if format == R9G9B9E5_SHAREDEXP {
+        RGBA16_FLOAT
+    } else {
+        format
+    }
+}
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
@@ -252,7 +268,7 @@ pub(crate) fn family(format: u32) -> u32 {
         (44, 47),
         (48, 52),
         (53, 59),
-        (60, 65),
+        (60, 64),
         (70, 72),
         (73, 75),
         (76, 78),
@@ -273,18 +289,28 @@ pub(crate) fn family(format: u32) -> u32 {
     }
 }
 
-/// sRGB formats and their linear twins.
-pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
+/// sRGB formats and their linear twins: 8-bit color, then BC1, BC2, BC3
+/// and BC7.
+pub(crate) const SRGB: [(u32, u32); 7] = [
+    (29, 28),
+    (91, 87),
+    (93, 88),
+    (72, 71),
+    (75, 74),
+    (78, 77),
+    (99, 98),
+];
 
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
+#[cfg(windows)]
 pub(crate) fn view_format(this: This) -> Option<u32> {
-    let own = pc_format(resource(this).desc.format);
     let host = host_resource(this)?;
+    let own = pc_format(resource(this).desc.format);
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
-    (format != own).then_some(own)
+    (format != own && format != target_format(own)).then_some(own)
 }
 
 /// Depth formats with their typeless family: depth textures that shaders
@@ -316,20 +342,34 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
     pub(crate) offset: u64,
-    format: u32,
-    width: u32,
-    height: u32,
-    depth: u32,
-    row_pitch: u32,
+    pub(crate) format: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) depth: u32,
+    pub(crate) row_pitch: u32,
 }
 
 impl PlacedFootprint {
+    /// `(lines, row_bytes, total_bytes)` spanned in a buffer: every row
+    /// pitched but the last.
+    pub(crate) fn layout(&self) -> Option<(u64, u64, u64)> {
+        let (element, block) = element(self.format)?;
+        let lines = u64::from(self.height)
+            .div_ceil(block)
+            .checked_mul(u64::from(self.depth))?;
+        let row_bytes = u64::from(self.width).div_ceil(block).checked_mul(element)?;
+        if lines == 0 {
+            return Some((0, row_bytes, 0));
+        }
+        let total = u64::from(self.row_pitch)
+            .checked_mul(lines - 1)?
+            .checked_add(row_bytes)?;
+        Some((lines, row_bytes, total))
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
-        let (element, block) = element(self.format)?;
-        let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
-        let last = u64::from(self.width).div_ceil(block) * element;
-        Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
+        self.layout().map(|(_, _, total)| total)
     }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
@@ -569,7 +609,7 @@ static ALLOCATOR: std::sync::OnceLock<(AllocRoutine, FreeRoutine)> = std::sync::
 
 /// Committed resources get their memory from the title's general
 /// allocator, as on the console, where titles hook it to place graphics
-/// memory themselves (Grand Theft Auto VI places its back buffers in a
+/// memory themselves (the title places its back buffers in a
 /// block of its own and checks they fill it). The runtime names it before
 /// the device exists.
 pub fn use_allocator(alloc: AllocRoutine, free: FreeRoutine) {
@@ -711,11 +751,13 @@ extern "system" fn heap_query(this: This, iid: *const Iid, out: *mut This) -> HR
 extern "system" fn heap_release(this: This) -> u32 {
     object::release_boxed::<Heap>(this)
 }
-extern "system" fn heap_desc(this: This, out: *mut HeapDesc) {
+/// Returns `out`, as the x64 COM ABI requires for struct returns in `RAX`.
+extern "system" fn heap_desc(this: This, out: *mut HeapDesc) -> *mut HeapDesc {
     if !out.is_null() {
         // SAFETY: `this` is a heap; the title passes room for a description.
         unsafe { out.write((*this.cast::<Heap>()).desc) };
     }
+    out
 }
 
 /// A resource's memory: its own, or a range of a heap it holds a reference
@@ -746,9 +788,36 @@ struct Resource {
     heap_flags: u32,
     backing: Backing,
     /// Textures also live on the host GPU (decision 0007); buffers do not
-    /// yet.
+    /// yet. Made on first use (a view, a target, a copy, a barrier), not
+    /// at creation: a texture the title makes and never has the GPU use
+    /// costs no host memory (the world makes thousands; their host copies
+    /// took about 9 GB, past an 8 GB card's budget, 2026-11-24).
     #[cfg(windows)]
-    host: Option<std::sync::Arc<HostTexture>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<HostTexture>>>,
+    /// The creation state and clear value the host copy is made with.
+    #[cfg(windows)]
+    made_with: (u32, Option<[u32; 5]>),
+}
+
+#[cfg(windows)]
+impl Resource {
+    /// The host copy, made now if this is its first use.
+    fn host(&self) -> Option<&std::sync::Arc<HostTexture>> {
+        self.host
+            .get_or_init(|| {
+                let (state, clear) = self.made_with;
+                let clear = clear
+                    .as_ref()
+                    .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
+                let texture = host_texture(&self.desc, state, clear)?;
+                let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
+                Some(std::sync::Arc::new(HostTexture {
+                    texture,
+                    state: state.into(),
+                }))
+            })
+            .as_ref()
+    }
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -768,7 +837,7 @@ pub(crate) struct HostTexture {
 #[cfg(windows)]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
-    let host = resource(this).host.as_ref()?;
+    let host = resource(this).host()?;
     let before = host
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
@@ -783,7 +852,7 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    resource(this).host.as_deref().map(|h| &h.texture)
+    resource(this).host().map(|h| &h.texture)
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -792,7 +861,7 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.clone()
+    resource(this).host().cloned()
 }
 
 /// A host texture like the title's: same description, in GPU memory,
@@ -814,7 +883,7 @@ fn host_texture(
     d.alignment = 0;
     d.flags &= PC_FLAGS;
     // PC refuses depth targets that are also unordered-access (the console
-    // allows both; Grand Theft Auto VI's shadow maps ask for it).
+    // allows both; the title's shadow maps ask for it).
     // shortcut: the host copy loses UAV use; give it a second view-only
     // copy if draws write it as a UAV.
     const DEPTH: u32 = 2;
@@ -822,7 +891,12 @@ fn host_texture(
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
-    d.format = pc_format(d.format);
+    const RENDER_TARGET: u32 = 1;
+    d.format = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
+        target_format(d.format)
+    } else {
+        pc_format(d.format)
+    };
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -839,7 +913,11 @@ fn host_texture(
     let clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
-        value[0] = pc_format(value[0]);
+        value[0] = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
+            target_format(value[0])
+        } else {
+            pc_format(value[0])
+        };
         value
     });
     let heap = D3D12_HEAP_PROPERTIES {
@@ -847,27 +925,59 @@ fn host_texture(
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
-    // SAFETY: the description has the host layout (checked size, same
-    // fields); the out pointer is ours.
-    let made = unsafe {
-        host.device.CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(
-                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-            ),
-            // The same layout: format, then color or depth and stencil.
-            clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
-            &mut texture,
-        )
+    let create = |d: &ResourceDesc, texture: &mut Option<ID3D12Resource>| {
+        // A clear value is only legal on render targets and depth.
+        let clear = clear_value
+            .as_ref()
+            .filter(|_| d.flags & (1 | DEPTH) != 0)
+            .map(|v| std::ptr::from_ref(v).cast());
+        // SAFETY: the description has the host layout (checked size, same
+        // fields); the out pointer is ours.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                std::ptr::from_ref(d).cast(),
+                D3D12_RESOURCE_STATES(crate::host::legal_for(
+                    d.flags,
+                    crate::host::texture_state(state),
+                ) as i32),
+                // The same layout: format, then color or depth and stencil.
+                clear,
+                texture,
+            )
+        }
     };
+    let mut made = create(&d, &mut texture);
+    // Not every host GPU offers every use of every format (NVIDIA: no
+    // unordered access to BGRA8, no B4G4R4A4 render targets, where the
+    // console's AMD GPU has both). Give up the uses the host refuses, UAV
+    // first; the views the host cannot make are skipped as for depth.
+    for drop in [UNORDERED, 1] {
+        if made.is_ok() || d.flags & drop == 0 {
+            continue;
+        }
+        let mut fewer = d;
+        fewer.flags &= !drop;
+        let mut retry: Option<ID3D12Resource> = None;
+        if create(&fewer, &mut retry).is_ok() {
+            tracing::warn!(desc = ?d, dropped = drop, "host texture without a use the host refuses");
+            d = fewer;
+            texture = retry;
+            made = Ok(());
+        } else if drop == UNORDERED {
+            d = fewer; // also try with neither
+        }
+    }
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+            format!(
+                "texture {}x{} f{} flags {:#x}",
+                d.width, d.height, d.format, d.flags
+            )
         });
     }
     texture
@@ -927,8 +1037,13 @@ fn hand_out_resource(
 ) -> HRESULT {
     #[cfg(not(windows))]
     let _ = (state, clear);
+    // The clear value is the caller's only during the call.
     #[cfg(windows)]
-    let host = host_texture(&desc, state, clear);
+    let made_with = (
+        state,
+        // SAFETY: the title passes a whole clear value (5 words) or null.
+        (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() }),
+    );
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -936,18 +1051,17 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: host.map(|texture| {
-            let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
-            std::sync::Arc::new(HostTexture {
-                texture,
-                state: state.into(),
-            })
-        }),
+        host: std::sync::OnceLock::new(),
+        #[cfg(windows)]
+        made_with,
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
+    } else if host_writes(&desc) {
+        let at = std::ptr::from_ref::<Resource>(&resource) as usize;
+        targets().insert(resource.data() as u64, at);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -958,7 +1072,8 @@ impl Drop for Resource {
         #[cfg(feature = "diagnostics")]
         if self
             .host
-            .as_ref()
+            .get()
+            .and_then(Option::as_ref)
             .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)
         {
             // Before lists held their textures, this freed a texture that
@@ -973,8 +1088,19 @@ impl Drop for Resource {
                 );
             }
         }
+        // A running submission may still read the host copy.
+        if let Some(host) = self.host.take().flatten() {
+            crate::host::retire(host);
+        }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        if self.desc.dimension != BUFFER && host_writes(&self.desc) {
+            let mut targets = targets();
+            let at = self.data() as u64;
+            if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
+                targets.remove(&at);
+            }
+        }
         if self.desc.dimension == BUFFER {
             crate::shadow::unregister(
                 std::ptr::from_ref::<Resource>(self) as usize,
@@ -1024,7 +1150,7 @@ pub(crate) extern "system" fn create_committed(
     )
 }
 
-/// Device method 0x3f8, inferred from Grand Theft Auto VI's calls
+/// Device method 0x3f8, inferred from the title's calls
 /// (title+0x193e1b4: its back buffers, heap flag "allow display"): the
 /// committed resource creation of the enhanced-barrier interfaces,
 /// `(heap, heap flags, desc1, initial layout, clear value, protected
@@ -1087,7 +1213,7 @@ pub(crate) extern "system" fn unregister_page_pool(_: This, handle: usize) -> HR
 }
 
 /// Device method 0x428, one of the `ID3D12Device9` to `ID3D12Device11`
-/// additions. From Grand Theft Auto VI's call: a resource at a virtual
+/// additions. From the title's call: a resource at a virtual
 /// address the title mapped itself, `(address, desc1, initial barrier
 /// layout, clear value, iid, out)`, as `CreatePlacedResourceX` with
 /// enhanced barriers. GPU addresses are CPU addresses, so the resource is
@@ -1137,7 +1263,7 @@ pub(crate) extern "system" fn create_at_address(
 }
 
 /// Textures the title placed in its own memory and views without a
-/// resource object (device 0x230, Grand Theft Auto VI's streamed and
+/// resource object (device 0x230, the title's streamed and
 /// interface textures), by address and description: a resource at that
 /// address, made the first time a draw reads one.
 /// shortcut: never released (one host texture per distinct address and
@@ -1174,7 +1300,89 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    placed_views().insert(out as usize);
+    resource(out).host().is_some().then_some(out)
+}
+
+/// The resources [`texture_at`] made (never released, as they are).
+#[cfg(windows)]
+fn placed_views() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize>> {
+    static PLACED: std::sync::Mutex<std::collections::BTreeSet<usize>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    PLACED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether the host writes a texture described by `desc` (a render target,
+/// depth or unordered-access texture): its contents exist on the host alone,
+/// not in title memory.
+#[cfg(windows)]
+fn host_writes(desc: &ResourceDesc) -> bool {
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    desc.dimension != BUFFER && desc.flags & TARGET_DEPTH_UNORDERED != 0
+}
+
+/// The title textures the host writes ([`host_writes`]), by the address of
+/// their memory: what a view the title places in that memory in another
+/// format shows ([`alias_of`]). A texture leaves the table before it is
+/// freed.
+#[cfg(windows)]
+fn targets() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<u64, usize>> {
+    static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// For `this`, a texture made for a view the title placed in memory
+/// ([`texture_at`]): the title texture the host writes that lies in the same
+/// memory, if there is one of the same size, levels and layers with texels of
+/// the same width.
+///
+/// The console reads such memory through the view as it is: a title can
+/// pack light as R9G9B9E5 into R32_UINT textures with compute shaders, which
+/// cannot write R9G9B9E5, and sample them through R9G9B9E5 views placed at
+/// the textures' addresses. On the host these are two textures and what the
+/// shaders wrote exists in one of them only; the other was filled from title
+/// memory, which nothing writes, so everything read through such a view was
+/// black. The caller copies the written texture's texels into the view's
+/// (`texture::alias`).
+///
+/// `VICTORY_ALIAS_COPY=0` (diagnostics builds) finds none, as before.
+#[cfg(windows)]
+pub(crate) fn alias_of(this: This) -> Option<This> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        !cfg!(feature = "diagnostics")
+            || std::env::var_os("VICTORY_ALIAS_COPY").is_none_or(|v| v != "0")
+    });
+    if this.is_null() || !on {
+        return None;
+    }
+    let r = resource(this);
+    // A level count of 0 asks for a full chain: not counted here.
+    let plain = |d: &ResourceDesc| {
+        d.dimension != BUFFER
+            && d.mip_levels >= 1
+            && d.depth_or_array_size >= 1
+            && d.sample_count <= 1
+    };
+    if host_writes(&r.desc) || !plain(&r.desc) || !placed_views().contains(&(this as usize)) {
+        return None;
+    }
+    // Under the table's lock: a texture leaves it before it is freed.
+    let targets = targets();
+    let other = *targets.get(&(r.data() as u64))? as This;
+    let o = resource(other);
+    const DEPTH: u32 = 0x2;
+    let same = plain(&o.desc)
+        && o.desc.dimension == r.desc.dimension
+        && o.desc.width == r.desc.width
+        && o.desc.height == r.desc.height
+        && o.desc.mip_levels == r.desc.mip_levels
+        && o.desc.depth_or_array_size == r.desc.depth_or_array_size
+        && o.desc.flags & DEPTH == 0
+        && target_format(o.desc.format) == o.desc.format
+        && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
+    same.then_some(other)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -1246,11 +1454,13 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
     S_OK
 }
 extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
-extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
+/// Returns `out`, as the x64 COM ABI requires for struct returns in `RAX`.
+extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) -> *mut ResourceDesc {
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a description.
         unsafe { out.write(resource(this).desc) };
     }
+    out
 }
 /// Device method `GetCustomHeapProperties`, returning its struct through a
 /// hidden first argument: what a standard heap type is as a custom heap.
@@ -1350,9 +1560,62 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 };
 
 #[cfg(test)]
+pub(crate) fn test_buffer(width: u64) -> This {
+    let heap = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 0,
+        visible_nodes: 0,
+    };
+    let desc = ResourceDesc {
+        dimension: BUFFER,
+        alignment: 0,
+        width,
+        height: 1,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format: 0,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 1,
+        flags: 0,
+    };
+    let mut out = std::ptr::null();
+    let hr = create_committed(
+        std::ptr::null(),
+        &heap,
+        0,
+        &desc,
+        0,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    assert_eq!(hr, S_OK);
+    out
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn a8_unorm_is_not_in_the_r8_typeless_family() {
+        // DXGI_FORMAT values: 60 R8_TYPELESS, 61 R8_UNORM, 62 R8_UINT,
+        // 63 R8_SNORM, 64 R8_SINT, 65 A8_UNORM. The R8 typeless family is
+        // 60..=64; A8_UNORM has no typeless family and cannot be cast to R8,
+        // so it must stand alone rather than fold into R8_TYPELESS.
+        assert_eq!(family(60), 60);
+        for f in 61..=64 {
+            assert_eq!(family(f), 60);
+        }
+        assert_eq!(family(65), 65);
+        // Boundaries: 59 belongs to the preceding family, 66 is unmapped.
+        assert_eq!(family(59), 53);
+        assert_eq!(family(66), 66);
+    }
 
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;
@@ -1416,9 +1679,12 @@ mod tests {
         let memory = unsafe { &(*heap.cast::<Heap>()).memory };
         assert_eq!(memory.ptr.as_ptr() as u64 % KIB_64, 0);
         let mut back = std::mem::MaybeUninit::<HeapDesc>::uninit();
-        slot::<extern "system" fn(This, *mut HeapDesc)>(heap, 0x40)(heap, back.as_mut_ptr());
+        type GetDesc = extern "system" fn(This, *mut HeapDesc) -> *mut HeapDesc;
+        let get_desc = slot::<GetDesc>(heap, 0x40);
+        assert_eq!(get_desc(heap, back.as_mut_ptr()), back.as_mut_ptr());
         // SAFETY: written above.
         assert_eq!(unsafe { back.assume_init() }.size, 1 << 20);
+        assert!(get_desc(heap, std::ptr::null_mut()).is_null());
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 0);
 
         let bad = HeapDesc {
@@ -1458,7 +1724,7 @@ mod tests {
         slot::<Custom>(device, 0xd0)(&mut p, device, 1, 1);
         assert_eq!(p.cpu_pages, 1, "default: not CPU-visible");
 
-        // 0x428: a buffer over memory the title owns, as GTA VI asks.
+        // 0x428: a buffer over memory the title owns, as it asks.
         type At = extern "system" fn(
             This,
             u64,
@@ -1560,6 +1826,12 @@ mod tests {
         assert_eq!(info.size, u64::MAX);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_resource_has_no_default_view_format() {
+        assert_eq!(view_format(std::ptr::null()), None);
+    }
+
     #[test]
     fn upload_footprints_follow_the_pc_rules() {
         let null = std::ptr::null();
@@ -1585,6 +1857,209 @@ mod tests {
         assert_eq!(t, u64::MAX, "no second subresource");
     }
 
+    /// The title may view a texture as sRGB or linear whichever format it
+    /// made it in, as the console allows: a shader reads 0x80 as 0.216
+    /// through the sRGB view, 0.502 through the linear one, and in the
+    /// texture's own format through a view without a description.
+    #[cfg(windows)]
+    #[test]
+    fn srgb_and_linear_views_of_one_texture_read_their_own_curve() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        use windows::core::s;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const SOURCE: &str = r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=3)), UAV(u0)"
+Texture2D<float4> as_srgb : register(t0);
+Texture2D<float4> as_linear : register(t1);
+Texture2D<float4> as_own : register(t2);
+RWByteAddressBuffer reads : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    int3 at = int3(1, 2, 0);
+    float3 r = float3(as_srgb.Load(at).r, as_linear.Load(at).r, as_own.Load(at).r);
+    reads.Store3(0, asuint(r));
+}
+"#;
+        let mut blob: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call; the out
+        // pointer is ours.
+        unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("views"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut blob,
+                None,
+            )
+            .unwrap()
+        };
+        let blob = blob.unwrap();
+        // SAFETY: the blob's own bytes.
+        let code = unsafe {
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+        };
+        // SAFETY: plain object creation; the root signature is inside the
+        // shader.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, code).unwrap();
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.as_ptr().cast(),
+                    BytecodeLength: code.len(),
+                },
+                ..Default::default()
+            };
+            let pso = host.device.CreateComputePipelineState(&desc).unwrap();
+            (root, pso)
+        };
+        let host_buffer = |kind: D3D12_HEAP_TYPE, flags, state| {
+            let mut b: Option<ID3D12Resource> = None;
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: flags,
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: kind,
+                ..Default::default()
+            };
+            // SAFETY: plain creation of a buffer.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        state,
+                        None,
+                        &mut b,
+                    )
+                    .unwrap()
+            };
+            b.unwrap()
+        };
+        // The texture made in `own`, its memory filled with `block`: what
+        // the shader reads through the title's views in `views` (sRGB,
+        // linear) and through one without a description.
+        let read = |own: u32, views: [u32; 2], block: &[u8]| -> [f32; 3] {
+            let null = std::ptr::null();
+            let mut image = null;
+            let desc = texture(4, 4, own, 1);
+            let iid = &RESOURCE_IIDS[0];
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), iid, &mut image),
+                S_OK
+            );
+            // Every element alike, so the layout does not matter.
+            let size = footprint(&desc).unwrap().size as usize;
+            // SAFETY: the texture's memory, `size` bytes.
+            let memory = unsafe { std::slice::from_raw_parts_mut(resource(image).data(), size) };
+            for (i, b) in memory.iter_mut().enumerate() {
+                *b = block[i % block.len()];
+            }
+            let mut slots = [0u64; 3 * 4];
+            let base = slots.as_mut_ptr() as u64;
+            let at = |i: u32| base + 32 * u64::from(i);
+            // 2D, the default component mapping, one mip.
+            let mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            let srv = |format| [format, 4, mapping, 0, 0, 1, 0, 0, 0, 0];
+            crate::descriptor::create_srv(null, image, &srv(views[0]), at(0));
+            crate::descriptor::create_srv(null, image, &srv(views[1]), at(1));
+            crate::descriptor::create_srv(null, image, null.cast(), at(2));
+            let heap = crate::descriptor::host::HostHeap::new(false, 3).unwrap();
+            for i in 0..3 {
+                assert!(heap.mirror(i, at(i), true).is_some());
+            }
+            let out = host_buffer(
+                D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COMMON,
+            );
+            let back = host_buffer(
+                D3D12_HEAP_TYPE_READBACK,
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
+            let list = host.new_list().unwrap();
+            crate::texture::upload(&list, image, host_resource(image).unwrap());
+            const NON_PIXEL_SHADER_RESOURCE: u32 = 0x40;
+            crate::list::ensure_state(&list, image, NON_PIXEL_SHADER_RESOURCE);
+            // SAFETY: an open list; our pipeline, heap and live resources.
+            unsafe {
+                let l = &list.list;
+                l.SetComputeRootSignature(&root);
+                l.SetPipelineState(&pso);
+                l.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                l.SetComputeRootDescriptorTable(0, heap.heap.GetGPUDescriptorHandleForHeapStart());
+                l.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+                l.Dispatch(1, 1, 1);
+                l.ResourceBarrier(&[crate::host::transition(
+                    &out,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                l.CopyBufferRegion(&back, 0, &out, 0, 12);
+            }
+            list.close();
+            host.execute(&[&list]);
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: the copy finished (execute waits); it wrote 12 bytes.
+            let read = unsafe {
+                let range = D3D12_RANGE { Begin: 0, End: 12 };
+                back.Map(0, Some(&range), Some(&mut mapped)).unwrap();
+                mapped.cast::<[f32; 3]>().read_unaligned()
+            };
+            assert_eq!(slot::<Release>(image, 0x10)(image), 0);
+            read
+        };
+        let to_linear = |c: f32| ((c + 0.055) / 1.055).powf(2.4);
+        // 0x80 in every channel of 8-bit color; a BC1 block of one color,
+        // red 16 of 31 (132 of 255 when expanded to 8 bits first).
+        const RGBA: &[u8] = &[0x80];
+        const BC1: &[u8] = &[0x00, 0x80, 0x00, 0x80, 0, 0, 0, 0];
+        let cases = [
+            (28, 29, 128.0 / 255.0, 0.002f32, RGBA),
+            (87, 91, 128.0 / 255.0, 0.002, RGBA),
+            (71, 72, 16.0 / 31.0, 0.01, BC1),
+        ];
+        let mut wrong = Vec::new();
+        for (linear, srgb, unorm, near, block) in cases {
+            for own in [linear, srgb] {
+                let curve = to_linear(unorm);
+                let wanted = [curve, unorm, if own == srgb { curve } else { unorm }];
+                let got = read(own, [srgb, linear], block);
+                if got.iter().zip(wanted).any(|(g, w)| (g - w).abs() > near) {
+                    wrong.push(format!(
+                        "texture {own}, views {srgb}/{linear}/none: read {got:?}, wanted {wanted:?}"
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// A 4x4 texture filled from a title buffer through our list and queue,
     /// then read back from the host GPU.
     #[cfg(windows)]
@@ -1592,7 +2067,8 @@ mod tests {
     fn buffer_data_reaches_the_host_texture() {
         use windows::Win32::Graphics::Direct3D12::*;
         let Some(host) = crate::host::host() else {
-            return; // no host GPU here
+            eprintln!("Skipping texture readback: no usable host D3D12 device");
+            return;
         };
         let null = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];
@@ -1783,6 +2259,321 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn copy_texture_region_reads_back_into_title_buffer() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let iid = &RESOURCE_IIDS[0];
+        let tex_desc = ResourceDesc {
+            dimension: 3, // Texture2D
+            alignment: 0,
+            width: 4,
+            height: 4,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 28, // R8G8B8A8_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 0,
+        };
+        let (mut image, mut upload_buf, mut dst_aligned, mut dst_packed, mut dst_crop) =
+            (null, null, null, null, null);
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &tex_desc,
+                0,
+                null.cast(),
+                iid,
+                &mut image
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &buffer(1024),
+                0,
+                null.cast(),
+                iid,
+                &mut upload_buf
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &buffer(2048),
+                0,
+                null.cast(),
+                iid,
+                &mut dst_aligned
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &buffer(256),
+                0,
+                null.cast(),
+                iid,
+                &mut dst_packed
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &buffer(1024),
+                0,
+                null.cast(),
+                iid,
+                &mut dst_crop
+            ),
+            S_OK
+        );
+
+        // Fill a 4x4 RGBA8 pattern (row_pitch 256): pixel (x, y) = [x*40+1, y*50+2, (x+y)*20+3, 0xff].
+        let (up_ptr, _) = buffer_bytes(upload_buf).unwrap();
+        // SAFETY: upload_buf holds 1024 bytes.
+        let up = unsafe { std::slice::from_raw_parts_mut(up_ptr, 1024) };
+        for y in 0..4usize {
+            for x in 0..4usize {
+                let at = y * 256 + x * 4;
+                up[at..at + 4].copy_from_slice(&[
+                    (x * 40 + 1) as u8,
+                    (y * 50 + 2) as u8,
+                    ((x + y) * 20 + 3) as u8,
+                    0xff,
+                ]);
+            }
+        }
+
+        let queue_iid = guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+            S_OK
+        );
+
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        type Copy = extern "system" fn(
+            This,
+            *const Location,
+            u32,
+            u32,
+            u32,
+            *const Location,
+            *const [u32; 6],
+        );
+        let copy = slot::<Copy>(list, 0x80);
+
+        let full_rows = PlacedFootprint {
+            offset: 0,
+            format: 28,
+            width: 4,
+            height: 4,
+            depth: 1,
+            row_pitch: 256,
+        };
+        let tex_loc = Location {
+            resource: image,
+            kind: 0,
+            footprint: PlacedFootprint {
+                offset: 0,
+                ..full_rows
+            },
+        };
+        let up_loc = Location {
+            resource: upload_buf,
+            kind: 1,
+            footprint: full_rows,
+        };
+        // 1) Buffer -> Texture upload.
+        copy(list, &tex_loc, 0, 0, 0, &up_loc, std::ptr::null());
+
+        // 2) Texture -> Buffer readback at non-zero offset (256), 256-aligned row pitch.
+        let aligned_loc = Location {
+            resource: dst_aligned,
+            kind: 1,
+            footprint: PlacedFootprint {
+                offset: 256,
+                ..full_rows
+            },
+        };
+        copy(list, &aligned_loc, 0, 0, 0, &tex_loc, std::ptr::null());
+
+        // 3) Texture -> Buffer readback with unaligned row_pitch (16 bytes, packed).
+        let packed_loc = Location {
+            resource: dst_packed,
+            kind: 1,
+            footprint: PlacedFootprint {
+                offset: 32,
+                format: 28,
+                width: 4,
+                height: 4,
+                depth: 1,
+                row_pitch: 16,
+            },
+        };
+        copy(list, &packed_loc, 0, 0, 0, &tex_loc, std::ptr::null());
+
+        // 4) Texture -> Buffer sub-box readback: 2x2 crop from (1, 1) to (3, 3).
+        let crop_box = [1u32, 1, 0, 3, 3, 1];
+        let crop_loc = Location {
+            resource: dst_crop,
+            kind: 1,
+            footprint: PlacedFootprint {
+                offset: 0,
+                format: 28,
+                width: 2,
+                height: 2,
+                depth: 1,
+                row_pitch: 256,
+            },
+        };
+        copy(list, &crop_loc, 0, 0, 0, &tex_loc, &crop_box);
+
+        // 5) Console formats 118..=120 (3 B/texel) map to 4-byte PC formats
+        // (45..=47): skipped cleanly without breaking Close() or touching dst.
+        let mut dst_d16s8 = null;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &buffer(1024),
+                0,
+                null.cast(),
+                iid,
+                &mut dst_d16s8
+            ),
+            S_OK
+        );
+        let d16s8_loc = Location {
+            resource: dst_d16s8,
+            kind: 1,
+            footprint: PlacedFootprint {
+                offset: 0,
+                format: 118,
+                width: 4,
+                height: 4,
+                depth: 1,
+                row_pitch: 256,
+            },
+        };
+        copy(list, &d16s8_loc, 0, 0, 0, &tex_loc, std::ptr::null());
+
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+
+        // Verify 256-aligned readback at offset 256 (leading 256 bytes untouched).
+        let (al_ptr, _) = buffer_bytes(dst_aligned).unwrap();
+        // SAFETY: dst_aligned holds 2048 bytes.
+        let al = unsafe { std::slice::from_raw_parts(al_ptr, 2048) };
+        assert!(
+            al[..256].iter().all(|&b| b == 0),
+            "bytes before offset touched"
+        );
+        for row in 0..4 {
+            let at = 256 + row * 256;
+            assert_eq!(
+                al[at..at + 16],
+                up[row * 256..row * 256 + 16],
+                "aligned row {row}"
+            );
+        }
+
+        // Verify unaligned packed readback (row_pitch 16, offset 32).
+        let (pk_ptr, _) = buffer_bytes(dst_packed).unwrap();
+        // SAFETY: dst_packed holds 256 bytes.
+        let pk = unsafe { std::slice::from_raw_parts(pk_ptr, 256) };
+        assert!(
+            pk[..32].iter().all(|&b| b == 0),
+            "bytes before packed offset touched"
+        );
+        for row in 0..4 {
+            let at = 32 + row * 16;
+            assert_eq!(
+                pk[at..at + 16],
+                up[row * 256..row * 256 + 16],
+                "packed row {row}"
+            );
+        }
+
+        // Verify 2x2 sub-box crop from (1, 1)..(3, 3).
+        let (cr_ptr, _) = buffer_bytes(dst_crop).unwrap();
+        // SAFETY: dst_crop holds 1024 bytes.
+        let cr = unsafe { std::slice::from_raw_parts(cr_ptr, 1024) };
+        for row in 0..2 {
+            let src_at = (row + 1) * 256 + 4; // x=1, y=row+1
+            let dst_at = row * 256;
+            assert_eq!(
+                cr[dst_at..dst_at + 8],
+                up[src_at..src_at + 8],
+                "crop row {row}"
+            );
+        }
+
+        // Verify skipped 118..=120 readback left its buffer untouched.
+        let (d16_ptr, _) = buffer_bytes(dst_d16s8).unwrap();
+        // SAFETY: dst_d16s8 holds 1024 bytes.
+        let d16 = unsafe { std::slice::from_raw_parts(d16_ptr, 1024) };
+        assert!(
+            d16.iter().all(|&b| b == 0),
+            "mismatched format 118 buffer touched"
+        );
+    }
+
     #[test]
     fn committed_and_placed_resources_map_at_their_gpu_address() {
         let null = std::ptr::null();
@@ -1798,6 +2589,14 @@ mod tests {
             &mut committed,
         );
         assert_eq!(hr, S_OK);
+        let mut back = std::mem::MaybeUninit::<ResourceDesc>::uninit();
+        type GetDesc = extern "system" fn(This, *mut ResourceDesc) -> *mut ResourceDesc;
+        let get_desc = slot::<GetDesc>(committed, 0x50);
+        assert_eq!(get_desc(committed, back.as_mut_ptr()), back.as_mut_ptr());
+        // SAFETY: written above.
+        let read = unsafe { back.assume_init() };
+        assert_eq!((read.dimension, read.width), (BUFFER, 256));
+        assert!(get_desc(committed, std::ptr::null_mut()).is_null());
         let mut data = std::ptr::null_mut();
         assert_eq!(
             slot::<Map>(committed, 0x40)(committed, 0, null.cast(), &mut data),
@@ -1840,5 +2639,55 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn r9g9b9e5_target_format_substitutes_rgba16f() {
+        assert_eq!(pc_format(67), 67);
+        assert_eq!(target_format(67), 10);
+        assert_eq!(target_format(28), 28);
+        assert_eq!(target_format(118), 45);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn r9g9b9e5_render_target_and_uav_textures_create_on_host() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let tex_desc = |flags: u32| ResourceDesc {
+            dimension: 3, // TEXTURE2D
+            alignment: 0,
+            width: 64,
+            height: 64,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 67, // DXGI_FORMAT_R9G9B9E5_SHAREDEXP
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags,
+        };
+        for (flags, expected_host_format) in [(0, 67), (4, 10), (5, 10)] {
+            let d = tex_desc(flags);
+            let mut out = std::ptr::null();
+            let hr = create_committed(
+                std::ptr::null(),
+                &PROPERTIES,
+                0,
+                &d,
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut out,
+            );
+            assert_eq!(hr, S_OK, "flags {flags}");
+            let host = host_resource(out).expect("host texture created");
+            // SAFETY: a live host texture.
+            let got = unsafe { host.GetDesc() }.Format.0 as u32;
+            assert_eq!(got, expected_host_format, "flags {flags}");
+            assert_eq!(view_format(out), None, "flags {flags}");
+            assert_eq!(slot::<Release>(out, 0x10)(out), 0);
+        }
     }
 }

@@ -7,15 +7,111 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+use victory_shader::emit;
+#[cfg(windows)]
 use victory_shader::emit::host::{self, Host};
-use victory_shader::emit::{self, validator::Validator};
+#[cfg(windows)]
+use victory_shader::emit::validator::Validator;
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
 };
 use victory_shader::{io, resource};
 
-use crate::shader::{MAX_FILE, Source, sources};
+use crate::shader::{MAX_FILE, Source, scan_entries, sources};
+
+/// Per-stage program counts.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+struct StageCounts {
+    vs: usize,
+    ps: usize,
+    cs: usize,
+    ms: usize,
+    ls: usize,
+    hs: usize,
+    es: usize,
+    gs: usize,
+}
+
+impl StageCounts {
+    fn record(&mut self, stage: HwStage) {
+        match stage {
+            HwStage::Vs => self.vs += 1,
+            HwStage::Ps => self.ps += 1,
+            HwStage::Cs => self.cs += 1,
+            HwStage::Ms => self.ms += 1,
+            HwStage::Ls => self.ls += 1,
+            HwStage::Hs => self.hs += 1,
+            HwStage::Es => self.es += 1,
+            HwStage::Gs => self.gs += 1,
+        }
+    }
+
+    fn merge(&mut self, other: &StageCounts) {
+        self.vs += other.vs;
+        self.ps += other.ps;
+        self.cs += other.cs;
+        self.ms += other.ms;
+        self.ls += other.ls;
+        self.hs += other.hs;
+        self.es += other.es;
+        self.gs += other.gs;
+    }
+
+    fn total(&self) -> usize {
+        self.vs + self.ps + self.cs + self.ms + self.ls + self.hs + self.es + self.gs
+    }
+
+    /// Stage breakdown printed on each program-level reason line.
+    fn format_reason_breakdown(&self) -> Option<String> {
+        if self.total() == 0 {
+            return None;
+        }
+        let mut out = format!(
+            "vs {}, ps {}, cs {}, ms {}",
+            self.vs, self.ps, self.cs, self.ms
+        );
+        for (name, count) in [
+            ("ls", self.ls),
+            ("hs", self.hs),
+            ("es", self.es),
+            ("gs", self.gs),
+        ] {
+            if count > 0 {
+                out.push_str(&format!(", {name} {count}"));
+            }
+        }
+        Some(out)
+    }
+
+    /// Breakdown of non-zero unemitted stages (`LS`, `HS`, `ES`, `GS`).
+    fn format_unemitted(&self) -> String {
+        let mut parts = Vec::new();
+        for (name, count) in [
+            ("LS", self.ls),
+            ("HS", self.hs),
+            ("ES", self.es),
+            ("GS", self.gs),
+        ] {
+            if count > 0 {
+                parts.push(format!("{name} {count}"));
+            }
+        }
+        parts.join(", ")
+    }
+}
+
+/// Programs stopped by one reason, split by stage, with the first example.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Failed {
+    total: usize,
+    stages: StageCounts,
+    example: String,
+}
+
+fn is_emitted_stage(stage: HwStage) -> bool {
+    matches!(stage, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms)
+}
 
 #[derive(Default)]
 struct Tally {
@@ -69,25 +165,158 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
-    /// Reason → programs stopped by it, and the first one.
-    failed: BTreeMap<String, (usize, String)>,
-    /// With `--list`: one line per program and outcome.
+    /// Programs in stages the emitter does not emit (`LS`, `HS`, `ES`, `GS`)
+    /// that were not refused by an earlier pass.
+    not_emitted: StageCounts,
+    /// Distinct programs refused before or during emission.
+    refused: usize,
+    /// Emitted programs rejected by the DXIL validator (`--validate`).
+    validator_rejected: usize,
+    /// Reason → programs stopped by it, split by stage, and the first one.
+    failed: BTreeMap<String, Failed>,
+    /// With `--list`: per-program result rows, including runtime hashes.
     list: bool,
     lines: Vec<String>,
 }
 
 impl Tally {
-    fn fail(&mut self, reason: String, example: impl FnOnce() -> String) {
-        if self.list {
+    fn fail(&mut self, stage: Option<HwStage>, reason: String, example: impl FnOnce() -> String) {
+        let entry = if self.list {
             let e = example();
             self.lines.push(format!("{e}  {reason}"));
-            self.failed.entry(reason).or_insert((0, e)).0 += 1;
-            return;
+            self.failed.entry(reason).or_insert(Failed {
+                total: 0,
+                stages: StageCounts::default(),
+                example: e,
+            })
+        } else {
+            self.failed.entry(reason).or_insert_with(|| Failed {
+                total: 0,
+                stages: StageCounts::default(),
+                example: example(),
+            })
+        };
+        entry.total += 1;
+        if let Some(stage) = stage {
+            entry.stages.record(stage);
         }
-        self.failed
-            .entry(reason)
-            .or_insert_with(|| (0, example()))
-            .0 += 1;
+    }
+
+    fn emitted_total(&self) -> usize {
+        self.emitted + self.cs_emitted + self.ms_emitted
+    }
+
+    fn validated_total(&self) -> usize {
+        self.validated + self.cs_validated + self.ms_validated
+    }
+
+    fn summary_lines(&self, validate: bool) -> Vec<String> {
+        let not_emitted = self.not_emitted.total();
+        let not_emitted_line = if not_emitted > 0 {
+            format!(
+                "             {not_emitted} programs in stages not emitted ({})",
+                self.not_emitted.format_unemitted()
+            )
+        } else {
+            "             0 programs in stages not emitted".to_owned()
+        };
+        let emitted = self.emitted_total();
+        let outcome_line = if validate || self.validator_rejected > 0 {
+            format!(
+                "             {emitted} emitted ({} validated, {} rejected by validator), \
+                 {} refused, {not_emitted} in stages not emitted ({} total)",
+                self.validated_total(),
+                self.validator_rejected,
+                self.refused,
+                self.programs
+            )
+        } else {
+            format!(
+                "             {emitted} emitted, {} refused, {not_emitted} in stages not emitted \
+                 ({} total)",
+                self.refused, self.programs
+            )
+        };
+        vec![
+            format!(
+                "containers   {} ({} duplicates skipped)",
+                self.containers, self.duplicates
+            ),
+            format!(
+                "programs     {} translated of {} ({} IR instructions)",
+                self.translated, self.programs, self.instructions
+            ),
+            format!(
+                "structured   {} of {} ({} vector instructions, {} guarded, {} on opaque masks; \
+                 branches {} per lane, {} uniform)",
+                self.structured,
+                self.translated,
+                self.vector,
+                self.guarded,
+                self.opaque,
+                self.lane_branches,
+                self.uniform_branches
+            ),
+            format!(
+                "resources    {} of {} tracked (descriptors {} loaded, {} built, {} constant; \
+                 {} scalar accesses; {} with a computed term)",
+                self.tracked,
+                self.translated,
+                self.loaded,
+                self.built,
+                self.constant,
+                self.scalar,
+                self.dynamic
+            ),
+            format!(
+                "  used-resource entries {}: {} not traced {:?}; {} traced parameters not listed",
+                self.used,
+                self.untraced_used.values().sum::<usize>(),
+                self.untraced_used,
+                self.unlisted
+            ),
+            format!(
+                "I/O          {} of {} vertex and pixel programs raised ({} interpolations, \
+                 {} vertex values; exports {:?}, {} still f16 pairs)",
+                self.io_raised,
+                self.io_programs,
+                self.interpolated,
+                self.vertex_values,
+                self.exports,
+                self.compressed
+            ),
+            format!(
+                "DXIL         {} emitted of {} vertex and pixel programs; {} validated, {} pipelines",
+                self.emitted, self.emit_programs, self.validated, self.pipelines
+            ),
+            format!(
+                "             {} emitted of {} compute programs; {} validated, {} pipelines",
+                self.cs_emitted, self.cs_programs, self.cs_validated, self.cs_pipelines
+            ),
+            format!(
+                "             {} emitted of {} mesh programs; {} validated, {} pipelines",
+                self.ms_emitted, self.ms_programs, self.ms_validated, self.ms_pipelines
+            ),
+            not_emitted_line,
+            outcome_line,
+        ]
+    }
+
+    fn failure_lines(&self) -> Vec<String> {
+        let mut failed: Vec<_> = self.failed.iter().collect();
+        failed.sort_by_key(|(_, f)| std::cmp::Reverse(f.total));
+        failed
+            .into_iter()
+            .map(|(reason, f)| match f.stages.format_reason_breakdown() {
+                Some(stages) => {
+                    format!(
+                        "  {:>7}  {reason}  [{stages}]  (e.g. {})",
+                        f.total, f.example
+                    )
+                }
+                None => format!("  {:>7}  {reason}  (e.g. {})", f.total, f.example),
+            })
+            .collect()
     }
 
     fn merge(&mut self, other: Tally) {
@@ -130,12 +359,21 @@ impl Tally {
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
+        self.not_emitted.merge(&other.not_emitted);
+        self.refused += other.refused;
+        self.validator_rejected += other.validator_rejected;
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
         self.lines.extend(other.lines);
-        for (reason, (n, example)) in other.failed {
-            self.failed.entry(reason).or_insert((0, example)).0 += n;
+        for (reason, f) in other.failed {
+            let entry = self.failed.entry(reason).or_insert_with(|| Failed {
+                total: 0,
+                stages: StageCounts::default(),
+                example: f.example,
+            });
+            entry.total += f.total;
+            entry.stages.merge(&f.stages);
         }
     }
 }
@@ -183,11 +421,9 @@ pub fn run(
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
+    let mut walk_errors = 0;
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
+        for entry in scan_entries(root, &mut walk_errors) {
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
@@ -221,55 +457,10 @@ pub fn run(
             });
         }
     }
-    let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
-    println!(
-        "containers   {} ({} duplicates skipped)",
-        t.containers, t.duplicates
-    );
-    println!(
-        "programs     {} translated of {} ({} IR instructions)",
-        t.translated, t.programs, t.instructions
-    );
-    println!(
-        "structured   {} of {} ({} vector instructions, {} guarded, {} on opaque masks; \
-         branches {} per lane, {} uniform)",
-        t.structured,
-        t.translated,
-        t.vector,
-        t.guarded,
-        t.opaque,
-        t.lane_branches,
-        t.uniform_branches
-    );
-    println!(
-        "resources    {} of {} tracked (descriptors {} loaded, {} built, {} constant; \
-         {} scalar accesses; {} with a computed term)",
-        t.tracked, t.translated, t.loaded, t.built, t.constant, t.scalar, t.dynamic
-    );
-    println!(
-        "  used-resource entries {}: {} not traced {:?}; {} traced parameters not listed",
-        t.used,
-        t.untraced_used.values().sum::<usize>(),
-        t.untraced_used,
-        t.unlisted
-    );
-    println!(
-        "I/O          {} of {} vertex and pixel programs raised ({} interpolations, \
-         {} vertex values; exports {:?}, {} still f16 pairs)",
-        t.io_raised, t.io_programs, t.interpolated, t.vertex_values, t.exports, t.compressed
-    );
-    println!(
-        "DXIL         {} emitted of {} vertex and pixel programs; {} validated, {} pipelines",
-        t.emitted, t.emit_programs, t.validated, t.pipelines
-    );
-    println!(
-        "             {} emitted of {} compute programs; {} validated, {} pipelines",
-        t.cs_emitted, t.cs_programs, t.cs_validated, t.cs_pipelines
-    );
-    println!(
-        "             {} emitted of {} mesh programs; {} validated, {} pipelines",
-        t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
-    );
+    let mut t = total.into_inner().unwrap_or_else(|e| e.into_inner());
+    for line in t.summary_lines(validate) {
+        println!("{line}");
+    }
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -288,16 +479,17 @@ pub fn run(
             println!("pair {v} + {p}: {made}");
         }
     }
-    let mut lines = t.lines;
-    lines.sort();
-    for l in lines {
+    t.lines.sort();
+    for l in &t.lines {
         println!("{l}");
     }
-    let mut failed: Vec<_> = t.failed.into_iter().collect();
-    failed.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
-    for (reason, (n, example)) in failed {
-        println!("  {n:>7}  {reason}  (e.g. {example})");
+    for line in t.failure_lines() {
+        println!("{line}");
     }
+    anyhow::ensure!(
+        walk_errors == 0,
+        "scan incomplete (traversal errors: {walk_errors})"
+    );
     Ok(())
 }
 
@@ -308,108 +500,153 @@ fn translate(
     t: &mut Tally,
     checks: &mut Checks,
 ) {
-    let example = || format!("{}{}", path.display(), source.label());
+    let location = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
-        return t.fail("corrupt record".into(), example);
+        return t.fail(None, "corrupt record".into(), location);
+    };
+    let list = t.list;
+    let hash = list.then(|| blake3::hash(&bytes).to_hex().to_string());
+    let example = || {
+        let location = location();
+        match &hash {
+            Some(hash) => format!("{location} hash={}", &hash[..16]),
+            None => location,
+        }
     };
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
-        return t.fail("no DXIL part (SM5 or older)".into(), example);
+        return t.fail(None, "no DXIL part (SM5 or older)".into(), example);
     };
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
-        return t.fail("no DXIL part (SM5 or older)".into(), example);
+        return t.fail(None, "no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(dxil)) {
+    if !lock(seen).insert(blake3::hash(dxil)) && !list {
         t.duplicates += 1;
         return;
     }
     let programs = match native_programs(dxil) {
         Ok(p) => p,
-        Err(e) => return t.fail(e.to_string(), example),
+        Err(e) => return t.fail(None, e.to_string(), example),
     };
     for p in programs {
-        t.programs += 1;
-        match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
-            Ok(program) => {
-                t.translated += 1;
-                t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
-                // Per-lane descriptors are traced on the per-lane form; its
-                // failure is listed after the resources' and I/O's.
-                let structured = structure::structure(&program);
-                let lanes = structured.as_ref().ok();
-                let res = match resource::track(&program, &p.layout, p.stage, lanes) {
+        tally_program(&container, &p, &example, t, checks);
+    }
+}
+
+fn tally_program(
+    container: &Container<'_>,
+    p: &NativeProgram,
+    example: &impl Fn() -> String,
+    t: &mut Tally,
+    checks: &mut Checks,
+) {
+    t.programs += 1;
+    match ir::build_with(&p.patched_code(), p.wave64, p.vgprs, p.uses_spill_table()) {
+        Ok(program) => {
+            t.translated += 1;
+            t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
+            // Per-lane descriptors are traced on the per-lane form; its
+            // failure is listed after the resources' and I/O's.
+            let structured = structure::structure(&program);
+            let lanes = structured.as_ref().ok();
+            let res = match resource::track(&program, &p.layout, p.stage, lanes) {
+                Ok(r) => {
+                    tally_resources(p, &r, t);
+                    Some(r)
+                }
+                Err(ShaderError::Unsupported { offset, what }) => {
+                    t.fail(Some(p.stage), format!("resources: {what}"), || {
+                        format!("{} {:?} at {offset:#x}", example(), p.stage)
+                    });
+                    None
+                }
+                Err(e) => {
+                    t.fail(Some(p.stage), e.to_string(), || {
+                        format!("{} {:?}", example(), p.stage)
+                    });
+                    None
+                }
+            };
+            let graphics = matches!(p.stage, HwStage::Vs | HwStage::Ps);
+            let mut raised = None;
+            if is_emitted_stage(p.stage) {
+                t.io_programs += usize::from(graphics);
+                match io::raise(&program, p) {
                     Ok(r) => {
-                        tally_resources(&p, &r, t);
-                        Some(r)
+                        if graphics {
+                            tally_io(&r, t);
+                        }
+                        raised = Some(r);
                     }
                     Err(ShaderError::Unsupported { offset, what }) => {
-                        t.fail(format!("resources: {what}"), || {
+                        t.fail(Some(p.stage), format!("I/O: {what}"), || {
                             format!("{} {:?} at {offset:#x}", example(), p.stage)
                         });
-                        None
                     }
-                    Err(e) => {
-                        t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage));
-                        None
-                    }
-                };
-                let graphics = matches!(p.stage, HwStage::Vs | HwStage::Ps);
-                let compute = p.stage == HwStage::Cs;
-                let mut raised = None;
-                if graphics || compute || p.stage == HwStage::Ms {
-                    t.io_programs += usize::from(graphics);
-                    match io::raise(&program, &p) {
-                        Ok(r) => {
-                            if graphics {
-                                tally_io(&r, t);
-                            }
-                            raised = Some(r);
-                        }
-                        Err(ShaderError::Unsupported { offset, what }) => t
-                            .fail(format!("I/O: {what}"), || {
-                                format!("{} {:?} at {offset:#x}", example(), p.stage)
-                            }),
-                        Err(e) => t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage)),
-                    }
-                }
-                let structured = match structured {
-                    Ok(s) => {
-                        tally_structured(&program, &s, t);
-                        Some(s)
-                    }
-                    Err(e) => {
-                        let reason = match e {
-                            ShaderError::Unsupported { what, .. } => format!("structure: {what}"),
-                            ShaderError::Isa { reason, .. } => format!("structure: {reason}"),
-                            e => e.to_string(),
-                        };
-                        t.fail(reason, || format!("{} {:?}", example(), p.stage));
-                        None
-                    }
-                };
-                if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
-                    let label = || format!("{} {:?}", example(), p.stage);
-                    *counter(t, p.stage, 0) += 1;
-                    match emit::emit(&container, &p, &program, &s, &i, &r) {
-                        Ok(shader) => {
-                            *counter(t, p.stage, 1) += 1;
-                            check(shader, t, checks, label);
-                        }
-                        Err(ShaderError::Unsupported { offset, what }) => t
-                            .fail(format!("emit: {what}"), || {
-                                format!("{} at {offset:#x}", label())
-                            }),
-                        Err(e) => t.fail(format!("emit: {e}"), label),
-                    }
+                    Err(e) => t.fail(Some(p.stage), e.to_string(), || {
+                        format!("{} {:?}", example(), p.stage)
+                    }),
                 }
             }
-            Err(e) => {
-                let reason = match e {
-                    ShaderError::Unsupported { what, .. } => format!("unsupported: {what}"),
-                    e => e.to_string(),
-                };
-                t.fail(reason, || format!("{} {:?}", example(), p.stage));
+            let structured = match structured {
+                Ok(s) => {
+                    tally_structured(&program, &s, t);
+                    Some(s)
+                }
+                Err(e) => {
+                    let reason = match e {
+                        ShaderError::Unsupported { what, .. } => format!("structure: {what}"),
+                        ShaderError::Isa { reason, .. } => format!("structure: {reason}"),
+                        e => e.to_string(),
+                    };
+                    t.fail(Some(p.stage), reason, || {
+                        format!("{} {:?}", example(), p.stage)
+                    });
+                    None
+                }
+            };
+            if !is_emitted_stage(p.stage) {
+                if res.is_some() && structured.is_some() {
+                    t.not_emitted.record(p.stage);
+                    if t.list {
+                        t.lines
+                            .push(format!("{} {:?}  stage not emitted", example(), p.stage));
+                    }
+                } else {
+                    t.refused += 1;
+                }
+            } else if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
+                let label = || format!("{} {:?}", example(), p.stage);
+                *counter(t, p.stage, 0) += 1;
+                match emit::emit(container, p, &program, &s, &i, &r) {
+                    Ok(shader) => {
+                        *counter(t, p.stage, 1) += 1;
+                        check(shader, t, checks, label);
+                    }
+                    Err(ShaderError::Unsupported { offset, what }) => {
+                        t.refused += 1;
+                        t.fail(Some(p.stage), format!("emit: {what}"), || {
+                            format!("{} at {offset:#x}", label())
+                        });
+                    }
+                    Err(e) => {
+                        t.refused += 1;
+                        t.fail(Some(p.stage), format!("emit: {e}"), label);
+                    }
+                }
+            } else {
+                t.refused += 1;
             }
+        }
+        Err(e) => {
+            t.refused += 1;
+            let reason = match e {
+                ShaderError::Unsupported { what, .. } => format!("unsupported: {what}"),
+                e => e.to_string(),
+            };
+            t.fail(Some(p.stage), reason, || {
+                format!("{} {:?}", example(), p.stage)
+            });
         }
     }
 }
@@ -451,7 +688,7 @@ fn check(
                     t.lines.push(format!("{}  pipeline created", label()));
                 }
             }
-            Err(e) => t.fail(format!("pipeline: {e}"), &label),
+            Err(e) => t.fail(Some(shader.stage), format!("pipeline: {e}"), &label),
         }
     }
     let Some(v) = checks.validator.as_mut() else {
@@ -474,7 +711,7 @@ fn check(
                 let n = t
                     .failed
                     .get(&format!("validator: {first}"))
-                    .map_or(0, |f| f.0);
+                    .map_or(0, |f| f.total);
                 if n < 3 {
                     let name = format!(
                         "{dir}/{}_{n}",
@@ -488,7 +725,8 @@ fn check(
                     let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
                 }
             }
-            t.fail(format!("validator: {first}"), label);
+            t.validator_rejected += 1;
+            t.fail(Some(shader.stage), format!("validator: {first}"), label);
         }
     }
 }
@@ -668,4 +906,315 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(not(windows))]
+use offline::{Host, Validator, host};
+
+/// Off Windows there is no D3D12 host or DXIL validator: asking for either
+/// fails, and the translation itself still runs.
+#[cfg(not(windows))]
+mod offline {
+    use victory_shader::emit::HostShader;
+
+    const NEEDS_WINDOWS: &str = "needs Windows (D3D12 and dxil.dll)";
+
+    pub enum Validator {}
+
+    impl Validator {
+        pub fn default_path() -> Option<std::path::PathBuf> {
+            None
+        }
+
+        pub fn load(_: Option<&std::path::Path>) -> Result<Self, String> {
+            Err(NEEDS_WINDOWS.into())
+        }
+
+        pub fn validate(&mut self, _: &mut [u8]) -> Result<(), String> {
+            match *self {}
+        }
+    }
+
+    pub enum Host {}
+
+    impl Host {
+        pub fn new(_: bool) -> Result<Self, String> {
+            Err(NEEDS_WINDOWS.into())
+        }
+
+        pub fn pipeline(&self, _: &HostShader, _: &HostShader) -> Result<(), String> {
+            match *self {}
+        }
+
+        pub fn mesh_pipeline(&self, _: &HostShader, _: &HostShader) -> Result<(), String> {
+            match *self {}
+        }
+
+        pub fn compute_pipeline(&self, _: &HostShader) -> Result<(), String> {
+            match *self {}
+        }
+    }
+
+    pub mod host {
+        use victory_shader::emit::HostShader;
+
+        /// Only asked for alongside a [`super::Host`], which never exists here.
+        pub fn stub_ps() -> HostShader {
+            unreachable!("no host GPU off Windows")
+        }
+
+        pub fn stub_vs(_: &HostShader) -> Result<HostShader, String> {
+            Err(super::NEEDS_WINDOWS.into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use victory_shader::native::{ComputeIo, StageIo};
+
+    fn empty_dxbc() -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(32);
+        bytes.extend_from_slice(b"DXBC");
+        bytes.extend_from_slice(&[0u8; 16]);
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&32u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes
+    }
+
+    fn endpgm_program(stage: HwStage, io: StageIo) -> NativeProgram {
+        // GFX10 `s_endpgm` (0xBF81_0000).
+        NativeProgram {
+            stage,
+            wave64: false,
+            vgprs: 4,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io,
+            code: 0xBF81_0000u32.to_le_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn reason_lines_report_per_stage_counts_and_merge_across_workers() {
+        let mut a = Tally::default();
+        a.fail(Some(HwStage::Vs), "emit: unknown stride".into(), || {
+            "a.bin Vs".into()
+        });
+        a.fail(Some(HwStage::Vs), "emit: unknown stride".into(), || {
+            "a2.bin Vs".into()
+        });
+        a.fail(Some(HwStage::Ps), "emit: unknown stride".into(), || {
+            "a3.bin Ps".into()
+        });
+        a.fail(Some(HwStage::Cs), "emit: unknown stride".into(), || {
+            "a4.bin Cs".into()
+        });
+        a.fail(
+            Some(HwStage::Ps),
+            "I/O: computed barycentrics".into(),
+            || "b.bin Ps".into(),
+        );
+        a.fail(None, "corrupt record".into(), || "bad.bin".into());
+
+        let mut b = Tally::default();
+        b.fail(Some(HwStage::Ps), "emit: unknown stride".into(), || {
+            "c.bin Ps".into()
+        });
+        b.fail(Some(HwStage::Ms), "emit: unknown stride".into(), || {
+            "d.bin Ms".into()
+        });
+        b.fail(Some(HwStage::Gs), "structure: irreducible".into(), || {
+            "g.bin Gs".into()
+        });
+
+        a.merge(b);
+        assert_eq!(
+            a.failure_lines(),
+            vec![
+                "        6  emit: unknown stride  [vs 2, ps 2, cs 1, ms 1]  (e.g. a.bin Vs)",
+                "        1  I/O: computed barycentrics  [vs 0, ps 1, cs 0, ms 0]  (e.g. b.bin Ps)",
+                "        1  corrupt record  (e.g. bad.bin)",
+                "        1  structure: irreducible  [vs 0, ps 0, cs 0, ms 0, gs 1]  (e.g. g.bin Gs)",
+            ]
+        );
+    }
+
+    #[test]
+    fn list_mode_records_rows_and_preserves_stage_breakdown() {
+        let mut t = Tally {
+            list: true,
+            ..Tally::default()
+        };
+        t.fail(Some(HwStage::Vs), "emit: test".into(), || {
+            "x.bin hash=0000 Vs".into()
+        });
+        t.fail(Some(HwStage::Ms), "emit: test".into(), || {
+            "y.bin hash=1111 Ms".into()
+        });
+        assert_eq!(
+            t.lines,
+            vec![
+                "x.bin hash=0000 Vs  emit: test",
+                "y.bin hash=1111 Ms  emit: test",
+            ]
+        );
+        assert_eq!(
+            t.failure_lines(),
+            vec!["        2  emit: test  [vs 1, ps 0, cs 0, ms 1]  (e.g. x.bin hash=0000 Vs)"]
+        );
+    }
+
+    #[test]
+    fn summary_program_counts_add_up_without_subtraction() {
+        let mut a = Tally {
+            programs: 10,
+            emit_programs: 5,
+            emitted: 4,
+            validated: 3,
+            validator_rejected: 1,
+            cs_programs: 2,
+            cs_emitted: 1,
+            cs_validated: 1,
+            refused: 3,
+            ..Tally::default()
+        };
+        a.not_emitted.record(HwStage::Ls);
+        a.not_emitted.record(HwStage::Hs);
+
+        let mut b = Tally {
+            programs: 7,
+            ms_programs: 3,
+            ms_emitted: 2,
+            ms_validated: 1,
+            validator_rejected: 1,
+            refused: 1,
+            ..Tally::default()
+        };
+        b.not_emitted.record(HwStage::Hs);
+        b.not_emitted.record(HwStage::Es);
+        b.not_emitted.record(HwStage::Gs);
+        b.not_emitted.record(HwStage::Gs);
+
+        a.merge(b);
+        assert_eq!(
+            a.emitted_total() + a.refused + a.not_emitted.total(),
+            a.programs
+        );
+
+        let without_validate = a.summary_lines(false);
+        assert!(
+            without_validate.contains(
+                &"             6 programs in stages not emitted (LS 1, HS 2, ES 1, GS 2)"
+                    .to_owned()
+            ),
+            "{without_validate:#?}"
+        );
+        // Because `validator_rejected > 0`, the breakdown stays visible even if `validate` is false.
+        assert!(
+            without_validate.contains(
+                &"             7 emitted (5 validated, 2 rejected by validator), 4 refused, 6 in stages not emitted (17 total)".to_owned()
+            ),
+            "{without_validate:#?}"
+        );
+
+        let plain = Tally {
+            programs: 3,
+            cs_programs: 3,
+            cs_emitted: 2,
+            refused: 1,
+            ..Tally::default()
+        };
+        let plain_lines = plain.summary_lines(false);
+        assert!(
+            plain_lines.contains(&"             0 programs in stages not emitted".to_owned()),
+            "{plain_lines:#?}"
+        );
+        assert!(
+            plain_lines.contains(
+                &"             2 emitted, 1 refused, 0 in stages not emitted (3 total)".to_owned()
+            ),
+            "{plain_lines:#?}"
+        );
+    }
+
+    #[test]
+    fn tally_program_separates_emitted_refused_and_unemitted_stages() {
+        let raw = empty_dxbc();
+        let container = Container::parse(&raw).unwrap();
+        let mut checks = Checks {
+            keep: None,
+            validator: None,
+            host: None,
+        };
+        let mut t = Tally {
+            list: true,
+            ..Tally::default()
+        };
+        let example = || "synth.bin".to_owned();
+
+        // Compute shader with `s_endpgm` emits cleanly.
+        let cs = endpgm_program(
+            HwStage::Cs,
+            StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+        );
+        tally_program(&container, &cs, &example, &mut t, &mut checks);
+
+        // Tessellation and geometry stages are counted in `not_emitted`, not refused.
+        for stage in [HwStage::Ls, HwStage::Hs, HwStage::Es, HwStage::Gs] {
+            let prog = endpgm_program(stage, StageIo::None);
+            tally_program(&container, &prog, &example, &mut t, &mut checks);
+        }
+
+        // An unemitted stage that fails IR building is counted once as refused, not `not_emitted`.
+        let mut bad_gs = endpgm_program(HwStage::Gs, StageIo::None);
+        bad_gs.code = 0xFFFF_FFFFu32.to_le_bytes().to_vec();
+        tally_program(&container, &bad_gs, &example, &mut t, &mut checks);
+
+        // A vertex shader that fails IR building records `vs 1` on its refusal line.
+        let mut bad_vs = endpgm_program(
+            HwStage::Vs,
+            StageIo::Vs {
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+            },
+        );
+        bad_vs.code = 0xFFFF_FFFFu32.to_le_bytes().to_vec();
+        tally_program(&container, &bad_vs, &example, &mut t, &mut checks);
+
+        assert_eq!(t.programs, 7);
+        assert_eq!(t.emitted_total(), 1);
+        assert_eq!(t.cs_emitted, 1);
+        assert_eq!(t.not_emitted.total(), 4);
+        assert_eq!(t.not_emitted.ls, 1);
+        assert_eq!(t.not_emitted.hs, 1);
+        assert_eq!(t.not_emitted.es, 1);
+        assert_eq!(t.not_emitted.gs, 1);
+        assert_eq!(t.refused, 2);
+        assert_eq!(
+            t.emitted_total() + t.refused + t.not_emitted.total(),
+            t.programs
+        );
+
+        let reasons = t.failure_lines();
+        assert_eq!(reasons.len(), 1, "{reasons:#?}");
+        assert!(
+            reasons[0].contains("[vs 1, ps 0, cs 0, ms 0, gs 1]"),
+            "{}",
+            reasons[0]
+        );
+        assert!(
+            t.lines
+                .iter()
+                .any(|l| l == "synth.bin Gs  stage not emitted"),
+            "{:#?}",
+            t.lines
+        );
+    }
 }

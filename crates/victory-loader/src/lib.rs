@@ -23,7 +23,12 @@
 
 #[cfg(windows)]
 mod crash;
+#[cfg(windows)]
+mod hooks;
 pub mod prepare;
+// Only the Windows loader publishes images; the tests run everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod publish;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;
@@ -36,12 +41,12 @@ mod tls;
 #[cfg(windows)]
 mod windows;
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use crash::save_on_crash;
 #[cfg(windows)]
 pub use crash::{
     locate, log_crash, log_crashes_to, note_title_output, report_crashes, report_unhandled,
 };
-#[cfg(all(windows, feature = "diagnostics"))]
-pub use crash::save_on_crash;
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]

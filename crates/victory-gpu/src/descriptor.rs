@@ -34,7 +34,7 @@ pub(crate) struct HeapDesc {
     nodes: u32,
 }
 
-/// Newer titles (Grand Theft Auto VI) pass the description followed by
+/// Newer titles pass the description followed by
 /// memory of their own for the descriptors: an address and its size in
 /// bytes, or a null address to have the heap allocate (inferred from the
 /// title's call sites; older titles pass the plain description).
@@ -59,6 +59,10 @@ pub(crate) struct Heap {
     host: std::sync::OnceLock<Option<host::HostHeap>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
+    /// Last `watch::writes` asking number scanned for direct CPU copies into
+    /// this heap's memory (`0` before the first sync).
+    #[cfg(windows)]
+    sync_watch: std::sync::Mutex<u64>,
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -73,7 +77,7 @@ impl Heap {
     }
 
     /// The host heap, made on first use from what the title wrote so far.
-    /// Made late because a host view heap the size of Grand Theft Auto VI's
+    /// Made late because a host view heap the size of the title's
     /// costs over 100 MB of commit, which its boot needs for its page pool.
     #[cfg(windows)]
     pub(crate) fn host(&self) -> Option<&host::HostHeap> {
@@ -105,6 +109,49 @@ impl Heap {
         let at = handle.checked_sub(self.start)?;
         let index = at / step;
         (index < u64::from(self.desc.count)).then_some(index as u32)
+    }
+
+    /// Detects and mirrors descriptor slots the title wrote directly in heap
+    /// memory (bypassing `Create*View` and `CopyDescriptors*`).
+    ///
+    /// Uses kernel write-watch pages when the heap lives in write-watched title
+    /// memory so clean heaps scan zero slots; falls back to scanning the
+    /// host-mirrored slot range when the heap memory is not write-watched.
+    #[cfg(windows)]
+    pub(crate) fn sync_direct_copies(&self, for_draw: bool) -> usize {
+        let Some(Some(host)) = self.host.get() else {
+            return 0;
+        };
+        let Some(step) = increment(self.desc.kind).map(u64::from) else {
+            return 0;
+        };
+        let mirrored_count = self.desc.count.min(host.count());
+        if mirrored_count == 0 {
+            return 0;
+        }
+        let start = self.start as usize;
+        let end = start.saturating_add(mirrored_count as usize * step as usize);
+        let mut last_watch = self.sync_watch.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((now, pages)) = crate::watch::writes(start, end, false) {
+            let prev = *last_watch;
+            let mut mirrored = 0;
+            for (page, written_at) in pages {
+                if written_at <= prev {
+                    continue;
+                }
+                let page_start = page * crate::watch::PAGE;
+                let page_end = page_start + crate::watch::PAGE;
+                let lo = page_start.max(start) - start;
+                let hi = page_end.min(end) - start;
+                let first_slot = (lo / step as usize) as u32;
+                let end_slot = hi.div_ceil(step as usize).min(mirrored_count as usize) as u32;
+                mirrored += host.sync_slots(self.start, step, first_slot, end_slot, for_draw);
+            }
+            *last_watch = now;
+            return mirrored;
+        }
+        drop(last_watch);
+        host.sync_slots(self.start, step, 0, mirrored_count, for_draw)
     }
 }
 
@@ -148,16 +195,60 @@ fn mirror(handle: u64) {
     }
 }
 
+/// A host-only key, distinct from any aligned title heap pointer and from no heap.
+#[cfg(windows)]
+pub(crate) const ROOT_VIEW_HEAP: usize = usize::MAX;
+
+/// Resolve one of the recording's bound heap keys. The renderer supplies a
+/// small view heap for bounded root descriptors if the title supplied none.
+#[cfg(windows)]
+pub(crate) fn recording_heap(key: usize) -> Option<&'static host::HostHeap> {
+    match key {
+        0 => None,
+        ROOT_VIEW_HEAP => {
+            static ROOT: std::sync::OnceLock<Option<host::HostHeap>> = std::sync::OnceLock::new();
+            ROOT.get_or_init(host::HostHeap::root_views).as_ref()
+        }
+        _ => heap(key as This).host(),
+    }
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+    if heap == ROOT_VIEW_HEAP {
+        if let Some(host) = recording_heap(heap) {
+            host.release(first, n);
+        }
+        return;
+    }
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
         host.release(first, n);
+    }
+}
+
+/// Mirrors any descriptor slots the title copied directly in memory across all
+/// live, already-initialized shader-visible heaps (called before submission).
+#[cfg(windows)]
+pub(crate) fn sync_all_heaps() {
+    let pinned: Vec<object::Held> = {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        heaps
+            .iter()
+            .filter_map(|&(_, _, at)| {
+                // SAFETY: while `SHADER_HEAPS` is held, no registered `Heap`
+                // has finished `Drop`, so its `Object` refcount is still live.
+                unsafe { object::Held::try_new(at as This) }
+            })
+            .collect()
+    };
+    for held in pinned {
+        heap(held.get()).sync_direct_copies(true);
     }
 }
 
@@ -231,7 +322,7 @@ impl RtvRecord {
                 0,
             ]
         };
-        words[0] = crate::resource::pc_format(words[0]);
+        words[0] = crate::resource::target_format(words[0]);
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
     }
@@ -336,7 +427,7 @@ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
 });
-const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+pub(crate) const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 impl View {
     /// The resource objects the view names.
@@ -385,21 +476,50 @@ fn record(handle: u64, view: View) {
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(entries) = views.by_resource.remove(&resource) else {
-        return;
-    };
-    for i in entries {
-        let (view, generation) = views.list[i as usize].clone();
-        // Entries freed through a view's other resource may hold another
-        // view by now.
-        if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
+    if let Some(entries) = views.by_resource.remove(&resource) {
+        for i in entries {
+            let (view, generation) = views.list[i as usize].clone();
+            // Entries freed through a view's other resource may hold another
+            // view by now.
+            if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
+                continue;
+            }
+            views.index.remove(&view);
+            views.list[i as usize].1 = generation.wrapping_add(1).max(1);
+            // The view's other resource (a counter) keeps a stale entry, which
+            // `forget` of that resource skips.
+            views.free.push(i);
+        }
+    }
+    drop(views);
+    // Always clear host bindless trackers even when `by_resource` had no entry
+    // (for example, `View::Placed` textures resolved via `placed_texture`).
+    #[cfg(windows)]
+    forget_host_resources(resource);
+}
+
+/// Drops all live bindless-tracker references to `resource` from every
+/// initialized shader-visible view heap, synchronizing with any in-progress
+/// `Heap::host()` publication so a freed resource cannot be published live.
+#[cfg(windows)]
+fn forget_host_resources(resource: usize) {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if heap.samplers() {
             continue;
         }
-        views.index.remove(&view);
-        views.list[i as usize].1 = generation.wrapping_add(1).max(1);
-        // The view's other resource (a counter) keeps a stale entry, which
-        // `forget` of that resource skips.
-        views.free.push(i);
+        if let Some(Some(host)) = heap.host.get() {
+            host.forget_resource(resource);
+        } else {
+            // Wait for any concurrent `Heap::host()` initialization holding
+            // `heap.pending` to finish publishing before checking again.
+            let _pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(Some(host)) = heap.host.get() {
+                host.forget_resource(resource);
+            }
+        }
     }
 }
 
@@ -431,10 +551,9 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 
 /// Device method.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let [lo, hi, size, _] = words(desc).unwrap_or_default();
+    let address = u64::from(lo) | u64::from(hi) << 32;
+    record(handle, View::Constant(address, size));
 }
 
 /// Device method.
@@ -624,6 +743,8 @@ pub(crate) extern "system" fn create_heap(
         host: std::sync::OnceLock::new(),
         #[cfg(windows)]
         pending: Default::default(),
+        #[cfg(windows)]
+        sync_watch: std::sync::Mutex::new(0),
     });
     #[cfg(windows)]
     if visible {
@@ -643,11 +764,13 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
 extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Heap>(this)
 }
-extern "system" fn desc(this: This, out: *mut HeapDesc) {
+/// Returns `out`, as the x64 COM ABI requires for struct returns in `RAX`.
+extern "system" fn desc(this: This, out: *mut HeapDesc) -> *mut HeapDesc {
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a description.
         unsafe { out.write(heap(this).desc) };
     }
+    out
 }
 /// The same address for the CPU and the GPU start.
 extern "system" fn start(this: This) -> u64 {
@@ -682,6 +805,17 @@ mod tests {
     }
 
     #[test]
+    fn a_null_cbv_overwrites_the_previous_descriptor() {
+        let mut slot = [0u64; 4];
+        let handle = slot.as_mut_ptr() as u64;
+        create_cbv(std::ptr::null(), &[0x1000, 0, 256, 0], handle);
+        assert_eq!(view(handle), Some(View::Constant(0x1000, 256)));
+
+        create_cbv(std::ptr::null(), std::ptr::null(), handle);
+        assert_eq!(view(handle), Some(View::Constant(0, 0)));
+    }
+
+    #[test]
     fn heaps_hold_count_descriptors_from_their_start() {
         let null = std::ptr::null();
         let desc = HeapDesc {
@@ -704,7 +838,9 @@ mod tests {
         unsafe { (cpu as *mut u8).add(999 * 32 + 31).write(1) };
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
-        assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
+        let mut bad_h = null;
+        assert_eq!(create(bad, none, &mut bad_h), E_INVALIDARG);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
     }
 
     #[test]
@@ -760,7 +896,7 @@ mod tests {
         assert_ne!(old, new, "a new generation");
     }
 
-    /// Grand Theft Auto VI places its shader-visible heap in its own memory
+    /// The title places its shader-visible heap in its own memory
     /// and checks that the heap starts there.
     #[test]
     fn placed_heaps_start_at_the_title_memory() {
@@ -786,8 +922,42 @@ mod tests {
         );
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x50)(h), address);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
         // A size that does not match the count is not a placement.
-        assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
-        assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+        let mut h2 = std::ptr::null();
+        assert_eq!(create(desc, Placement { address, size: 7 }, &mut h2), S_OK);
+        assert_ne!(
+            slot::<extern "system" fn(This) -> u64>(h2, 0x48)(h2),
+            address
+        );
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h2, 0x10)(h2), 0);
+    }
+
+    #[test]
+    fn heap_get_desc_returns_its_output_pointer() {
+        let desc = HeapDesc {
+            kind: 1,
+            count: 16,
+            flags: 0,
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let mut out = std::mem::MaybeUninit::<HeapDesc>::uninit();
+        type GetDesc = extern "system" fn(This, *mut HeapDesc) -> *mut HeapDesc;
+        let get_desc = slot::<GetDesc>(h, 0x40);
+        assert_eq!(get_desc(h, out.as_mut_ptr()), out.as_mut_ptr());
+        // SAFETY: written above.
+        let read = unsafe { out.assume_init() };
+        assert_eq!(
+            (read.kind, read.count, read.flags, read.nodes),
+            (desc.kind, desc.count, desc.flags, desc.nodes)
+        );
+        assert!(get_desc(h, std::ptr::null_mut()).is_null());
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
     }
 }

@@ -1,7 +1,7 @@
 //! The console's DirectStorage (`XCRDAPI.dll`): a factory that opens files
 //! and creates request queues and status arrays the title polls. Its
 //! interfaces have grown since 2020 (new interface ids, new slots); the
-//! slots here are the ones Grand Theft Auto VI calls, read from its call
+//! slots here are the ones the title calls, read from its call
 //! sites. Slots nobody has needed yet log their offset.
 //!
 //! Submitted requests of every queue run on one pool of workers, as the
@@ -18,7 +18,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
@@ -26,12 +26,17 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
+use windows_sys::Win32::Foundation::HANDLE;
 
+use super::release_ref;
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
 use crate::{HleModule, hle_export};
 
-/// The factory interface Grand Theft Auto VI asks for.
+mod errors;
+use errors::{ErrorRecord, QueueErrors, ReadFailure};
+
+/// The factory interface the title asks for.
 const FACTORY: Guid = Guid::new(
     0x6295_9d11,
     0xd45f,
@@ -89,12 +94,12 @@ extern "system" fn add_ref_instance<T>(this: *const Instance<T>) -> u32 {
 
 extern "system" fn release<T>(this: *mut Instance<T>) -> u32 {
     // SAFETY: as above.
-    let left = unsafe { &*this }.refs.fetch_sub(1, Ordering::AcqRel) - 1;
-    if left == 0 {
+    let left = release_ref(&unsafe { &*this }.refs, "dstorage object");
+    if left == Some(0) {
         // SAFETY: the last reference; created by `Instance::create`.
         drop(unsafe { Box::from_raw(this) });
     }
-    left
+    left.unwrap_or(0)
 }
 
 fn iid_text(iid: *const Guid) -> String {
@@ -132,10 +137,11 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         std::ptr::null_mut(),
     );
     // SAFETY: the title passes a NUL-terminated path.
-    let name = unsafe {
+    let filename = unsafe {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
-        String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
+        std::slice::from_raw_parts(path, len)
     };
+    let name = String::from_utf16_lossy(filename);
     if handle as isize == -1 {
         let error = std::io::Error::last_os_error();
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
@@ -144,7 +150,13 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let file = Instance::create(
+        Object::new("dstorage file", &FILE_VTABLE),
+        File {
+            file,
+            filename: filename.into(),
+        },
+    );
     put(out, file)
 }
 
@@ -171,7 +183,7 @@ extern "system" fn create_status_array(
 }
 
 /// The queue's description: as in 2020 (source type, capacity, priority,
-/// name), plus a field Grand Theft Auto VI sets to 1.
+/// name), plus a field the title sets to 1.
 #[repr(C)]
 struct QueueDesc {
     source_type: u64,
@@ -187,6 +199,9 @@ extern "system" fn create_queue(
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
     // SAFETY: the title passes its description (null tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
@@ -204,10 +219,13 @@ extern "system" fn create_queue(
     let Some(scheduler) = scheduler() else {
         return E_OUTOFMEMORY;
     };
+    let lane = match Lane::new(desc.priority, desc.capacity) {
+        Ok(lane) => lane,
+        Err(hr) => return hr,
+    };
     let mut lanes = scheduler.lock();
     let id = lanes.next_id;
     lanes.next_id += 1;
-    let lane = Lane::new(desc.priority, desc.capacity);
     lanes.lanes.insert(id, lane);
     drop(lanes);
     put(
@@ -216,7 +234,7 @@ extern "system" fn create_queue(
     )
 }
 
-/// Grand Theft Auto VI asks for 32 MiB and stops if this fails.
+/// The title asks for 32 MiB and stops if this fails.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     tracing::info!(size, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
@@ -258,6 +276,7 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
+    filename: Box<[u16]>,
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -289,7 +308,7 @@ extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
         .map_or(E_INVALIDARG, |e| e.load(Ordering::Acquire))
 }
 
-/// Grand Theft Auto VI polls this (entry 0, a `Sleep(1)` loop) and never
+/// The title polls this (entry 0, a `Sleep(1)` loop) and never
 /// reads the result itself.
 extern "system" fn is_complete(this: Array, index: u32) -> bool {
     status_result(this, index) != E_PENDING
@@ -366,12 +385,13 @@ struct Lane {
     clock: u64,
     /// Enqueued, not yet submitted.
     unsubmitted: Vec<Command>,
-    /// Submitted, by sequence number: reads not started, status entries
-    /// not written, reads running, and failures not yet reported.
+    /// Submitted reads and status entries, by sequence number.
     reads: VecDeque<(u64, Request)>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
-    failures: BTreeMap<u64, HRESULT>,
+    /// First completed failure since the previous status entry.
+    first_status_failure: Option<HRESULT>,
+    errors: QueueErrors,
     closed: bool,
 }
 
@@ -445,14 +465,19 @@ fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
-            lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
+            lanes = scheduler
+                .work
+                .wait(lanes)
+                .unwrap_or_else(|e| e.into_inner());
             continue;
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
+        let failure = execute(&job.request)
+            .err()
+            .map(|hr| Box::new(ReadFailure::new(&job.request, hr)));
         lanes = scheduler.lock();
-        lanes.finish(&job, result);
+        lanes.finish(&job, failure);
         lanes.count(&job, started);
         if std::mem::take(&mut lanes.starved) {
             scheduler.work.notify_all();
@@ -484,7 +509,8 @@ impl Lanes {
                 reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
                 staging_waits = std::mem::take(&mut self.refused),
                 bcpack_mb = self.bcpack.0 / 1_000_000,
-                bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
+                bcpack_workers =
+                    format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
                 waiting,
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
@@ -529,12 +555,12 @@ impl Lanes {
         })
     }
 
-    fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
+    fn finish(&mut self, job: &Job, failure: Option<Box<ReadFailure>>) {
         self.staged -= job.staging;
         if let Some(lane) = self.lanes.get_mut(&job.lane) {
             lane.running.remove(&job.seq);
-            if let Err(hr) = result {
-                lane.failures.insert(job.seq, hr);
+            if let Some(failure) = failure {
+                lane.errors.defer(job.seq, failure);
             }
             lane.flush();
         }
@@ -573,8 +599,8 @@ impl Lanes {
 }
 
 impl Lane {
-    fn new(priority: i8, capacity: u16) -> Lane {
-        Lane {
+    fn new(priority: i8, capacity: u16) -> Result<Self, HRESULT> {
+        Ok(Self {
             class: priority.clamp(-1, 1).wrapping_add(1) as usize,
             capacity: usize::from(capacity),
             clock: 0,
@@ -582,9 +608,10 @@ impl Lane {
             reads: VecDeque::new(),
             statuses: VecDeque::new(),
             running: BTreeSet::new(),
-            failures: BTreeMap::new(),
+            first_status_failure: None,
+            errors: QueueErrors::new()?,
             closed: false,
-        }
+        })
     }
 
     /// Requests and status entries held, submitted or not.
@@ -592,24 +619,24 @@ impl Lane {
         self.unsubmitted.len() + self.reads.len() + self.statuses.len() + self.running.len()
     }
 
-    /// Writes the status entries whose earlier reads have all finished.
+    /// Publishes completed errors and writes ready status entries in queue order.
     fn flush(&mut self) {
-        while let Some(&(seq, _)) = self.statuses.front() {
-            let waiting = self.reads.front().map(|r| r.0);
-            if waiting.into_iter().chain(self.running.first().copied()).any(|s| s < seq) {
-                return;
-            }
-            let Some((_, status)) = self.statuses.pop_front() else {
-                return;
-            };
-            let later = self.failures.split_off(&seq);
-            let first = std::mem::replace(&mut self.failures, later)
-                .into_values()
-                .next();
-            status
-                .entry()
-                .store(first.unwrap_or(S_OK), Ordering::Release);
+        let next_read = self
+            .reads
+            .front()
+            .map(|(seq, _)| *seq)
+            .into_iter()
+            .chain(self.running.first().copied())
+            .min()
+            .unwrap_or(u64::MAX);
+        while let Some(&(seq, _)) = self.statuses.front().filter(|(seq, _)| *seq < next_read) {
+            let failure = self.errors.publish_before(seq);
+            let result = self.first_status_failure.take().or(failure).unwrap_or(S_OK);
+            let (_, status) = self.statuses.pop_front().unwrap();
+            status.entry().store(result, Ordering::Release);
         }
+        let failure = self.errors.publish_before(next_read);
+        self.first_status_failure = self.first_status_failure.or(failure);
     }
 }
 
@@ -625,8 +652,9 @@ fn staging_bytes(request: &Request) -> u64 {
     }
 }
 
-/// Ends a queue: what was not started is dropped, and this waits for the
-/// reads already running (they write title memory).
+/// Ends a queue: what was enqueued but not submitted is dropped, and this
+/// waits until what was submitted has completed or failed, its status
+/// entries written, as the console's `Close` does.
 fn close_lane(id: u64) {
     let Some(scheduler) = scheduler() else {
         return;
@@ -637,9 +665,8 @@ fn close_lane(id: u64) {
     };
     lane.closed = true;
     lane.unsubmitted.clear();
-    lane.reads.clear();
-    lane.statuses.clear(); // releases their arrays
-    while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
+    let pending = |l: &Lane| !(l.reads.is_empty() && l.running.is_empty() && l.statuses.is_empty());
+    while lanes.lanes.get(&id).is_some_and(pending) {
         lanes = scheduler
             .finished
             .wait(lanes)
@@ -667,7 +694,7 @@ struct Request {
     source_size: u32,
     /// Compressed size between two decompression stages; unused here.
     intermediate_size: u32,
-    /// Matched by cancellation; Grand Theft Auto VI leaves it 0.
+    /// Matched by cancellation; the title leaves it 0.
     tag: u64,
     name: *const c_char,
 }
@@ -680,7 +707,7 @@ const BCPACK: u64 = 0xf << 1;
 const PAGE_DESTINATION: u64 = 1 << 21;
 const MEMORY_SOURCE: u64 = 1 << 22;
 // Bits 5-20 select a further transform, bit 23 a source in physical pages;
-// Grand Theft Auto VI's packages need neither, so requests with them fail.
+// The title's packages need neither, so requests with them fail.
 
 const PAGE: usize = 64 * 1024;
 
@@ -688,7 +715,6 @@ enum Command {
     Read(Request),
     Status(Status),
 }
-
 
 /// A status entry to write, holding a reference on its array.
 struct Status {
@@ -776,12 +802,43 @@ extern "system" fn submit(this: QueueRef) {
     scheduler.work.notify_all();
 }
 
-/// Ends the queue whatever its reference count: what was not started never
-/// completes, and this returns once the reads already running have
-/// finished. Grand Theft Auto VI calls this, not `Release`.
+/// Ends the queue whatever its reference count: what was not submitted
+/// never completes, and this returns once everything submitted has
+/// completed or failed (a title may still be polling its status entries).
+/// The title calls this, not `Release`.
 extern "system" fn close(this: QueueRef) {
     // SAFETY: as above.
     close_lane(unsafe { &*this }.state.id);
+}
+
+extern "system" fn get_error_event(this: QueueRef) -> HANDLE {
+    // SAFETY: a queue we created and the title still holds.
+    let id = unsafe { &*this }.state.id;
+    scheduler()
+        .and_then(|scheduler| {
+            let lanes = scheduler.lock();
+            lanes
+                .lanes
+                .get(&id)
+                .map(|lane| lane.errors.duplicate_event())
+        })
+        .unwrap_or(std::ptr::null_mut())
+}
+
+extern "system" fn retrieve_error_record(this: QueueRef, out: *mut ErrorRecord) {
+    if out.is_null() {
+        return;
+    }
+    // SAFETY: a queue we created and the title still holds.
+    let id = unsafe { &*this }.state.id;
+    let record = scheduler()
+        .and_then(|scheduler| {
+            let mut lanes = scheduler.lock();
+            lanes.lanes.get_mut(&id).map(|lane| lane.errors.take())
+        })
+        .unwrap_or_default();
+    // SAFETY: the title supplies room for its error record.
+    unsafe { out.write(record) };
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
@@ -817,7 +874,11 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         return into_destination(request, size, |out| read_into(request, out).map(|()| size))
             .map_err(|hr| fail(hr, "copying"));
     }
-    let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
+    let tables = if bc != 0 {
+        Some(bcpack_tables()?)
+    } else {
+        None
+    };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
@@ -889,7 +950,9 @@ fn use_bcpack_tables(dir: std::path::PathBuf) {
 
 #[cfg(test)]
 fn load_bcpack_tables() -> Result<Tables, String> {
-    let dir = BCPACK_DIR.get().ok_or("no folder set for the test tables")?;
+    let dir = BCPACK_DIR
+        .get()
+        .ok_or("no folder set for the test tables")?;
     let bytes = std::fs::read(dir.join("tables.bin")).map_err(|e| e.to_string())?;
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
@@ -915,7 +978,9 @@ static READING: AtomicU64 = AtomicU64::new(0);
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
-        out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
+        out.copy_from_slice(unsafe {
+            std::slice::from_raw_parts(request.source.cast(), out.len())
+        });
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
@@ -949,13 +1014,34 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
-        // Raw reads land through the kernel, which does not fault into the
-        // GPU side's guard on title buffers; open them first.
-        victory_gpu::kernel_will_write(request.destination as usize, len);
-        // SAFETY: the title's destination holds `destination_size` bytes, at
-        // least `len`, and nothing else writes it until completion.
-        let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        if request.options & (ZLIB | BCPACK) == 0 {
+            // Raw reads are bounded by the OS file read and do not need a
+            // second potentially large buffer.
+            victory_gpu::kernel_will_write(request.destination as usize, len);
+            // SAFETY: the title's destination holds `destination_size` bytes,
+            // at least `len`, and the worker owns this request until completion.
+            let out =
+                unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
+            let filled = fill(out);
+            victory_gpu::kernel_wrote(request.destination as usize, len);
+            return filled.map(drop);
+        }
+        // Decode into host-owned memory first. A title mapping can disappear
+        // while a worker is running; copying through the kernel reports that
+        // instead of faulting this worker while it writes the destination.
+        let mut data = vec![0; len];
+        let written = fill(&mut data)?;
+        if written > len {
+            return Err(E_INVALIDARG);
+        }
+        if !victory_gpu::write_title_memory(request.destination as usize, &data[..written]) {
+            tracing::warn!(
+                bytes = written,
+                "dstorage: decompressed destination write failed"
+            );
+            return Err(E_INVALIDARG);
+        }
+        return Ok(());
     }
     let offset = (request.page_offset & 0xffff) as usize;
     // SAFETY: the title passes a page number per 64 KiB of destination,
@@ -980,21 +1066,21 @@ fn into_destination(
     }
 }
 
-/// Slots by the 2020 order, which the argument shapes at Grand Theft Auto
-/// VI's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
+/// Slots by the 2020 order, which the argument shapes at the
+/// title's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
 static QUEUE_VTABLE: Methods<12> = Methods([
     missing::<0> as *const (),
     add_ref_instance::<Queue> as *const (),
     release::<Queue> as *const (),
-    enqueue_request as *const (), // 0x18
-    enqueue_status as *const (),  // 0x20
-    missing::<5> as *const (),    // 0x28 (2020: fence signal)
-    submit as *const (),          // 0x30
-    missing::<7> as *const (),    // 0x38 (2020: cancel by tag)
-    close as *const (),           // 0x40
-    missing::<9> as *const (),    // 0x48 (2020: error event)
-    missing::<10> as *const (),   // 0x50 (2020: error record)
-    missing::<11> as *const (),   // 0x58 (2020: queue info)
+    enqueue_request as *const (),       // 0x18
+    enqueue_status as *const (),        // 0x20
+    missing::<5> as *const (),          // 0x28 (2020: fence signal)
+    submit as *const (),                // 0x30
+    missing::<7> as *const (),          // 0x38 (2020: cancel by tag)
+    close as *const (),                 // 0x40
+    get_error_event as *const (),       // 0x48
+    retrieve_error_record as *const (), // 0x50
+    missing::<11> as *const (),         // 0x58 (2020: queue info)
 ]);
 
 pub(crate) fn module() -> HleModule {
@@ -1008,7 +1094,11 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::time::{Duration, Instant};
+
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     use super::*;
     use crate::modules::xgameruntime::method;
@@ -1103,6 +1193,19 @@ mod tests {
     fn void(object: *mut c_void, slot: usize) {
         let f: extern "system" fn(*mut c_void) = call(object, slot);
         f(object);
+    }
+
+    fn error_event(queue: *mut c_void) -> OwnedHandle {
+        let get: extern "system" fn(*mut c_void) -> HANDLE = call(queue, 0x48);
+        let handle = get(queue);
+        assert!(!handle.is_null());
+        // SAFETY: the queue returned a caller-owned event handle.
+        unsafe { OwnedHandle::from_raw_handle(handle) }
+    }
+
+    fn poll_event(event: &OwnedHandle) -> u32 {
+        // SAFETY: the caller holds the event.
+        unsafe { WaitForSingleObject(event.as_raw_handle(), 0) }
     }
 
     fn result(array: *mut c_void, index: u32) -> HRESULT {
@@ -1205,7 +1308,8 @@ mod tests {
         // Requests in flight together run in any order, so none of them
         // shares a destination (failed ones leave theirs undefined).
         let mut buffers = [[0u8; 16]; 5];
-        let [failed, failed_too, out, other, bcpack] = buffers.each_mut().map(|b| b.as_mut_ptr().cast());
+        let [failed, failed_too, out, other, bcpack] =
+            buffers.each_mut().map(|b| b.as_mut_ptr().cast());
 
         // Segment 0: a read past the end, then a bad stream; the first wins.
         enqueue(queue, &request(0, failed, 16, file, 4090, 16));
@@ -1227,6 +1331,98 @@ mod tests {
         assert_eq!(result(array, 1), S_OK);
         assert_eq!(buffers[2], contents[100..116]);
         assert_eq!(buffers[3], contents[..16]);
+    }
+
+    #[test]
+    fn queue_reports_and_retrieves_read_errors() {
+        let contents = pattern(64);
+        let (dir, file) = file_with(&contents);
+        let (queue, array) = (new_queue(0), status_array(2));
+        let idle_queue = new_queue(0);
+        let event = error_event(queue);
+        let idle_event = error_event(idle_queue);
+        drop(error_event(queue)); // Each caller can close its own handle.
+        assert_eq!(poll_event(&event), WAIT_TIMEOUT);
+
+        let mut buffers = [[0u8; 16]; 3];
+        let [short, bad_zlib, out] = buffers.each_mut().map(|b| b.as_mut_ptr().cast());
+        let mut first = request(0, short, 16, file, 60, 16);
+        first.name = c"short read".as_ptr();
+        first.tag = 23;
+        enqueue(queue, &first);
+        enqueue(queue, &request(ZLIB, bad_zlib, 16, file, 0, 16));
+        enqueue_status(queue, array, 0);
+        enqueue(queue, &request(0, out, 16, file, 8, 16));
+        enqueue_status(queue, array, 1);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 1), S_OK);
+        assert_eq!(result(array, 0), END_OF_FILE);
+        assert_eq!(buffers[2], contents[8..24]);
+        assert_eq!(poll_event(&event), WAIT_OBJECT_0);
+        assert_eq!(poll_event(&idle_event), WAIT_TIMEOUT);
+
+        #[repr(C)]
+        struct Guarded {
+            before: u64,
+            record: ErrorRecord,
+            after: u64,
+        }
+        let mut out = Guarded {
+            before: 17,
+            record: ErrorRecord::default(),
+            after: 29,
+        };
+        let retrieve: extern "system" fn(*mut c_void, *mut ErrorRecord) = call(queue, 0x50);
+        retrieve(queue, std::ptr::null_mut());
+        retrieve(queue, &mut out.record);
+        assert_eq!((out.before, out.after), (17, 29));
+        assert_eq!(out.record.failure_count, 2);
+        let metadata = &out.record.first;
+        assert_eq!(metadata.result, END_OF_FILE);
+        assert_eq!(metadata.command_type, 0);
+        assert_eq!(metadata.options, first.options);
+        assert_eq!(metadata.destination, short as usize);
+        assert_eq!(metadata.destination_size, 16);
+        assert_eq!(metadata.file_offset, 60);
+        assert_eq!(metadata.source, 0);
+        assert_eq!(metadata.source_size, 16);
+        assert_eq!(metadata.tag, 23);
+        assert_eq!(&metadata.name[..11], b"short read\0");
+        let filename: Vec<_> = dir
+            .path()
+            .join("data.bin")
+            .as_os_str()
+            .encode_wide()
+            .take(metadata.filename.len() - 1)
+            .chain([0])
+            .collect();
+        assert_eq!(&metadata.filename[..filename.len()], filename.as_slice());
+        assert_eq!(poll_event(&event), WAIT_TIMEOUT);
+        retrieve(queue, &mut out.record);
+        assert_eq!(
+            (out.record.failure_count, out.record.first.command_type),
+            (0, -1),
+        );
+
+        // A later failure starts a fresh record. Retrieve while the event
+        // is still signaled, before a wait can consume the signal.
+        enqueue(queue, &first);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), END_OF_FILE);
+        retrieve(queue, &mut out.record);
+        assert_eq!(
+            (out.record.failure_count, out.record.first.result),
+            (1, END_OF_FILE),
+        );
+        assert_eq!(poll_event(&event), WAIT_TIMEOUT);
+
+        for object in [queue, idle_queue, array, file] {
+            let release: extern "system" fn(*mut c_void) -> u32 = call(object, 0x10);
+            assert_eq!(release(object), 0);
+        }
+        // Closing the queue releases its handle. The caller's stays valid.
+        assert_eq!(poll_event(&event), WAIT_TIMEOUT);
     }
 
     #[test]
@@ -1280,9 +1476,9 @@ mod tests {
     #[test]
     fn priorities_share_by_bytes_about_tenfold() {
         let mut l = lanes(STAGING);
-        l.lanes.insert(0, Lane::new(0, 4096));
-        l.lanes.insert(1, Lane::new(1, 4096));
-        l.lanes.insert(2, Lane::new(2, 4096)); // real-time: as high
+        l.lanes.insert(0, Lane::new(0, 4096).unwrap());
+        l.lanes.insert(1, Lane::new(1, 4096).unwrap());
+        l.lanes.insert(2, Lane::new(2, 4096).unwrap()); // real-time: as high
         for _ in 0..400 {
             for id in 0..3 {
                 read(&mut l, id, 0, 4096);
@@ -1293,7 +1489,7 @@ mod tests {
         for _ in 0..330 {
             let job = l.start().unwrap();
             started[job.lane as usize] += 1;
-            l.finish(&job, Ok(()));
+            l.finish(&job, None);
         }
         // Normal gets about a tenth of what high and real-time get together.
         assert_eq!(started[1] + started[2], 300, "{started:?}");
@@ -1304,14 +1500,14 @@ mod tests {
     #[test]
     fn staging_bounds_compressed_bytes_in_flight() {
         let mut l = lanes(100);
-        l.lanes.insert(0, Lane::new(0, 64));
+        l.lanes.insert(0, Lane::new(0, 64).unwrap());
         read(&mut l, 0, ZLIB, 60);
         read(&mut l, 0, ZLIB, 60);
         read(&mut l, 0, 0, 1000); // raw: straight to its destination
         l.submit(0);
         let first = l.start().unwrap();
         assert!(l.start().is_none(), "60 + 60 > 100");
-        l.finish(&first, Ok(()));
+        l.finish(&first, None);
         let second = l.start().unwrap();
         let raw = l.start().unwrap();
         assert_eq!((second.staging, raw.staging), (60, 0));
@@ -1319,14 +1515,14 @@ mod tests {
         read(&mut l, 0, ZLIB, 500);
         l.submit(0);
         assert!(l.start().is_none());
-        l.finish(&second, Ok(()));
+        l.finish(&second, None);
         assert!(l.start().is_some());
     }
 
     #[test]
     fn a_status_waits_for_every_earlier_read() {
         let mut l = lanes(STAGING);
-        l.lanes.insert(0, Lane::new(0, 64));
+        l.lanes.insert(0, Lane::new(0, 64).unwrap());
         let array = status_array(2).cast::<Instance<StatusArray>>();
         let status = |index| {
             add_ref_instance(array);
@@ -1344,12 +1540,56 @@ mod tests {
         l.submit(0);
         let jobs: Vec<Job> = (0..3).map(|_| l.start().unwrap()).collect();
         // The last read and the first finish; the second then fails.
-        l.finish(&jobs[2], Ok(()));
-        l.finish(&jobs[0], Ok(()));
+        l.finish(&jobs[2], None);
+        l.finish(&jobs[0], None);
         let results = || (result(array.cast(), 0), result(array.cast(), 1));
         assert_eq!(results(), (E_PENDING, E_PENDING));
-        l.finish(&jobs[1], Err(INVALID_DATA));
+        let failure = ReadFailure::new(&jobs[1].request, INVALID_DATA);
+        l.finish(&jobs[1], Some(Box::new(failure)));
         assert_eq!(results(), (INVALID_DATA, S_OK));
+    }
+
+    #[test]
+    fn error_event_reports_failures_in_enqueue_order_without_status_entries() {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64).unwrap());
+        read(&mut l, 0, MEMORY_SOURCE, 16);
+        read(&mut l, 0, MEMORY_SOURCE, 16);
+        l.submit(0);
+        let data = [0u8; 16];
+        let mut first = l.start().unwrap();
+        first.request.source = data.as_ptr().cast();
+        let second = l.start().unwrap();
+        let handle = l.lanes[&0].errors.duplicate_event();
+        assert!(!handle.is_null());
+        // SAFETY: a new duplicate owned by the test.
+        let event = unsafe { OwnedHandle::from_raw_handle(handle) };
+        let failure = ReadFailure::new(&second.request, INVALID_DATA);
+        l.finish(&second, Some(Box::new(failure)));
+        assert_eq!(poll_event(&event), WAIT_TIMEOUT);
+        assert_eq!(l.lanes.get_mut(&0).unwrap().errors.take().failure_count, 0);
+
+        let failure = ReadFailure::new(&first.request, END_OF_FILE);
+        l.finish(&first, Some(Box::new(failure)));
+        assert_eq!(poll_event(&event), WAIT_OBJECT_0);
+        let record = l.lanes.get_mut(&0).unwrap().errors.take();
+        assert_eq!(
+            (record.failure_count, record.first.result),
+            (2, END_OF_FILE)
+        );
+        assert_eq!(record.first.source, data.as_ptr() as usize);
+        assert_eq!(record.first.file_offset, 0);
+        assert!(record.first.filename.iter().all(|&unit| unit == 0));
+
+        // A status entry submitted after retrieval still sees the failure.
+        let array = status_array(1).cast::<Instance<StatusArray>>();
+        add_ref_instance(array);
+        let lane = l.lanes.get_mut(&0).unwrap();
+        lane.unsubmitted
+            .push(Command::Status(Status { array, index: 0 }));
+        l.submit(0);
+        assert_eq!(result(array.cast(), 0), END_OF_FILE);
+        assert_eq!(release(array), 0);
     }
 
     #[test]
@@ -1421,7 +1661,10 @@ mod tests {
         let (_dir, file) = file_with(&contents);
         let (queue, array) = (new_queue(0), status_array(1));
         let mut out = [0u8; 16];
-        enqueue(queue, &request(4 << 1, out.as_mut_ptr().cast(), 16, file, 100, 88));
+        enqueue(
+            queue,
+            &request(4 << 1, out.as_mut_ptr().cast(), 16, file, 100, 88),
+        );
         enqueue_status(queue, array, 0);
         void(queue, 0x30);
         assert_eq!(wait(array, 0), S_OK);
@@ -1440,6 +1683,29 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(result(array, 0), E_PENDING);
         assert_eq!(out, [0; 16]);
+    }
+
+    /// Close blocks until every submitted request has completed or failed,
+    /// and writes their status entries.
+    #[test]
+    fn closing_a_queue_completes_what_was_submitted() {
+        let data = pattern(8 << 20);
+        let (_dir, file) = file_with(&data);
+        let (queue, array) = (new_queue(0), status_array(1));
+        let chunk = 256 << 10;
+        let mut out = vec![0u8; data.len()];
+        for k in 0..32 {
+            let dst = out[k * chunk..].as_mut_ptr().cast();
+            enqueue(
+                queue,
+                &request(0, dst, chunk, file, (k * chunk) as u64, chunk),
+            );
+        }
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        void(queue, 0x40);
+        assert_eq!(result(array, 0), S_OK);
+        assert!(out == data);
     }
 
     #[test]
@@ -1541,5 +1807,22 @@ mod tests {
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// A title releasing once too often: the count stays 0 and nothing is
+    /// freed again (the old `fetch_sub(1) - 1` overflowed).
+    #[test]
+    fn release_past_zero_leaves_the_count_at_zero() {
+        let object = Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), ())
+            .cast::<Instance<()>>();
+        assert_eq!(add_ref_instance(object), 2);
+        assert_eq!(release(object), 1);
+        // SAFETY: still allocated; the test holds the object.
+        let refs = &unsafe { &*object }.refs;
+        refs.store(0, Ordering::Relaxed);
+        assert_eq!(release(object), 0);
+        assert_eq!(refs.load(Ordering::Relaxed), 0);
+        // SAFETY: made by `Instance::create` and not freed by `release`.
+        drop(unsafe { Box::from_raw(object) });
     }
 }

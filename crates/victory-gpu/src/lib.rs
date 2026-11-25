@@ -15,11 +15,23 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+// Off Windows there is no host GPU: only the portable parts are built (for
+// their tests), and the paths that feed the host go unused.
+#![cfg_attr(not(windows), allow(dead_code, unused_variables, unused_mut))]
+
+mod adapter;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+/// Diagnostics: counters raised by this crate's callers (the title's page
+/// scatters), which ride the frame line with the copy statistics.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod stats {
+    pub use super::copystat::{C, add};
+}
+
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -27,6 +39,8 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+mod hlsl;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
@@ -38,6 +52,8 @@ pub mod pipeline;
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod rectangles;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -47,12 +63,14 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+mod switch;
 #[cfg(windows)]
 mod texture;
+mod timeline;
 #[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::{HdrDisplayInfo, display_hdr_info, on_failure, write_title_memory};
 #[cfg(windows)]
-pub use watch::{title_memory_remapped, writing as kernel_will_write};
+pub use watch::{kernel_will_write, kernel_wrote, title_memory_remapped};

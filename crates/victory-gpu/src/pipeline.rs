@@ -4,7 +4,7 @@
 //! types.
 //!
 //! Host pipelines are made on a pipeline's first draw, not at creation:
-//! Grand Theft Auto VI creates some 60,000 pipelines in its first 20
+//! The title creates some 60,000 pipelines in its first 20
 //! seconds and draws with a few dozen (decision 0007, step 3). Shader
 //! containers are shared by content hash and translated once, on first
 //! use (decision 0003).
@@ -18,7 +18,9 @@
 
 use std::collections::HashMap;
 use std::mem::offset_of;
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(windows)]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -63,6 +65,10 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// Whether its native program runs in 64-lane console waves
+    /// (diagnostics: `VICTORY_SKIP_WAVE64`).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    wave64: OnceLock<bool>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -88,6 +94,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(all(windows, feature = "diagnostics"))]
+                wave64: OnceLock::new(),
             })
         })
         .clone()
@@ -102,6 +110,36 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        stage: &'static str,
+        hw_stage: victory_shader::HwStage,
+        used: Vec<victory_shader::UsedResource>,
+    ) -> Arc<Self> {
+        let translated = OnceLock::new();
+        let _ = translated.set(Some(Translated {
+            host: victory_shader::emit::HostShader {
+                stage: hw_stage,
+                dxil: Vec::new(),
+                user_data: Vec::new(),
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+            },
+            used,
+        }));
+        Arc::new(Self {
+            stage,
+            hash: String::new(),
+            container: Vec::new(),
+            translated,
+            #[cfg(feature = "diagnostics")]
+            wave64: OnceLock::new(),
+        })
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -233,25 +271,87 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// The stages `VICTORY_SKIP_WAVE64` names (`mesh`, `compute`, `vertex`,
+/// `pixel`).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn parse_skip_stages(value: &str) -> Vec<&'static str> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            let stage = ["mesh", "compute", "vertex", "pixel"]
+                .into_iter()
+                .find(|&k| k.eq_ignore_ascii_case(s));
+            if stage.is_none() {
+                tracing::warn!(
+                    stage = s,
+                    "VICTORY_SKIP_WAVE64 expects mesh, compute, vertex or pixel"
+                );
+            }
+            stage
+        })
+        .collect()
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+impl Shader {
+    /// Whether the container's native program runs in 64-lane console waves.
+    fn wave64(&self) -> bool {
+        *self.wave64.get_or_init(|| {
+            victory_shader::Container::parse(&self.container)
+                .ok()
+                .and_then(|c| {
+                    c.part(victory_shader::FourCC::DXIL)
+                        .map(|p| p.data.to_vec())
+                })
+                .and_then(|d| victory_shader::native::native_programs(&d).ok())
+                .is_some_and(|ps| ps.iter().any(|p| p.wave64))
+        })
+    }
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    static WAVE64: OnceLock<Vec<&'static str>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
     });
-    if hashes.is_empty() {
+    let wave64 = WAVE64.get_or_init(|| {
+        let value = std::env::var("VICTORY_SKIP_WAVE64").unwrap_or_default();
+        parse_skip_stages(&value)
+    });
+    if hashes.is_empty() && wave64.is_empty() {
         return None;
     }
     p.shaders
         .iter()
-        .find(|shader| hashes.contains(&shader.hash))
+        .find(|shader| {
+            hashes.contains(&shader.hash) || (wave64.contains(&shader.stage) && shader.wave64())
+        })
         .map(|shader| shader.hash.as_str())
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
+}
+
+/// Why a draw or dispatch of `this` is dropped, in words (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn drop_reason(this: This) -> String {
+    if this.is_null() {
+        return "no pipeline set".to_owned();
+    }
+    let p = pipeline(this);
+    skipped_shader(p)
+        .map(|hash| format!("skipped shader {hash}"))
+        .or_else(|| make::missing(&p.host))
+        .unwrap_or_else(|| {
+            "has a host pipeline (prepare or bind failed, or another kind of pipeline)".to_owned()
+        })
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
@@ -275,7 +375,10 @@ pub(crate) fn note_drop(this: This) {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
+    *drops
+        .get_or_insert_with(HashMap::new)
+        .entry(why)
+        .or_default() += 1;
 }
 
 /// The drops counted since the last call, most first (diagnostics).
@@ -507,6 +610,17 @@ pub fn save_pipeline_cache() {
 mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
+    fn skip_stages_names_known_stages_only() {
+        assert_eq!(
+            super::parse_skip_stages(" mesh,Compute ,,"),
+            ["mesh", "compute"]
+        );
+        assert_eq!(super::parse_skip_stages("hull,pixel"), ["pixel"]);
+        assert!(super::parse_skip_stages("").is_empty());
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());
         assert_eq!(
@@ -568,7 +682,7 @@ mod tests {
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
     }
 
-    /// The stream layout Grand Theft Auto VI builds (title+0x86f090): root
+    /// The stream layout the title builds (title+0x86f090): root
     /// signature, five shader slots (the first a mesh shader), blend, sample
     /// mask, rasterizer, depth-stencil 1, sample description, input layout,
     /// topology, render target and depth formats: 0x2b0 bytes.

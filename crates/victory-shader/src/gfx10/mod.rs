@@ -56,12 +56,16 @@ pub struct Instruction {
     pub opcode: u16,
     /// Every dword of the instruction, including literals and extra dwords.
     pub words: Vec<u32>,
+    /// [`name`] of `encoding` and `opcode`, resolved once at decode time.
+    /// The translator asks about every instruction eight times; the table is
+    /// a binary search.
+    name: Option<&'static str>,
 }
 
 impl Instruction {
     /// AMD's name for the opcode, if it is in our table.
     pub fn name(&self) -> Option<&'static str> {
-        name(self.encoding, self.opcode)
+        self.name
     }
 }
 
@@ -282,11 +286,13 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
             _ => return Err(isa(offset, "unknown encoding")),
         }
     };
+    let opcode = opcode as u16;
     Ok(Instruction {
         offset,
         encoding,
-        opcode: opcode as u16,
+        opcode,
         words: (0..len).map(word).collect::<Result<_, _>>()?,
+        name: name(encoding, opcode),
     })
 }
 
@@ -473,6 +479,18 @@ mod tests {
                 (24, "s_setpc_b64"),
             ]
         );
+    }
+
+    /// RDNA2 (GFX10.3) has the fused legacy multiply-adds at these
+    /// opcodes: LLVM's gfx1030 assembler tests encode
+    /// `v_fma_legacy_f32 v0, v1, v2, v3` and `v_fmac_legacy_f32_e32 v0,
+    /// v1, v2` as these words.
+    #[test]
+    fn legacy_multiply_adds_are_the_fused_ones() {
+        let fma = summary(&[0xD540_0000, 0x040E_0501, S_ENDPGM]);
+        assert_eq!(fma[0].2, "v_fma_legacy_f32");
+        let fmac = summary(&[0x0C00_0501, S_ENDPGM]);
+        assert_eq!(fmac[0].2, "v_fmac_legacy_f32");
     }
 
     #[test]

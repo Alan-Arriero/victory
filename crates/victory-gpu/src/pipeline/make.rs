@@ -16,19 +16,27 @@
 //! guess; a pass the title runs only once and whose pipeline takes longer
 //! is lost.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::{BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use super::Shader;
+use super::{Shader, Translated};
+use victory_shader::emit::{StructuredBinding, translate_with_view_strides};
+use victory_shader::{ResourceType, RootType, UsedResource};
+
+type Strides = Vec<(StructuredBinding, u32)>;
 use super::host::{GraphicsState, HostPipeline};
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
-    pub(crate) graphics: Option<Box<GraphicsState>>,
-    queued: AtomicBool,
-    made: OnceLock<Option<HostPipeline>>,
+    pub(crate) graphics: Option<Arc<GraphicsState>>,
+    queue_state: AtomicU8,
+    made: OnceLock<Option<Arc<HostPipeline>>>,
+    bindings: OnceLock<Vec<StructuredBinding>>,
+    strides: Strides,
+    variants: Mutex<VecDeque<Arc<Pending>>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
     key: String,
@@ -48,23 +56,144 @@ impl Pending {
             key.update(s.stage.as_bytes());
             key.update(s.hash.as_bytes());
         }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        key.update(
+            graphics
+                .as_ref()
+                .map(|g| g.describe())
+                .unwrap_or_default()
+                .as_bytes(),
+        );
         Pending {
             shaders,
-            graphics,
-            queued: AtomicBool::new(false),
+            graphics: graphics.map(Arc::from),
+            queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
+            bindings: OnceLock::new(),
+            strides: Vec::new(),
+            variants: Mutex::new(VecDeque::new()),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            static TRACE: OnceLock<bool> = OnceLock::new();
+            if *TRACE.get_or_init(|| crate::switch::on("VICTORY_TRACE_PIPELINES")) {
+                // SAFETY: GetCurrentThreadId queries the calling thread and takes no pointers.
+                let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+                tracing::info!(tid = format_args!("{tid:04x}"), shaders = ?self.shaders, "starting host pipeline");
+            }
+            if self.strides.is_empty() {
+                let made = HostPipeline::new(&self.shaders, self.graphics.as_deref(), &[]);
+                if made.is_none()
+                    && let Some(bindings) = self.find_stride_bindings()
+                {
+                    let _ = self.bindings.set(bindings);
+                }
+                made.map(Arc::new)
+            } else {
+                let shaders = self.specialize_shaders()?;
+                HostPipeline::new(&shaders, self.graphics.as_deref(), &self.strides).map(Arc::new)
+            }
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
+    }
+
+    fn find_stride_bindings(&self) -> Option<Vec<StructuredBinding>> {
+        let host = crate::host::host()?;
+        let bindings = std::cell::RefCell::new(BTreeSet::new());
+        for shader in &self.shaders {
+            if shader.translated().is_none() {
+                // Probe lowering with a valid annotation. Only the binding
+                // locations survive the probe; its DXIL never reaches D3D12.
+                translate_with_view_strides(
+                    &shader.container,
+                    host.supports_wave32(),
+                    &|binding, required| {
+                        required.then(|| {
+                            bindings.borrow_mut().insert(binding);
+                            4
+                        })
+                    },
+                )
+                .ok()?;
+            }
+        }
+        Some(bindings.into_inner().into_iter().collect())
+    }
+
+    fn specialize_shaders(&self) -> Option<Vec<Arc<Shader>>> {
+        let host = crate::host::host()?;
+        self.shaders
+            .iter()
+            .map(|shader| {
+                if shader.translated.get().is_some_and(Option::is_some) {
+                    return Some(shader.clone());
+                }
+                let accessed = std::cell::RefCell::new(BTreeSet::new());
+                let (host, mut used) = translate_with_view_strides(
+                    &shader.container,
+                    host.supports_wave32(),
+                    &|binding, _| {
+                        let i = self
+                            .strides
+                            .binary_search_by_key(&binding, |&(key, _)| key)
+                            .ok()?;
+                        let stride = self.strides[i].1;
+                        accessed.borrow_mut().insert((binding, stride));
+                        Some(stride)
+                    },
+                )
+                .map_err(|error| {
+                    tracing::warn!(?shader, %error, "shader with bound structured views refused");
+                })
+                .ok()?;
+                // Include exact slots absent from the console metadata so draw
+                // binding snapshots and transitions the views that lowering reads.
+                for (binding, stride) in accessed.into_inner() {
+                    let kind = if binding.uav {
+                        ResourceType::Uav
+                    } else {
+                        ResourceType::Srv
+                    };
+                    if let Some(entry) = used.iter_mut().find(|u| {
+                        u.root == RootType::Table
+                            && u.slot == binding.slot
+                            && u.table_offset_dwords == binding.offset_dwords
+                            && u.kind == kind
+                    }) {
+                        entry.stride = stride;
+                    } else {
+                        let user_data = host
+                            .user_data
+                            .iter()
+                            .find(|u| u.root == RootType::Table && u.slot == binding.slot)?
+                            .index;
+                        used.push(UsedResource {
+                            kind,
+                            root: RootType::Table,
+                            table_offset_dwords: binding.offset_dwords,
+                            lower_bound: 0,
+                            stride,
+                            dwords: 4,
+                            user_data: user_data.try_into().ok()?,
+                            slot: binding.slot,
+                        });
+                    }
+                }
+                Some(Arc::new(Shader {
+                    stage: shader.stage,
+                    hash: shader.hash.clone(),
+                    container: Vec::new(),
+                    translated: OnceLock::from(Some(Translated { host, used })),
+                    #[cfg(feature = "diagnostics")]
+                    wave64: OnceLock::new(),
+                }))
+            })
+            .collect()
     }
 }
 
@@ -109,22 +238,68 @@ pub(crate) fn waiting() -> u64 {
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
-        start(p);
+        start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
     let made = p.made.get()?.as_ref();
     if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
     }
-    made
+    made.map(Arc::as_ref)
 }
 
-/// Queues `p` for the workers, once.
-fn start(p: &Arc<Pending>) {
-    if !p.queued.swap(true, Ordering::Relaxed) {
-        PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
-        queue(p.clone());
+/// Uses the existing worker queue and wait budget for stride variants. Old
+/// variants can be evicted while commands keep their PSO and root signature.
+pub(super) fn ready_with_strides(
+    p: &Arc<Pending>,
+    view_stride: impl Fn(StructuredBinding) -> Option<u32>,
+) -> Option<Arc<HostPipeline>> {
+    if let Some(made) = p.made.get()?.as_ref() {
+        return Some(made.clone());
     }
+    let bindings = p.bindings.get().filter(|bindings| !bindings.is_empty())?;
+    let Some(strides) = bindings
+        .iter()
+        .map(|&binding| Some((binding, view_stride(binding)?)))
+        .collect::<Option<Strides>>()
+    else {
+        static WARN: std::sync::Once = std::sync::Once::new();
+        WARN.call_once(|| {
+            tracing::warn!("a draw or dispatch requires a matching structured buffer view")
+        });
+        return None;
+    };
+    let variant = {
+        let mut variants = p.variants.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = variants
+            .iter()
+            .position(|variant| variant.strides == strides)
+        {
+            let variant = variants.remove(i).expect("a variant at this index");
+            variants.push_back(variant.clone());
+            variant
+        } else {
+            const MAX_VARIANTS: usize = 16;
+            let variant = Arc::new(Pending {
+                shaders: p.shaders.clone(),
+                graphics: p.graphics.clone(),
+                queue_state: AtomicU8::new(NOT_QUEUED),
+                made: OnceLock::new(),
+                bindings: OnceLock::new(),
+                strides,
+                variants: Mutex::new(VecDeque::new()),
+                key: p.key.clone(),
+                used: AtomicBool::new(false),
+            });
+            if variants.len() >= MAX_VARIANTS {
+                variants.pop_front();
+            }
+            variants.push_back(variant.clone());
+            variant
+        }
+    };
+    ready(&variant)?;
+    variant.made.get()?.clone()
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
@@ -132,7 +307,7 @@ fn start(p: &Arc<Pending>) {
 pub(crate) fn early(p: &Arc<Pending>) {
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p);
+        start(p, EARLY);
     }
 }
 
@@ -152,24 +327,106 @@ fn wait(p: &Pending, frame: u64) {
         if rest.is_zero() {
             break;
         }
-        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+        held = done
+            .wait_timeout(held, rest)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
-fn queue(p: Arc<Pending>) {
-    static SENDER: OnceLock<std::sync::mpsc::Sender<Arc<Pending>>> = OnceLock::new();
-    let sender = SENDER.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
-        let receiver = Arc::new(Mutex::new(receiver));
+const NOT_QUEUED: u8 = 0;
+const EARLY: u8 = 1;
+const REQUESTED: u8 = 2;
+const MAKING: u8 = 3;
+
+struct Queue {
+    early: VecDeque<Arc<Pending>>,
+    requested: VecDeque<Arc<Pending>>,
+}
+
+impl Queue {
+    const fn new() -> Self {
+        Self {
+            early: VecDeque::new(),
+            requested: VecDeque::new(),
+        }
+    }
+
+    /// Queues an unrequested pipeline or promotes one queued at creation.
+    /// Returns whether it is new to the queue, or `None` if nothing changed.
+    fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
+        let prev = p.queue_state.load(Ordering::Relaxed);
+        if prev >= priority {
+            return None;
+        }
+        p.queue_state.store(priority, Ordering::Relaxed);
+        if priority == REQUESTED {
+            self.requested.push_back(p.clone());
+        } else {
+            self.early.push_back(p.clone());
+        }
+        Some(prev == NOT_QUEUED)
+    }
+
+    fn pop(&mut self) -> Option<Arc<Pending>> {
+        let p = self.requested.pop_front().or_else(|| {
+            // An early entry can have been promoted and claimed already.
+            std::iter::from_fn(|| self.early.pop_front())
+                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+        })?;
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        Some(p)
+    }
+}
+
+static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
+static AVAILABLE: Condvar = Condvar::new();
+
+/// Start or promote work for a draw without waiting behind the entire early
+/// list. Queue changes and worker claims happen under the same lock.
+fn start(p: &Arc<Pending>, priority: u8) {
+    if p.queue_state.load(Ordering::Relaxed) >= priority {
+        return;
+    }
+    if !workers() {
+        if p.queue_state.swap(MAKING, Ordering::Relaxed) == NOT_QUEUED {
+            p.make();
+        }
+        return;
+    }
+    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(new) = queue.push(p, priority) {
+        if new {
+            PEAK.fetch_max(
+                WAITING.fetch_add(1, Ordering::Relaxed) + 1,
+                Ordering::Relaxed,
+            );
+        }
+        AVAILABLE.notify_one();
+    }
+}
+
+fn next() -> Arc<Pending> {
+    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if let Some(p) = queue.pop() {
+            return p;
+        }
+        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// Starts the workers (half the logical processors, 2 to 8) on first use.
+fn workers() -> bool {
+    static RUNNING: OnceLock<bool> = OnceLock::new();
+    *RUNNING.get_or_init(|| {
+        let mut running = false;
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         for i in 0..workers {
-            let receiver = receiver.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
-                .spawn(move || {
+                .spawn(|| {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
                     unsafe {
@@ -177,9 +434,7 @@ fn queue(p: Arc<Pending>) {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                        let Ok(p) = next else { return };
-                        p.make();
+                        next().make();
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -189,15 +444,12 @@ fn queue(p: Arc<Pending>) {
                 });
             if let Err(e) = spawned {
                 tracing::warn!(error = %e, "no pipeline worker");
+            } else {
+                running = true;
             }
         }
-        sender
-    });
-    if let Err(e) = sender.send(p) {
-        // No worker: made here instead.
-        e.0.make();
-        WAITING.fetch_sub(1, Ordering::Relaxed);
-    }
+        running
+    })
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
@@ -228,11 +480,31 @@ mod tests {
     fn first_use_is_made_by_a_worker() {
         let p = Arc::new(Pending::new(Vec::new(), None));
         assert!(ready(&p).is_none());
-        assert!(p.queued.load(Ordering::Relaxed));
+        assert_ne!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
         let started = Instant::now();
         while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn draws_promote_early_pipelines_without_claiming_them_twice() {
+        let earlier = Arc::new(Pending::new(Vec::new(), None));
+        let promoted = Arc::new(Pending::new(Vec::new(), None));
+        let requested = Arc::new(Pending::new(Vec::new(), None));
+        let mut queue = Queue::new();
+
+        assert_eq!(queue.push(&earlier, EARLY), Some(true));
+        assert_eq!(queue.push(&promoted, EARLY), Some(true));
+        assert_eq!(queue.push(&requested, REQUESTED), Some(true));
+        assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
+        assert_eq!(queue.push(&promoted, REQUESTED), None);
+
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
+        assert_eq!(queue.push(&promoted, REQUESTED), None);
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
+        assert!(queue.pop().is_none());
     }
 }
