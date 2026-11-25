@@ -10239,7 +10239,9 @@ mod tests {
         // The old path wrote float 1.0 into W; a single-channel 32_FLOAT
         // fetch has no other reason to emit that constant.
         assert!(
-            !l.dxil.windows(4).any(|w| w == 1.0f32.to_bits().to_le_bytes()),
+            !l.dxil
+                .windows(4)
+                .any(|w| w == 1.0f32.to_bits().to_le_bytes()),
             "missing-channel fill must not be float 1.0"
         );
     }
