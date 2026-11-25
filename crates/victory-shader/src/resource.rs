@@ -1079,7 +1079,10 @@ impl<'a> Tracer<'a> {
         if inst.write(Reg::V(reg)) != Some(v)
             || f.abs != 0
             || f.neg != 0
-            || f.clamp && { self.clamped.set(true); true }
+            || f.clamp && {
+                self.clamped.set(true);
+                true
+            }
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -1113,7 +1116,10 @@ impl<'a> Tracer<'a> {
             || inst.write(Reg::V(reg)) != Some(v)
             || f.abs != 0
             || f.neg != 0
-            || f.clamp && { self.clamped.set(true); true }
+            || f.clamp && {
+                self.clamped.set(true);
+                true
+            }
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -1158,7 +1164,10 @@ impl<'a> Tracer<'a> {
             || inst.write(Reg::V(reg)) != Some(v)
             || f.abs != 0
             || f.neg != 0
-            || f.clamp && { self.clamped.set(true); true }
+            || f.clamp && {
+                self.clamped.set(true);
+                true
+            }
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -1193,7 +1202,10 @@ impl<'a> Tracer<'a> {
             })) != Some(v)
             || f.abs != 0
             || f.neg != 0
-            || f.clamp && { self.clamped.set(true); true }
+            || f.clamp && {
+                self.clamped.set(true);
+                true
+            }
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
