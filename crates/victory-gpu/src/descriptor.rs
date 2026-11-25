@@ -644,10 +644,11 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
     (!desc.is_null()).then(|| unsafe { desc.read_unaligned() })
 }
 
-/// Device method.
+/// Device method: always records a CBV; a null desc is location 0, size 0.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    let [lo, hi, size, _] = words(desc).unwrap_or_default();
-    let address = u64::from(lo) | u64::from(hi) << 32;
+    let (address, size) = words(desc).map_or((0, 0), |[lo, hi, size, _]| {
+        (u64::from(lo) | u64::from(hi) << 32, size)
+    });
     record(handle, View::Constant(address, size));
 }
 
@@ -937,12 +938,19 @@ mod tests {
 
     #[test]
     fn a_null_cbv_overwrites_the_previous_descriptor() {
+        let this = std::ptr::null();
         let mut slot = [0u64; 4];
         let handle = slot.as_mut_ptr() as u64;
-        create_cbv(std::ptr::null(), &[0x1000, 0, 256, 0], handle);
+        create_cbv(this, &[0x1000, 0, 256, 0], handle);
         assert_eq!(view(handle), Some(View::Constant(0x1000, 256)));
 
-        create_cbv(std::ptr::null(), std::ptr::null(), handle);
+        create_cbv(this, std::ptr::null(), handle);
+        assert_eq!(view(handle), Some(View::Constant(0, 0)));
+
+        // Same null-desc write clears a prior SRV, not only a prior CBV.
+        create_srv(this, this, std::ptr::null(), handle);
+        assert_eq!(view(handle), Some(View::Shader(0, None)));
+        create_cbv(this, std::ptr::null(), handle);
         assert_eq!(view(handle), Some(View::Constant(0, 0)));
     }
 
