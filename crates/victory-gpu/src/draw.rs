@@ -1107,8 +1107,7 @@ impl State {
         // Buffer / constant views through ResourceDescriptorHeap: title CPU
         // writes do not bump tex_gen or state_gen, so refresh every time a
         // stage indexes the heap — same cadence as table `readable()`.
-        // Also covers off-element / aliased slots that `refresh_special_buffers`
-        // would have refreshed on main (#553).
+        // Also covers off-element / aliased slots (#553).
         host.refresh_bindless_buffers(list);
         if !uses_heap_srv && !uses_heap_uav {
             return;
