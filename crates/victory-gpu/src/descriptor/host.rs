@@ -41,7 +41,9 @@ type SrvMips = (usize, (u32, u32));
 const MAX_TEX_CHANGES: usize = 4096;
 
 /// Live title-memory buffer range a heap slot views, for bindless refresh.
-type BufRange = (Arc<Shadow>, u64, u64);
+/// The bool is whether the view is unordered (refresh must leave the host
+/// copy in unordered-access state, not generic-read).
+type BufRange = (Arc<Shadow>, u64, u64, bool);
 
 /// Tracks which title slots hold buffer / constant views whose host copies
 /// need a submission-time refresh when a shader indexes `ResourceDescriptorHeap`.
@@ -985,9 +987,10 @@ impl HostHeap {
     ///
     /// Covers ordinary buffer / constant copies tracked in [`BufTracker`], and
     /// unaligned / aliased structured slots registered in [`Self::refreshes`].
-    /// shortcut: unordered buffer ranges are refreshed for reading but not
-    /// marked for copy-back (a full-heap UAV snapshot is too expensive; table
-    /// UAVs still go through [`crate::draw`]'s `readable` path).
+    /// Unordered heap views refresh into unordered-access state so the
+    /// dispatch can write them; copy-back of heap-only UAV ranges is still
+    /// skipped (a full-heap snapshot is too expensive; table UAVs still go
+    /// through [`crate::draw`]'s `readable` path).
     pub(crate) fn refresh_bindless_buffers(&self, list: &HostList) {
         if self.sampler {
             return;
@@ -1003,8 +1006,13 @@ impl HostHeap {
             let tracker = self.buf_tracker.lock().unwrap_or_else(|e| e.into_inner());
             tracker.live.values().cloned().collect()
         };
-        for (shadow, address, len) in live {
-            shadow.refresh(list, address, len);
+        for (shadow, address, len, is_uav) in live {
+            let access = if is_uav {
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+            } else {
+                D3D12_RESOURCE_STATE_GENERIC_READ
+            };
+            shadow.refresh_as(list, address, len, access);
         }
     }
 
@@ -1428,26 +1436,47 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 }
 
 /// Host copy range a buffer or constant view reads, for bindless refresh.
+///
+/// Resolves the shadow the same way descriptor creation does (`find` on the
+/// buffer's full base and length), then refreshes only the viewed subrange —
+/// so overlapping title buffers do not pick a different innermost shadow than
+/// the one the descriptor was created against.
 fn buffer_refresh_range(view: &View) -> Option<BufRange> {
-    match *view {
-        View::Constant(address, size) => {
-            let len = u64::from(size);
-            if len == 0 {
-                return None;
-            }
-            let shadow = crate::shadow::find(address, len)?;
-            let len = len.min(shadow.left(address));
-            (len > 0).then_some((shadow, address, len))
+    let is_uav = matches!(
+        view,
+        View::Unordered(..) | View::Placed(true, ..)
+    );
+    let (base, extent) = buffer_host_extent(view)?;
+    if extent == 0 {
+        return None;
+    }
+    let shadow = crate::shadow::find(base, extent)?;
+    let (address, len) = match *view {
+        View::Constant(address, size) => (address, u64::from(size)),
+        _ => buffer_range(view)?,
+    };
+    if len == 0 {
+        return None;
+    }
+    let len = len.min(shadow.left(address));
+    (len > 0).then_some((shadow, address, len, is_uav))
+}
+
+/// The full title buffer a view was created against: base address and length
+/// passed to [`crate::shadow::find`] when making the host descriptor.
+fn buffer_host_extent(view: &View) -> Option<(u64, u64)> {
+    match view {
+        View::Constant(address, size) => Some((*address, u64::from(*size))),
+        View::Shader(resource, Some(_)) | View::Unordered(resource, _, Some(_)) => {
+            let (data, len) = crate::resource::buffer_bytes(*resource as crate::object::This)?;
+            Some((data as u64, len))
         }
-        _ => {
-            let (address, len) = buffer_range(view)?;
-            if len == 0 {
-                return None;
-            }
-            let shadow = crate::shadow::find(address, len)?;
-            let len = len.min(shadow.left(address));
-            (len > 0).then_some((shadow, address, len))
+        View::Placed(_, resource, desc) if resource[0] == 1 => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+            Some((address, len))
         }
+        _ => None,
     }
 }
 
