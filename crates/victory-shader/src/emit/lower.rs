@@ -8714,6 +8714,25 @@ impl<'a> Lower<'a> {
                 when,
                 taken,
                 not_taken,
+            } if taken == not_taken => {
+                // Degenerate branch: both arms share one successor. Emitting
+                // CondBr with two critical-edge blocks would insert the same
+                // edges map key twice and drop the first edge from fill_phis
+                // (VIC-BT-007). Treat it as an unconditional jump.
+                let _ = when;
+                if self.counters.contains_key(&taken) && self.rpo[taken] <= self.rpo[b] {
+                    let ok = self.count_iteration(taken, pred::IULT);
+                    let abort = self.abort_block();
+                    Term::CondBr(ok, self.block[taken].expect("reachable"), abort)
+                } else {
+                    self.enter_loop(b, taken, self.cur);
+                    Term::Br(self.block[taken].expect("reachable"))
+                }
+            }
+            LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
             } => {
                 // A negated condition branches the other way round.
                 let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
@@ -10660,6 +10679,64 @@ mod tests {
             let features = u64::from_le_bytes(sfi0.try_into().unwrap());
             assert_eq!(features & 0x8000, 0, "unexpected INT64 feature bit");
         }
+    }
+
+    /// `LaneExit::Branch` with `taken == not_taken` must lower as a jump.
+    /// Calling `edge` twice for the same `(from, to)` would overwrite the
+    /// first critical-edge block in the map and leave `fill_phis` missing a
+    /// CondBr predecessor (VIC-BT-007).
+    #[test]
+    fn identical_branch_arms_lower_as_a_jump() {
+        let words = [
+            0xBF06_0100u32, // s_cmp_eq_u32 s0, s1
+            0xBF85_0001,    // s_cbranch_scc1 -> end
+            0xBE82_0300,    // s_mov_b32 s2, s0
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code: code.clone(),
+        };
+        let p = ir::build(&code, false, 256).unwrap();
+        let mut st = structure::structure(&p).unwrap();
+        let mut collapsed = false;
+        for exit in &mut st.exits {
+            if let structure::LaneExit::Branch {
+                taken, not_taken, ..
+            } = exit
+            {
+                *not_taken = *taken;
+                collapsed = true;
+            }
+        }
+        assert!(
+            collapsed,
+            "fixture must expose a LaneExit::Branch to force identical arms"
+        );
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .expect("degenerate Branch arms must lower without PHI/edge map errors");
+        assert!(!lowered.dxil.is_empty());
     }
 }
 
