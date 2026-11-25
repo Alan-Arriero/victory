@@ -885,8 +885,8 @@ mod tests {
             used: vec![],
             io: StageIo::Ps {
                 inputs: vec![],
-                input_addr: 0,
                 rsrc2: Default::default(),
+                input_addr: 0,
                 db_shader_control: 0,
                 patches: vec![],
             },
@@ -1235,6 +1235,44 @@ mod tests {
             slot: 0,
         }];
         pixel_program(rsrc2, vec![table_param(0)], used, &words)
+    }
+
+    fn sfi0_features(dxil: &[u8]) -> u64 {
+        let host = Container::parse(dxil).unwrap();
+        let sfi0 = host.part(FourCC::SFI0).unwrap().data;
+        u64::from_le_bytes(sfi0.try_into().unwrap())
+    }
+
+    /// A POPS pixel program (`LOAD_COLLISION_WAVEID`) reads the collision
+    /// wave id SGPR after the primitive mask and compares its fields with
+    /// `src_pops_exiting_wave_id` to wait for the earlier waves that cover
+    /// its pixels. Both translate as a wave that overlaps none, and the UAV
+    /// is rasterizer ordered (D3D_SHADER_FEATURE_ROVS, 0x1000, in SFI0).
+    #[test]
+    fn a_pops_pixel_program_orders_its_uavs_on_the_host() {
+        let body = [
+            0x9003_9F02, // s_lshr_b32 s3, s2, 31 (the wave overlaps another)
+            0x8104_03EF, // s_add_i32 s4, src_pops_exiting_wave_id, s3
+            0xBF90_0007, // s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)
+        ];
+        let dxil = pixel_uav_store(1 << 1 | 1 << 25, &body).unwrap();
+        let features = sfi0_features(&dxil);
+        assert_ne!(features & 0x1000, 0, "SFI0 {features:#x}: no ROVs");
+    }
+
+    /// Without `LOAD_COLLISION_WAVEID` the same store is no ROV. s2 is then
+    /// above the SGPRs the hardware initializes, and since no instruction
+    /// writes it, reading it stays refused, as in compute programs.
+    #[test]
+    fn a_pixel_program_without_pops_keeps_plain_uavs() {
+        let dxil = pixel_uav_store(1 << 1, &[0xBE84_0380]).unwrap(); // s_mov_b32 s4, 0
+        let features = sfi0_features(&dxil);
+        assert_eq!(features & 0x1000, 0, "SFI0 {features:#x}: ROVs");
+        let body = [0x9004_9F02]; // s_lshr_b32 s4, s2, 31
+        assert!(pixel_uav_store(1 << 1, &body).is_err());
+        // src_pops_exiting_wave_id has no value there.
+        let body = [0x8104_03EF]; // s_add_i32 s4, src_pops_exiting_wave_id, s3
+        assert!(pixel_uav_store(1 << 1, &body).is_err());
     }
 
     /// The primitive mask (s1 with one user SGPR) arrives in every pixel
@@ -1672,8 +1710,8 @@ mod tests {
                         pack2: false,
                         row2: 0,
                     }],
-                    input_addr: 1 << 1,
                     rsrc2: Default::default(),
+                    input_addr: 1 << 1,
                     db_shader_control: 0,
                     patches: vec![],
                 },
