@@ -9184,10 +9184,10 @@ mod tests {
     }
 
     /// VIC-BT-042: fused `v_fma_f16` keeps `256h×256h + (-65504h) = 32h`;
-    /// unfused mad (mul then add) overflows the product to +inf. Both
-    /// sequences must lower; host execution is in `valu_tests`.
+    /// unfused `v_mad_f16` / `v_mac_f16` overflow the product to +inf. All
+    /// three opcodes must decode and lower; host execution is in `valu_tests`.
     #[test]
-    fn f16_fma_and_mul_add_lower() {
+    fn f16_fma_and_mad_mac_lower() {
         // Exact fused sum is finite; the product alone exceeds max finite f16.
         let (a, b, c) = (256.0f64, 256.0f64, -65504.0f64);
         assert_eq!(a * b + c, 32.0);
@@ -9200,18 +9200,37 @@ mod tests {
                 (src0 & 0x1FF) | (src1 & 0x1FF) << 9 | (src2 & 0x1FF) << 18,
             ]
         };
-        // v_fma_f16 v0, v1, v2, v3
+        let names = |words: &[u32]| -> Vec<&'static str> {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            crate::gfx10::decode(&code)
+                .unwrap()
+                .iter()
+                .map(|i| i.name().unwrap())
+                .collect()
+        };
+
+        // v_fma_f16 v0, v1, v2, v3 (VOP3 0x34b)
         let mut fma = Vec::new();
         fma.extend_from_slice(&vop3(0x34b, 0, v(1), v(2), v(3)));
         fma.push(S_ENDPGM);
+        assert_eq!(names(&fma), ["v_fma_f16", "s_endpgm"]);
         lowers(&fma, 0).expect("v_fma_f16");
 
-        // v_mul_f16 v5, v1, v2; v_add_f16 v0, v5, v3 (unfused mad)
+        // v_mad_f16 v0, v1, v2, v3 (VOP3 0x203)
         let mut mad = Vec::new();
-        mad.extend_from_slice(&vop3(0x135, 5, v(1), v(2), 0));
-        mad.extend_from_slice(&vop3(0x132, 0, v(5), v(3), 0));
+        mad.extend_from_slice(&vop3(0x203, 0, v(1), v(2), v(3)));
         mad.push(S_ENDPGM);
-        lowers(&mad, 0).expect("v_mul_f16+v_add_f16");
+        assert_eq!(names(&mad), ["v_mad_f16", "s_endpgm"]);
+        lowers(&mad, 0).expect("v_mad_f16");
+
+        // v_mac_f16 v0, v1, v2 (VOP3 encoding of VOP2 0x023 → 0x123);
+        // seed v0 from v3 so the accumulator is defined.
+        let mut mac = Vec::new();
+        mac.push(0x7E00_0303); // v_mov_b32 v0, v3
+        mac.extend_from_slice(&vop3(0x123, 0, v(1), v(2), 0));
+        mac.push(S_ENDPGM);
+        assert_eq!(names(&mac), ["v_mov_b32", "v_mac_f16", "s_endpgm"]);
+        lowers(&mac, 0).expect("v_mac_f16");
     }
 
     /// Lowers a pixel program with one target: whether it translates.

@@ -693,10 +693,9 @@ fn v_fma_legacy_f32_follows_the_d3d9_zero_rule() {
     });
 }
 
-/// `v_fma_f16` is fused; unfused `v_mad_f16` / `v_mac_f16` (and a separate
-/// `v_mul_f16` then `v_add_f16`) round the product to f16 first. With
-/// `a = b = 256h` and `c = -65504h`, the product overflows to +inf unfused,
-/// while the fused form yields `32h` (VIC-BT-042).
+/// `v_fma_f16` is fused; unfused `v_mad_f16` / `v_mac_f16` round the product
+/// to f16 first. With `a = b = 256h` and `c = -65504h`, the product overflows
+/// to +inf unfused, while the fused form yields `32h` (VIC-BT-042).
 #[test]
 fn v_fma_f16_is_fused_mul_add_rounds_the_product() {
     // 256.0h, 256.0h, -65504.0h
@@ -713,17 +712,28 @@ fn v_fma_f16_is_fused_mul_add_rounds_the_product() {
         );
     });
 
-    // Unfused mad semantics: v_mul_f16 v5, v1, v2; v_add_f16 v0, v5, v3.
-    // VOP3 encodings of VOP2 0x035 / 0x032.
-    let mut body = Vec::new();
-    body.extend_from_slice(&vop3(0x135, 5, vgpr(1), vgpr(2), 0));
-    body.extend_from_slice(&vop3(0x132, 0, vgpr(5), vgpr(3), 0));
-    let mad = build_valu_cs(&body);
+    // v_mad_f16 v0, v1, v2, v3 (VOP3 0x203, GFX9 opcode retained for titles)
+    let mad = build_valu_cs(&vop3(0x203, 0, vgpr(1), vgpr(2), vgpr(3)));
     run_cases(&mad, &cases, |backend, _, _, got| {
         assert_eq!(
             got & 0xFFFF,
             0x7C00,
-            "{backend}: v_mul_f16+v_add_f16(256h, 256h, -65504h) = {:#06x}, want 0x7C00 (+inf)",
+            "{backend}: v_mad_f16(256h, 256h, -65504h) = {:#06x}, want 0x7C00 (+inf)",
+            got & 0xFFFF
+        );
+    });
+
+    // v_mac_f16 v0, v1, v2: dst is the accumulator. Seed v0 from v3 first.
+    // VOP3 encoding of VOP2 0x023 → 0x123.
+    let mut body = Vec::new();
+    body.push(vop1(0x001, 0, vgpr(3))); // v_mov_b32 v0, v3
+    body.extend_from_slice(&vop3(0x123, 0, vgpr(1), vgpr(2), 0));
+    let mac = build_valu_cs(&body);
+    run_cases(&mac, &cases, |backend, _, _, got| {
+        assert_eq!(
+            got & 0xFFFF,
+            0x7C00,
+            "{backend}: v_mac_f16(256h, 256h, -65504h) = {:#06x}, want 0x7C00 (+inf)",
             got & 0xFFFF
         );
     });
