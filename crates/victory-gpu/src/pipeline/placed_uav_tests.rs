@@ -179,7 +179,6 @@ fn placed_uav_dispatch_writes_its_texture() {
 
     let expected = [1.0f32, 0.5, -0.25, 2.0];
     let list = host.new_list().unwrap();
-    crate::texture::upload(&list, placed, texture);
     let mut state = crate::draw::State::default();
     state.set_pipeline(pipeline.0);
     state.set_heaps(&[views.0]);
@@ -191,6 +190,11 @@ fn placed_uav_dispatch_writes_its_texture() {
         crate::draw::dispatched() > dispatched,
         "dispatch did not record"
     );
+    // A readback uploads a texture the title fills (the texture-to-buffer
+    // copy does, without asking whether the host wrote it): what the shader
+    // stored must survive, so nothing of the title memory (zeroes) may be
+    // copied over it.
+    crate::texture::upload(&list, placed, texture);
     crate::list::ensure_state(&list, placed, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
     let (readback, footprint) =
         crate::capture::read_back(&host.device, &list.list, texture).unwrap();
