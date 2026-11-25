@@ -254,8 +254,10 @@ pub fn track(
                     // type is a ray-tracing structure is a range of title
                     // memory (the title: all of it, or from one structure's
                     // address on), and the node's address is among the
-                    // operands; any other descriptor must be a resource of
-                    // the host.
+                    // operands; any other descriptor that can be traced is a
+                    // resource of the host. One that cannot be traced is not
+                    // an error: the query then lowers as a miss, which never
+                    // reads its descriptor.
                     let word = |k: u8| match *rsrc {
                         Operand::Scalar { code, dwords } if k < dwords => {
                             inst.read(Reg::S(code + k)).map(|v| t.origin(v))
@@ -269,8 +271,20 @@ pub fn track(
                             out.bvh.push((site, BvhNodes::Memory { word1, word3 }));
                         }
                         _ => {
-                            descriptor(rsrc, Role::Resource)?;
-                            out.bvh.push((site, BvhNodes::Resource));
+                            if descriptor(rsrc, Role::Resource).is_ok() {
+                                // A descriptor fixed in the code names no
+                                // memory to walk, so the query is left to
+                                // lower as a miss.
+                                let usable = out
+                                    .descriptors
+                                    .iter()
+                                    .rev()
+                                    .find(|d| d.site == site && d.role == Role::Resource)
+                                    .is_some_and(|d| !matches!(d.source, Source::Constant(_)));
+                                if usable {
+                                    out.bvh.push((site, BvhNodes::Resource));
+                                }
+                            }
                         }
                     }
                 }
