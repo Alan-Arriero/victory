@@ -89,14 +89,14 @@ pub struct SpaceInfo {
 
 fn used_bytes(dir: &Path) -> u64 {
     // Walk without following symlinks/junctions so a cycle or escape
-    // cannot inflate the PLS quota (VIC-BT-040 / #440).
+    // cannot inflate the PLS quota (VIC-BT-040 / #440). Paths stay on the
+    // stack so breadth does not hold many open directory handles at once.
     let mut total = 0u64;
-    let mut stack = Vec::new();
-    match std::fs::read_dir(dir) {
-        Ok(entries) => stack.push(entries),
-        Err(_) => return 0,
-    }
-    while let Some(entries) = stack.pop() {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
         for e in entries.flatten() {
             let Ok(ft) = e.file_type() else {
                 continue;
@@ -105,9 +105,7 @@ fn used_bytes(dir: &Path) -> u64 {
                 continue;
             }
             if ft.is_dir() {
-                if let Ok(sub) = std::fs::read_dir(e.path()) {
-                    stack.push(sub);
-                }
+                stack.push(e.path());
                 continue;
             }
             if let Ok(m) = e.metadata() {
