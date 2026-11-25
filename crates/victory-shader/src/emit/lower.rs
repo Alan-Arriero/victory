@@ -205,7 +205,7 @@ fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
 /// 10-bit floats of the packed formats) shifts up to be a half:
 /// the small floats are a half's exponent (5 bits, biased 15) and the top
 /// of its mantissa, without the sign. Non-NaN values widen as a half;
-/// NaNs keep their payload (see [`f16_nan_widen_bits`]).
+/// NaNs keep their payload via [`Lower::f16_widen_keep_snan`].
 fn half_shift(width: u32) -> u32 {
     debug_assert!(matches!(width, 10 | 11 | 16), "{width}-bit float");
     if width == 16 { 0 } else { 15 - width }
@@ -214,6 +214,7 @@ fn half_shift(width: u32) -> u32 {
 /// f32 bits for an f16 NaN without quieting: `sign | 0x7F800000 |
 /// (payload << 13)`. RDNA typed-buffer float formats preserve the
 /// signalling bit; `legacyF16ToF32` would set it (VIC-BT-019 / #440).
+#[cfg(test)]
 fn f16_nan_widen_bits(h: u32) -> u32 {
     let h = h & 0xFFFF;
     debug_assert!(h & 0x7FFF > 0x7C00, "{h:#x} is not an f16 NaN");
