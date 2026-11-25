@@ -55,6 +55,20 @@ const fn vop3_omod(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16, omod: u8)
     [w0, w1 | (omod as u32 & 3) << 27]
 }
 
+/// VOP3 with integer/float `clamp` (unsigned saturation on integer add/sub).
+const fn vop3_clamp(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    let [w0, w1] = vop3(op, vdst, src0, src1, src2);
+    [w0 | 1 << 15, w1]
+}
+
+/// VOP3B (carry-out `sdst`) with `clamp`.
+const fn vop3b_clamp(op: u16, vdst: u8, sdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    [
+        0x35 << 26 | (op as u32 & 0x3FF) << 16 | 1 << 15 | (sdst as u32 & 0x7F) << 8 | vdst as u32,
+        (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9 | (src2 as u32 & 0x1FF) << 18,
+    ]
+}
+
 /// VOP2 `op vdst, src0, vsrc1`.
 const fn vop2(op: u8, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
     (op as u32 & 0x3F) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
@@ -1720,6 +1734,53 @@ fn v_mad_f32_flushes_subnormals_around_omod() {
         (&mad_mul2, mad_mul2_cases, "v_mad_f32 mul:2"),
         (&mad_div2, mad_div2_cases, "v_mad_f32 div:2"),
         (&mac, mac_cases, "v_mac_f32"),
+    ] {
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+        run_cases(shader, &inputs, |backend, i, _, got| {
+            let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend}: {what} case {i}: {got:#010x}, want {want:#010x}"
+            );
+        });
+    }
+}
+
+/// VOP3 integer `clamp` saturates unsigned add/sub on overflow/underflow
+/// (VIC-BT-010). Without the fix these refuse to lower, or wrap.
+#[test]
+fn integer_vop3_clamp_saturates_add_and_sub() {
+    // VOP2 ops in VOP3 encoding use opcode + 0x100 (0x025 alone is VOPC).
+    // v_add_nc_u32 / v_sub_nc_u32 / v_subrev_nc_u32 with clamp.
+    let add_nc = build_valu_cs(&vop3_clamp(0x125, 0, vgpr(1), vgpr(2), 0));
+    let sub_nc = build_valu_cs(&vop3_clamp(0x126, 0, vgpr(1), vgpr(2), 0));
+    let subrev_nc = build_valu_cs(&vop3_clamp(0x127, 0, vgpr(1), vgpr(2), 0));
+    // v_add_co_u32 / v_sub_co_u32 with clamp (carry → s16, unused).
+    let add_co = build_valu_cs(&vop3b_clamp(0x30f, 0, 16, vgpr(1), vgpr(2), 0));
+    let sub_co = build_valu_cs(&vop3b_clamp(0x310, 0, 16, vgpr(1), vgpr(2), 0));
+
+    let add_cases: &[([u32; 4], u32)] = &[
+        ([1, 2, 0, 0], 3),
+        ([u32::MAX, 1, 0, 0], u32::MAX),
+        ([0x8000_0000, 0x8000_0000, 0, 0], u32::MAX),
+        ([0, 0, 0, 0], 0),
+    ];
+    let sub_cases: &[([u32; 4], u32)] = &[
+        ([5, 3, 0, 0], 2),
+        ([1, 2, 0, 0], 0),
+        ([0, 1, 0, 0], 0),
+        ([u32::MAX, u32::MAX, 0, 0], 0),
+    ];
+    // subrev: dst = src1 - src0 (v2 - v1).
+    let subrev_cases: &[([u32; 4], u32)] =
+        &[([3, 5, 0, 0], 2), ([2, 1, 0, 0], 0), ([1, 0, 0, 0], 0)];
+
+    for (shader, cases, what) in [
+        (&add_nc, add_cases, "v_add_nc_u32 clamp"),
+        (&sub_nc, sub_cases, "v_sub_nc_u32 clamp"),
+        (&subrev_nc, subrev_cases, "v_subrev_nc_u32 clamp"),
+        (&add_co, add_cases, "v_add_co_u32 clamp"),
+        (&sub_co, sub_cases, "v_sub_co_u32 clamp"),
     ] {
         let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
         run_cases(shader, &inputs, |backend, i, _, got| {

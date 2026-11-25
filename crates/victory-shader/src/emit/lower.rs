@@ -2402,7 +2402,9 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        if v.clamp || v.omod != 0 {
+        // Integer `clamp` is unsigned saturation on add/sub; those ops apply it
+        // before calling here. Other integer ops refuse the modifier.
+        if v.omod != 0 || (v.clamp && !Self::integer_clamp_op(inst.name())) {
             return Err("integer output modifiers");
         }
         match v.dst {
@@ -2411,6 +2413,22 @@ impl<'a> Lower<'a> {
             _ => return Err("a result without a register"),
         }
         Ok(())
+    }
+
+    /// VOP3 integer ops whose `clamp` means unsigned saturation via carry/borrow.
+    fn integer_clamp_op(name: &str) -> bool {
+        matches!(
+            name,
+            "v_add_co_u32"
+                | "v_sub_co_u32"
+                | "v_subrev_co_u32"
+                | "v_add_co_ci_u32"
+                | "v_sub_co_ci_u32"
+                | "v_subrev_co_ci_u32"
+                | "v_add_nc_u32"
+                | "v_sub_nc_u32"
+                | "v_subrev_nc_u32"
+        )
     }
 
     /// Starts code only the lanes where `guard` holds run (a store under a
@@ -3611,6 +3629,13 @@ impl<'a> Lower<'a> {
             carry = self.s.m.bin(c, Bin::Or, carry, more);
         }
         (r, carry)
+    }
+
+    /// VOP3 integer `clamp`: unsigned saturation from the carry (add →
+    /// `0xFFFF_FFFF`) or borrow (sub → `0`) bit.
+    fn clamp_u32(&mut self, c: usize, add: bool, r: V, carry: V) -> V {
+        let sat = self.s.m.i32(if add { u32::MAX } else { 0 });
+        self.s.m.select(c, carry, sat, r)
     }
 
     fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
@@ -5549,7 +5574,11 @@ impl<'a> Lower<'a> {
                 } else {
                     None
                 };
-                let (r, carry) = self.add_sub_carry(c, name.starts_with("v_add"), a, bb, cin);
+                let add = name.starts_with("v_add");
+                let (mut r, carry) = self.add_sub_carry(c, add, a, bb, cin);
+                if v.clamp {
+                    r = self.clamp_u32(c, add, r, carry);
+                }
                 int(self, r)?;
                 if let Some(Operand::Scalar { code, .. }) = v.carry
                     && let Some(w) = inst.write(Reg::S(code))
@@ -6333,19 +6362,32 @@ impl<'a> Lower<'a> {
             l.s.m.bin(c, Bin::And, x, k31)
         };
         Ok(match name {
-            "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_add_nc_u32" | "v_sub_nc_u32"
-            | "v_subrev_nc_u32" | "v_mul_lo_u32" => {
+            "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_mul_lo_u32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 let (op, a, b) = match name {
                     "v_and_b32" => (Bin::And, a, b),
                     "v_or_b32" => (Bin::Or, a, b),
                     "v_xor_b32" => (Bin::Xor, a, b),
-                    "v_add_nc_u32" => (Bin::Add, a, b),
-                    "v_sub_nc_u32" => (Bin::Sub, a, b),
-                    "v_subrev_nc_u32" => (Bin::Sub, b, a),
                     _ => (Bin::Mul, a, b),
                 };
                 self.s.m.bin(c, op, a, b)
+            }
+            "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32" => {
+                let (mut a, mut b) = (s(self, 0)?, s(self, 1)?);
+                if name == "v_subrev_nc_u32" {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                let add = name == "v_add_nc_u32";
+                let Fields::Valu(v) = &inst.fields else {
+                    unreachable!()
+                };
+                if v.clamp {
+                    let (r, carry) = self.add_sub_carry(c, add, a, b, None);
+                    self.clamp_u32(c, add, r, carry)
+                } else {
+                    let op = if add { Bin::Add } else { Bin::Sub };
+                    self.s.m.bin(c, op, a, b)
+                }
             }
             "v_xnor_b32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
@@ -9793,6 +9835,41 @@ mod tests {
 
         for words in [add, sub] {
             lowers(&words, 0).unwrap();
+        }
+    }
+
+    /// VOP3 integer `clamp` is unsigned saturation on carry/non-carry add/sub
+    /// (VIC-BT-010). The LDS store forces the result live: without the fix,
+    /// `write_i` leaves it missing and the store refuses translation.
+    #[test]
+    fn integer_vop3_clamp_lowers_add_and_sub() {
+        let v1 = 256 + 1u32;
+        let v2 = 256 + 2u32;
+        let store = |op_words: [u32; 2]| {
+            let mut words = vec![
+                0x7E02_0281, // v_mov_b32 v1, 1
+                0x7E04_0282, // v_mov_b32 v2, 2
+            ];
+            words.extend_from_slice(&op_words);
+            words.extend_from_slice(&[
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0xD834_0000,
+                0x0000_0003, // ds_write_b32 v3, v0
+                S_ENDPGM,
+            ]);
+            lowers_lds(&words).unwrap();
+        };
+        // VOP2-as-VOP3: opcode + 0x100 (bare 0x025 is VOPC v_cmp_lg_f64).
+        // v_add_nc_u32 / v_sub_nc_u32 / v_subrev_nc_u32 with clamp.
+        for op in [0x125u16, 0x126, 0x127] {
+            store([0x35 << 26 | (op as u32) << 16 | 1 << 15, v1 | v2 << 9]);
+        }
+        // v_add_co_u32 / v_sub_co_u32 / v_subrev_co_u32 with clamp (carry → s16).
+        for op in [0x30fu16, 0x310, 0x319] {
+            store([
+                0x35 << 26 | (op as u32) << 16 | 1 << 15 | 16 << 8,
+                v1 | v2 << 9,
+            ]);
         }
     }
 
